@@ -14,6 +14,7 @@ use crate::types::ability::{
     DelayedTriggerCondition, MultiTargetSpec, OpponentMayScope, PlayerFilter, QuantityExpr,
     RoundingMode, UnlessPayModifier,
 };
+use crate::types::mana::ManaExpiry;
 
 /// Chain-level IR: the complete parsed representation of an effect chain before assembly.
 ///
@@ -63,6 +64,8 @@ pub(crate) enum SpecialClause {
     /// Follow-up to a drawn-this-turn choice: sets the life payment and
     /// confirms the topdeck branch without emitting a separate effect.
     DrawnThisTurnPayOrTopdeck { life_payment: QuantityExpr },
+    /// CR 106.4: Mana-retention rider — fold expiry onto the previous Mana effect.
+    ManaRetention(ManaExpiry),
 }
 
 /// Per-clause IR: captures everything about a single parsed chunk before chain assembly.

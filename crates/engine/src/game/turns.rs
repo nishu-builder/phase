@@ -95,8 +95,11 @@ pub fn advance_phase(state: &mut GameState, events: &mut Vec<GameEvent>) {
             | Phase::CombatDamage
             | Phase::EndCombat
     );
+    let entering_cleanup = next == Phase::Cleanup;
     for player in &mut state.players {
-        player.mana_pool.clear_step_transition(in_combat);
+        player
+            .mana_pool
+            .clear_step_transition(in_combat, entering_cleanup);
         // CR 121.1 + CR 504.1: `cards_drawn_this_step` resets on every step
         // transition so `ExceptFirstDrawInDrawStep` conditions can identify
         // the first card drawn during the new step (most importantly, the

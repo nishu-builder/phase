@@ -79,6 +79,7 @@ use self::subject::{try_parse_subject_predicate_ast, try_parse_targeted_controll
 use crate::parser::oracle_ir::ast::*;
 pub(crate) use crate::parser::oracle_ir::context::ParseContext;
 use crate::parser::oracle_ir::effect_chain::{ClauseIr, EffectChainIr, SpecialClause};
+use crate::types::mana::ManaExpiry;
 
 /// CR 608.2k: True when `text` is a standalone object pronoun referring to
 /// the trigger/spell subject. Used by effect-target parsers that need to
@@ -6473,6 +6474,26 @@ pub(crate) fn try_parse_alt_cost_rider(text: &str) -> Option<crate::types::abili
     None
 }
 
+/// CR 106.4 + CR 514.2: Recognise mana-retention riders that modify the mana
+/// produced by the previous clause rather than creating a standalone effect.
+fn try_parse_mana_retention_rider(text: &str) -> Option<ManaExpiry> {
+    nom_on_lower(text, &text.to_lowercase(), |input| {
+        let (input, _) = tag::<_, _, OracleError<'_>>("until end of turn, ").parse(input)?;
+        let (input, _) = alt((tag("you "), tag("they "))).parse(input)?;
+        let (input, _) = alt((
+            tag("don't lose this mana as steps and phases end"),
+            tag("don't lose unspent mana as steps and phases end"),
+            tag("don\u{2019}t lose this mana as steps and phases end"),
+            tag("don\u{2019}t lose unspent mana as steps and phases end"),
+        ))
+        .parse(input)?;
+        let (input, _) = nom::combinator::opt(tag(".")).parse(input)?;
+        nom::combinator::eof(input)?;
+        Ok((input, ManaExpiry::EndOfTurn))
+    })
+    .map(|(expiry, _)| expiry)
+}
+
 /// CR 118.9: Walk `defs` from the back, descending into `sub_ability`
 /// chains, and stamp `alt_ability_cost` onto the most recent `CastFromZone`
 /// effect that does not already carry one. Returns `true` when a target
@@ -6504,6 +6525,33 @@ fn attach_alt_cost_to_prior_cast_from_zone(
     }
     for def in defs.iter_mut().rev() {
         if walk(def, &cost) {
+            return true;
+        }
+    }
+    false
+}
+
+/// CR 106.4: Walk `defs` from the back, descending into `sub_ability` chains,
+/// and stamp a mana-retention expiry onto the most recent Mana effect.
+fn attach_mana_retention_to_prior_mana(defs: &mut [AbilityDefinition], expiry: ManaExpiry) -> bool {
+    fn walk(def: &mut AbilityDefinition, expiry: ManaExpiry) -> bool {
+        if let Some(sub) = def.sub_ability.as_mut() {
+            if walk(sub, expiry) {
+                return true;
+            }
+        }
+        if let Effect::Mana {
+            expiry: current @ None,
+            ..
+        } = &mut *def.effect
+        {
+            *current = Some(expiry);
+            return true;
+        }
+        false
+    }
+    for def in defs.iter_mut().rev() {
+        if walk(def, expiry) {
             return true;
         }
     }
@@ -7533,6 +7581,35 @@ pub(crate) fn parse_effect_chain_ir(
                 source_text: normalized_text.to_string(),
             });
             continue;
+        }
+
+        if let Some(expiry) = try_parse_mana_retention_rider(normalized_text) {
+            if !clauses.is_empty() {
+                clauses.push(ClauseIr {
+                    parsed: parsed_clause(Effect::Unimplemented {
+                        name: "mana_retention_placeholder".to_string(),
+                        description: None,
+                    }),
+                    boundary: chunk.boundary_after,
+                    condition: None,
+                    is_optional: false,
+                    opponent_may_scope: None,
+                    repeat_for: None,
+                    player_scope: None,
+                    delayed_condition: None,
+                    prefix_delayed_condition: None,
+                    intrinsic_continuation: None,
+                    followup_continuation: None,
+                    absorbed_by_followup: false,
+                    multi_target: None,
+                    where_x_expression: None,
+                    is_otherwise: false,
+                    unless_pay: None,
+                    special: Some(SpecialClause::ManaRetention(expiry)),
+                    source_text: normalized_text.to_string(),
+                });
+                continue;
+            }
         }
 
         // CR 608.2c: "Otherwise, [effect]" — attach as else_ability on the
@@ -8899,6 +8976,10 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
                             *current = life_payment.clone();
                         }
                     }
+                    continue;
+                }
+                SpecialClause::ManaRetention(expiry) => {
+                    attach_mana_retention_to_prior_mana(&mut defs, *expiry);
                     continue;
                 }
             }
@@ -12196,7 +12277,7 @@ mod tests {
     };
     use crate::types::card_type::Supertype;
     use crate::types::keywords::Keyword;
-    use crate::types::mana::ManaColor;
+    use crate::types::mana::{ManaColor, ManaExpiry};
     use crate::types::player::PlayerCounterKind;
     use crate::types::zones::Zone;
 
@@ -24962,6 +25043,41 @@ mod tests {
             !has_pay_unimpl(&def),
             "rider must NOT leak as Unimplemented{{name:'pay'}} sibling"
         );
+    }
+
+    #[test]
+    fn mana_retention_rider_folds_onto_prior_mana_effect() {
+        let def = super::parse_effect_chain(
+            "add {G}. Until end of turn, you don't lose this mana as steps and phases end.",
+            AbilityKind::Spell,
+        );
+        match &*def.effect {
+            Effect::Mana {
+                expiry: Some(ManaExpiry::EndOfTurn),
+                ..
+            } => {}
+            other => panic!("expected Mana with EndOfTurn expiry, got {other:?}"),
+        }
+        assert!(
+            def.sub_ability.is_none(),
+            "mana retention rider must not leak as a no-op sub-ability"
+        );
+    }
+
+    #[test]
+    fn mana_retention_rider_accepts_triggering_player_pronoun() {
+        let def = super::parse_effect_chain(
+            "that player adds {G}{G}{G}. Until end of turn, they don't lose this mana as steps and phases end.",
+            AbilityKind::Spell,
+        );
+        match &*def.effect {
+            Effect::Mana {
+                expiry: Some(ManaExpiry::EndOfTurn),
+                ..
+            } => {}
+            other => panic!("expected Mana with EndOfTurn expiry, got {other:?}"),
+        }
+        assert!(def.sub_ability.is_none());
     }
 }
 

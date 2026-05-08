@@ -815,6 +815,15 @@ fn def_tree_has_duration(def: &AbilityDefinition) -> bool {
     if def.duration.is_some() {
         return true;
     }
+    if matches!(
+        &*def.effect,
+        Effect::Mana {
+            expiry: Some(_),
+            ..
+        }
+    ) {
+        return true;
+    }
     if let Some(ref sub) = def.sub_ability {
         if def_tree_has_duration(sub) {
             return true;
