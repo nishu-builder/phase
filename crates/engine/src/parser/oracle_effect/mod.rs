@@ -48,8 +48,8 @@ use crate::types::ability::{
     FilterProp, GainLifePlayer, GameRestriction, ManaProduction, MultiTargetSpec, ObjectScope,
     PlayerFilter, PlayerScope, PreventionAmount, PtValue, QuantityExpr, QuantityRef,
     ReplacementDefinition, RestrictionExpiry, RestrictionPlayerScope, RoundingMode,
-    StaticCondition, StaticDefinition, TargetChoiceTiming, TargetFilter, TriggerDefinition,
-    TypeFilter, TypedFilter, UnlessCost, UnlessPayModifier,
+    StaticCondition, StaticDefinition, TargetChoiceTiming, TargetFilter, TriggerCondition,
+    TriggerDefinition, TypeFilter, TypedFilter, UnlessCost, UnlessPayModifier,
 };
 use crate::types::card_type::{CoreType, Supertype};
 use crate::types::game_state::{DistributionUnit, NextSpellModifier, RetargetScope};
@@ -382,6 +382,45 @@ fn scan_tracked_set_reference(text: &str) -> bool {
     .is_some()
 }
 
+/// CR 700.4 + CR 120.1 + CR 603.7c: Parse delayed "a creature dealt damage
+/// this way dies [this turn]" conditions by reusing the normal death-trigger
+/// condition that checks this turn's damage ledger against the delayed
+/// trigger's source.
+fn parse_dealt_damage_this_way_dies_trigger(
+    condition_text: &str,
+    ctx: &mut ParseContext,
+) -> Option<TriggerDefinition> {
+    let condition_lower = condition_text.to_lowercase();
+    let (rest, subject) = take_until::<_, _, OracleError<'_>>(" dealt damage this way dies")
+        .parse(condition_lower.as_str())
+        .ok()?;
+    let (rest, _) = tag::<_, _, OracleError<'_>>(" dealt damage this way dies")
+        .parse(rest)
+        .ok()?;
+    let (rest, _) = opt(tag::<_, _, OracleError<'_>>(" this turn"))
+        .parse(rest)
+        .ok()?;
+    let (rest, _) = eof::<_, OracleError<'_>>.parse(rest).ok()?;
+    debug_assert!(rest.is_empty());
+
+    let (valid_card, rem) = parse_type_phrase(subject);
+    if !rem.trim().is_empty() || matches!(valid_card, TargetFilter::Any) {
+        ctx.push_diagnostic(OracleDiagnostic::TargetFallback {
+            context: "unrecognized delayed damage subject".into(),
+            text: subject.trim().into(),
+            line_index: 0,
+        });
+        return None;
+    }
+
+    let mut trigger = TriggerDefinition::new(TriggerMode::ChangesZone);
+    trigger.origin = Some(Zone::Battlefield);
+    trigger.destination = Some(Zone::Graveyard);
+    trigger.valid_card = Some(valid_card);
+    trigger.condition = Some(TriggerCondition::DealtDamageBySourceThisTurn);
+    Some(trigger)
+}
+
 /// Delegates to the shared word-boundary scanning primitive in `oracle_nom::primitives`.
 fn scan_contains_phrase(text: &str, phrase: &str) -> bool {
     nom_primitives::scan_contains(text, phrase)
@@ -407,11 +446,16 @@ fn try_parse_whenever_this_turn(tp: TextPair) -> Option<ParsedEffectClause> {
     // Effect is after " this turn, "
     let effect_text = after.original;
 
-    // Parse the condition as a trigger using the trigger parser
-    let (_, mut trigger_def) = crate::parser::oracle_trigger::parse_trigger_condition(
-        condition_text,
-        &mut ParseContext::default(),
-    );
+    // Parse the condition as a trigger using the trigger parser.
+    let mut inner_ctx = ParseContext::default();
+    let mut trigger_def = parse_dealt_damage_this_way_dies_trigger(condition_text, &mut inner_ctx)
+        .unwrap_or_else(|| {
+            let (_, trigger_def) = crate::parser::oracle_trigger::parse_trigger_condition(
+                condition_text,
+                &mut inner_ctx,
+            );
+            trigger_def
+        });
     trigger_def.execute = None; // Effect lives in DelayedTrigger.ability, not here
 
     let inner = parse_effect_chain(effect_text, AbilityKind::Spell);
@@ -827,27 +871,37 @@ fn try_parse_inline_delayed_trigger(
     let condition_text = &tp.lower["when ".len()..comma];
     let effect_text = &tp.original[comma + 2..];
 
-    let condition = match scan_delayed_condition_kind(condition_text) {
-        Some(DelayedConditionKind::Dies | DelayedConditionKind::PutIntoGraveyard) => {
-            DelayedTriggerCondition::WhenDies {
-                filter: parse_delayed_subject_filter(condition_text, ctx),
-            }
+    let condition = if let Some(trigger) =
+        parse_dealt_damage_this_way_dies_trigger(condition_text, ctx)
+    {
+        DelayedTriggerCondition::WhenNextEvent {
+            trigger: Box::new(trigger),
         }
-        Some(DelayedConditionKind::LeavesPlay) => DelayedTriggerCondition::WhenLeavesPlayFiltered {
-            filter: parse_delayed_subject_filter(condition_text, ctx),
-        },
-        Some(DelayedConditionKind::EntersBattlefield) => {
-            if has_unconsumed_conditional(condition_text) {
-                tracing::warn!(
+    } else {
+        match scan_delayed_condition_kind(condition_text) {
+            Some(DelayedConditionKind::Dies | DelayedConditionKind::PutIntoGraveyard) => {
+                DelayedTriggerCondition::WhenDies {
+                    filter: parse_delayed_subject_filter(condition_text, ctx),
+                }
+            }
+            Some(DelayedConditionKind::LeavesPlay) => {
+                DelayedTriggerCondition::WhenLeavesPlayFiltered {
+                    filter: parse_delayed_subject_filter(condition_text, ctx),
+                }
+            }
+            Some(DelayedConditionKind::EntersBattlefield) => {
+                if has_unconsumed_conditional(condition_text) {
+                    tracing::warn!(
                     text = condition_text,
                     "Unconsumed conditional in delayed trigger 'enters' match — parser may need extension"
                 );
+                }
+                DelayedTriggerCondition::WhenEntersBattlefield {
+                    filter: parse_delayed_subject_filter(condition_text, ctx),
+                }
             }
-            DelayedTriggerCondition::WhenEntersBattlefield {
-                filter: parse_delayed_subject_filter(condition_text, ctx),
-            }
+            None => return None,
         }
-        None => return None,
     };
 
     // "that creature/permanent/token" references the parent spell's target.
@@ -17614,6 +17668,34 @@ mod tests {
             "Expected CreateDelayedTrigger with WhenDies, got {:?}",
             e
         );
+    }
+
+    #[test]
+    fn inline_delayed_trigger_when_damage_this_way_dies_uses_damage_condition() {
+        let e = parse_effect(
+            "When a creature dealt damage this way dies this turn, create a 1/1 black Skeleton creature token",
+        );
+        match e {
+            Effect::CreateDelayedTrigger {
+                condition: DelayedTriggerCondition::WhenNextEvent { trigger },
+                uses_tracked_set: false,
+                ..
+            } => {
+                assert_eq!(trigger.mode, TriggerMode::ChangesZone);
+                assert_eq!(trigger.origin, Some(Zone::Battlefield));
+                assert_eq!(trigger.destination, Some(Zone::Graveyard));
+                assert!(matches!(
+                    trigger.valid_card,
+                    Some(TargetFilter::Typed(TypedFilter { type_filters, .. }))
+                        if type_filters == vec![TypeFilter::Creature]
+                ));
+                assert_eq!(
+                    trigger.condition,
+                    Some(TriggerCondition::DealtDamageBySourceThisTurn)
+                );
+            }
+            other => panic!("expected damage-this-way delayed trigger, got {other:?}"),
+        }
     }
 
     #[test]
