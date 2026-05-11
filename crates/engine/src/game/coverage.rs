@@ -5004,6 +5004,26 @@ fn ability_tree_any(def: &AbilityDefinition, pred: &impl Fn(&AbilityDefinition) 
     false
 }
 
+fn ability_places_counter(def: &AbilityDefinition, counter_type: &str) -> bool {
+    match &*def.effect {
+        Effect::PutCounter {
+            counter_type: ct, ..
+        }
+        | Effect::PutCounterAll {
+            counter_type: ct, ..
+        } => ct == counter_type,
+        Effect::Token {
+            enter_with_counters,
+            ..
+        }
+        | Effect::ChangeZone {
+            enter_with_counters,
+            ..
+        } => enter_with_counters.iter().any(|(ct, _)| ct == counter_type),
+        _ => false,
+    }
+}
+
 /// A semantic finding detected during audit of a card's parsed data vs Oracle text.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -5526,14 +5546,8 @@ impl<'a> ParsedElement<'a> {
 
     /// Check if this element has a counter effect matching the given type.
     fn has_counter_effect(&self, counter_type: &str) -> bool {
-        let counter_pred = |def: &AbilityDefinition| -> bool {
-            matches!(
-                &*def.effect,
-                Effect::PutCounter { counter_type: ct, .. }
-                | Effect::PutCounterAll { counter_type: ct, .. }
-                if ct == counter_type
-            )
-        };
+        let counter_pred =
+            |def: &AbilityDefinition| -> bool { ability_places_counter(def, counter_type) };
         match self {
             ParsedElement::Ability(a) => ability_tree_any(a, &counter_pred),
             ParsedElement::Trigger(t) => t
@@ -5642,6 +5656,7 @@ fn normalize_for_matching(lower: &str, card_name_lower: &str) -> String {
         "this aura",
         "this equipment",
         "this vehicle",
+        "this token",
     ] {
         result = result.replace(phrase, "~");
     }
@@ -6203,7 +6218,6 @@ fn audit_card_lines(oracle_text: &str, face: &CardFace) -> Vec<SemanticFinding> 
                 .iter()
                 .any(|a| ability_tree_any(a, &|d| pred(d)))
         };
-
         // 1. Condition check: does Oracle text contain condition language?
         if let Some(cond_label) = line_has_condition_text(&lower) {
             // Skip condition check for replacement effects — the "if" is inherently
@@ -6285,12 +6299,7 @@ fn audit_card_lines(oracle_text: &str, face: &CardFace) -> Vec<SemanticFinding> 
                         ));
                     let any_has_counter = matched.iter().any(|e| e.has_counter_effect(&normalized))
                         || modal_any(&|d: &AbilityDefinition| {
-                            matches!(
-                                &*d.effect,
-                                Effect::PutCounter { counter_type: ct, .. }
-                                | Effect::PutCounterAll { counter_type: ct, .. }
-                                if ct == &normalized
-                            )
+                            ability_places_counter(d, &normalized)
                         });
                     if !any_has_counter {
                         findings.push(SemanticFinding::WrongParameter {
@@ -8256,6 +8265,92 @@ mod tests {
                 .iter()
                 .any(|f| matches!(f, SemanticFinding::DroppedDuration { duration_text, .. } if duration_text == "until end of turn")),
             "Should detect dropped duration: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn test_audit_per_line_matches_this_token_descriptions() {
+        let mut face = make_face();
+        let oracle = "Create a 1/1 black Rat creature token with \"This token can't block.\"";
+        face.oracle_text = Some(oracle.to_string());
+        face.abilities.push(
+            AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Token {
+                    name: "Rat".to_string(),
+                    power: PtValue::Fixed(1),
+                    toughness: PtValue::Fixed(1),
+                    types: vec!["Creature".to_string(), "Rat".to_string()],
+                    colors: vec![],
+                    keywords: vec![],
+                    tapped: false,
+                    count: QuantityExpr::Fixed { value: 1 },
+                    owner: TargetFilter::Controller,
+                    attach_to: None,
+                    enters_attacking: false,
+                    supertypes: vec![],
+                    static_abilities: vec![],
+                    enter_with_counters: vec![],
+                },
+            )
+            .description(
+                "Create a 1/1 black Rat creature token with \"~ can't block.\"".to_string(),
+            ),
+        );
+
+        let findings = audit_card_lines(oracle, &face);
+
+        assert!(
+            !findings
+                .iter()
+                .any(|f| matches!(f, SemanticFinding::SilentDrop { .. })),
+            "Should match parsed token descriptions normalized to ~: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn test_audit_per_line_accepts_token_enter_with_counters() {
+        let mut face = make_face();
+        let oracle =
+            "Create a 0/0 green and blue Fractal creature token. Put X +1/+1 counters on it.";
+        face.oracle_text = Some(oracle.to_string());
+        face.abilities.push(
+            AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Token {
+                    name: "Fractal".to_string(),
+                    power: PtValue::Fixed(0),
+                    toughness: PtValue::Fixed(0),
+                    types: vec!["Creature".to_string(), "Fractal".to_string()],
+                    colors: vec![],
+                    keywords: vec![],
+                    tapped: false,
+                    count: QuantityExpr::Fixed { value: 1 },
+                    owner: TargetFilter::Controller,
+                    attach_to: None,
+                    enters_attacking: false,
+                    supertypes: vec![],
+                    static_abilities: vec![],
+                    enter_with_counters: vec![(
+                        "P1P1".to_string(),
+                        QuantityExpr::Ref {
+                            qty: QuantityRef::Variable {
+                                name: "X".to_string(),
+                            },
+                        },
+                    )],
+                },
+            )
+            .description(oracle.to_string()),
+        );
+
+        let findings = audit_card_lines(oracle, &face);
+
+        assert!(
+            !findings.iter().any(
+                |f| matches!(f, SemanticFinding::WrongParameter { field, .. } if field == "counter")
+            ),
+            "Should accept counters folded into token enter_with_counters: {findings:?}"
         );
     }
 
