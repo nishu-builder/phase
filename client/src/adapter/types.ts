@@ -430,6 +430,7 @@ export interface GameObject {
   dealt_deathtouch_damage: boolean;
   attached_to: ObjectId | null;
   attachments: ObjectId[];
+  paired_with?: ObjectId | null;
   counters: Partial<Record<CounterType, number>>;
   name: string;
   power: number | null;

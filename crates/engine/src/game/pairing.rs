@@ -56,9 +56,6 @@ pub fn cleanup_invalid_pairs(state: &mut GameState) {
         .iter()
         .filter_map(|(&id, obj)| {
             let partner_id = obj.paired_with?;
-            if id.0 > partner_id.0 {
-                return None;
-            }
             let Some(partner) = state.objects.get(&partner_id) else {
                 return Some(id);
             };

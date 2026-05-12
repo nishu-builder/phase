@@ -12,6 +12,7 @@ use crate::types::identifiers::ObjectId;
 use crate::types::player::PlayerId;
 
 use super::engine::EngineError;
+use super::filter::{matches_target_filter, FilterContext};
 use super::quantity::resolve_quantity_with_targets;
 use super::targeting;
 use super::triggers;
@@ -784,6 +785,15 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
             .collect()
     } else {
         match triggers::extract_target_filter_from_effect(&validated.effect) {
+            Some(filter) if matches!(validated.effect, Effect::PairWith { .. }) => {
+                let legal_choices = pair_with_legal_choices(state, &validated, filter);
+                validated
+                    .targets
+                    .iter()
+                    .filter(|target| legal_choices.contains(target))
+                    .cloned()
+                    .collect()
+            }
             Some(filter) => targeting::validate_targets(
                 state,
                 &validated.targets,
@@ -912,7 +922,7 @@ fn collect_target_slots(
         }
         if ability.target_choice_timing == TargetChoiceTiming::Stack {
             if let Some(filter) = triggers::extract_target_filter_from_effect(&ability.effect) {
-                let legal_targets = legal_targets_for_ability_filter(state, ability, filter, slots);
+                let legal_targets = legal_choices_for_ability_filter(state, ability, filter, slots);
                 if legal_targets.is_empty() && !ability.optional_targeting {
                     return Err(EngineError::ActionNotAllowed(
                         "No legal targets available".to_string(),
@@ -958,6 +968,48 @@ fn collect_target_slots(
     Ok(())
 }
 
+fn legal_choices_for_ability_filter(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    filter: &TargetFilter,
+    existing_slots: &[TargetSelectionSlot],
+) -> Vec<TargetRef> {
+    if matches!(ability.effect, Effect::PairWith { .. }) {
+        return pair_with_legal_choices(state, ability, filter);
+    }
+    legal_targets_for_ability_filter(state, ability, filter, existing_slots)
+}
+
+fn pair_with_legal_choices(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    filter: &TargetFilter,
+) -> Vec<TargetRef> {
+    if !super::pairing::is_unpaired_creature_you_control(
+        state,
+        ability.source_id,
+        ability.controller,
+    ) {
+        return Vec::new();
+    }
+
+    let ctx = FilterContext::from_source_with_controller(ability.source_id, ability.controller);
+    state
+        .battlefield
+        .iter()
+        .copied()
+        .filter(|&object_id| {
+            matches_target_filter(state, object_id, filter, &ctx)
+                && super::pairing::is_unpaired_creature_you_control(
+                    state,
+                    object_id,
+                    ability.controller,
+                )
+        })
+        .map(TargetRef::Object)
+        .collect()
+}
+
 fn resolve_multi_target_max(
     state: &GameState,
     ability: &ResolvedAbility,
@@ -993,9 +1045,10 @@ fn quantity_expr_has_unresolved_variable(
         QuantityExpr::Offset { inner, .. }
         | QuantityExpr::Multiply { inner, .. }
         | QuantityExpr::DivideRounded { inner, .. }
-        | QuantityExpr::UpTo { max: inner } => {
-            quantity_expr_has_unresolved_variable(state, ability, inner)
-        }
+        | QuantityExpr::UpTo { max: inner }
+        | QuantityExpr::Power {
+            exponent: inner, ..
+        } => quantity_expr_has_unresolved_variable(state, ability, inner),
         QuantityExpr::Sum { exprs } => exprs
             .iter()
             .any(|expr| quantity_expr_has_unresolved_variable(state, ability, expr)),
@@ -1326,6 +1379,10 @@ fn legal_targets_for_selected_slot(
     spec: &TargetSlotSpec,
     selected_slots: &[Option<TargetRef>],
 ) -> Vec<TargetRef> {
+    if matches!(ability.effect, Effect::PairWith { .. }) {
+        return pair_with_legal_choices(state, ability, &spec.filter);
+    }
+
     if let Some(targets) = damage_any_target_legal_targets(state, ability, &spec.filter) {
         return targets;
     }
