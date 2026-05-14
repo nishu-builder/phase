@@ -1,6 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
 
-import type { CoreType, DebugAction, ManaColor, PlayerId, Zone } from "../../adapter/types";
+import type {
+  CoreType,
+  CounterType,
+  DebugAction,
+  ManaColor,
+  PlayerId,
+  Zone,
+} from "../../adapter/types";
 import {
   listTokenPresets,
   type TokenCategory,
@@ -58,6 +65,65 @@ const COLOR_LABELS: Record<ManaColor, string> = {
   Red: "R",
   Green: "G",
 };
+
+// The counter types most useful for debug recovery (state injection). The
+// engine accepts any `CounterType` over the wire, but the dropdown sticks to
+// the canonical SBA-relevant set so a single click resolves the "0/0 token
+// dies" case. Default is `P1P1` because that's the counter every 0/0-shape
+// printed card uses to make tokens survive.
+const COUNTER_OPTIONS: readonly { value: CounterType; label: string }[] = [
+  { value: "P1P1", label: "+1/+1" },
+  { value: "M1M1", label: "-1/-1" },
+  { value: "loyalty", label: "Loyalty" },
+  { value: "stun", label: "Stun" },
+];
+
+interface CounterPickerProps {
+  counterType: CounterType;
+  setCounterType: (c: CounterType) => void;
+  count: number;
+  setCount: (n: number) => void;
+  hint?: string;
+}
+
+function CounterPicker({
+  counterType,
+  setCounterType,
+  count,
+  setCount,
+  hint,
+}: CounterPickerProps) {
+  return (
+    <>
+      <FieldRow label="Counter Type">
+        <select
+          value={counterType}
+          onChange={(e) => setCounterType(e.target.value as CounterType)}
+          className="w-full rounded border border-gray-700 bg-gray-900 px-2 py-1 font-mono text-xs text-gray-200"
+        >
+          {COUNTER_OPTIONS.map((o) => (
+            <option key={o.value} value={o.value}>
+              {o.label}
+            </option>
+          ))}
+        </select>
+      </FieldRow>
+      <FieldRow label="Counters">
+        <NumberInput value={count} onChange={setCount} />
+      </FieldRow>
+      {hint && (
+        <div className="mb-2 px-2 text-[10px] text-amber-300">{hint}</div>
+      )}
+    </>
+  );
+}
+
+function buildEnterCounters(
+  counterType: CounterType,
+  count: number,
+): [CounterType, number][] {
+  return count > 0 ? [[counterType, count]] : [];
+}
 
 interface Props {
   onDispatch: (action: DebugAction) => void;
@@ -132,6 +198,8 @@ function CatalogTokenForm({ onDispatch }: Props) {
   const [search, setSearch] = useState("");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [counterType, setCounterType] = useState<CounterType>("P1P1");
+  const [counterCount, setCounterCount] = useState(0);
 
   useEffect(() => {
     listTokenPresets()
@@ -185,14 +253,26 @@ function CatalogTokenForm({ onDispatch }: Props) {
     return keys;
   }, [grouped]);
 
+  const selectedPreset = presets?.find((p) => p.id === selectedId) ?? null;
+  // CR 704.5f hint: cite the rule that explains why this token would die.
+  // FE string formatting over engine-provided fields — no game-state inference.
+  const survivalHint =
+    selectedPreset &&
+    selectedPreset.body.core_types.includes("Creature") &&
+    selectedPreset.body.power === 0 &&
+    selectedPreset.body.toughness === 0 &&
+    counterCount === 0
+      ? "0/0 creature dies to state-based actions — add counters to keep it alive (CR 704.5f)."
+      : undefined;
+
   const handleSubmit = () => {
-    const preset = presets?.find((p) => p.id === selectedId);
-    if (!preset) return;
+    if (!selectedPreset) return;
     onDispatch({
       type: "CreateToken",
       data: {
         owner,
-        characteristics: preset.body,
+        characteristics: selectedPreset.body,
+        enter_with_counters: buildEnterCounters(counterType, counterCount),
       },
     });
   };
@@ -252,6 +332,13 @@ function CatalogTokenForm({ onDispatch }: Props) {
           );
         })}
       </div>
+      <CounterPicker
+        counterType={counterType}
+        setCounterType={setCounterType}
+        count={counterCount}
+        setCount={setCounterCount}
+        hint={survivalHint}
+      />
       <SubmitButton onClick={handleSubmit} disabled={!selectedId}>
         Create Selected Token
       </SubmitButton>
@@ -268,6 +355,8 @@ function CustomTokenForm({ onDispatch }: Props) {
   const [subtypesText, setSubtypesText] = useState("");
   const [colors, setColors] = useState<ManaColor[]>([]);
   const [keywordsText, setKeywordsText] = useState("");
+  const [counterType, setCounterType] = useState<CounterType>("P1P1");
+  const [counterCount, setCounterCount] = useState(0);
 
   const toggleCoreType = (ct: CoreType) => {
     setCoreTypes((prev) =>
@@ -305,9 +394,19 @@ function CustomTokenForm({ onDispatch }: Props) {
           colors,
           keywords,
         },
+        enter_with_counters: buildEnterCounters(counterType, counterCount),
       },
     });
   };
+
+  // CR 704.5f hint: same display-only annotation used by the catalog form.
+  const survivalHint =
+    coreTypes.includes("Creature") &&
+    power === 0 &&
+    toughness === 0 &&
+    counterCount === 0
+      ? "0/0 creature dies to state-based actions — add counters to keep it alive (CR 704.5f)."
+      : undefined;
 
   return (
     <>
@@ -360,6 +459,13 @@ function CustomTokenForm({ onDispatch }: Props) {
       <FieldRow label="Keywords">
         <TextInput value={keywordsText} onChange={setKeywordsText} placeholder="Flying, Haste" />
       </FieldRow>
+      <CounterPicker
+        counterType={counterType}
+        setCounterType={setCounterType}
+        count={counterCount}
+        setCount={setCounterCount}
+        hint={survivalHint}
+      />
       <SubmitButton onClick={handleSubmit}>Create Custom Token</SubmitButton>
     </>
   );
