@@ -27773,6 +27773,62 @@ mod tests {
     }
 
     #[test]
+    fn strip_mv_conditional_leading_present_tense() {
+        // CR 400.7: present-tense "has" → use_lki: false. Covers Cosmic Rebirth.
+        let (cond, text) = strip_mana_value_conditional("If it has mana value 3 or less, scry 1.");
+        assert!(
+            cond.is_some(),
+            "should extract leading present-tense MV condition"
+        );
+        assert_eq!(text, "scry 1.");
+        match cond.unwrap() {
+            AbilityCondition::TargetMatchesFilter { filter, use_lki } => {
+                assert!(!use_lki, "present-tense check must not use LKI");
+                if let TargetFilter::Typed(tf) = filter {
+                    assert!(tf.properties.iter().any(|p| matches!(
+                        p,
+                        FilterProp::Cmc {
+                            comparator: Comparator::LE,
+                            value: QuantityExpr::Fixed { value: 3 }
+                        }
+                    )));
+                } else {
+                    panic!("expected Typed filter");
+                }
+            }
+            other => panic!("expected TargetMatchesFilter, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strip_mv_conditional_leading_present_tense_greater() {
+        let (cond, text) =
+            strip_mana_value_conditional("If it has mana value 4 or greater, draw a card.");
+        assert!(
+            cond.is_some(),
+            "should extract leading present-tense MV ≥ 4"
+        );
+        assert_eq!(text, "draw a card.");
+        match cond.unwrap() {
+            AbilityCondition::TargetMatchesFilter { filter, use_lki } => {
+                assert!(!use_lki);
+                if let TargetFilter::Typed(tf) = filter {
+                    assert!(tf.properties.iter().any(|p| matches!(
+                        p,
+                        FilterProp::Cmc {
+                            comparator: Comparator::GE,
+                            value: QuantityExpr::Fixed { value: 4 }
+                        }
+                    )));
+                } else {
+                    panic!("expected Typed filter");
+                }
+            }
+            other => panic!("expected TargetMatchesFilter, got: {other:?}"),
+        }
+    }
+
+    #[test]
     fn strip_mv_conditional_no_match() {
         let (cond, text) = strip_mana_value_conditional("Destroy target creature");
         assert!(cond.is_none());

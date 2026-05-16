@@ -490,6 +490,28 @@ pub(super) fn strip_card_type_conditional(text: &str) -> (Option<AbilityConditio
     };
     let type_word = type_str.rsplit(' ').next().unwrap_or(type_str);
     let capitalized = format!("{}{}", &type_word[..1].to_uppercase(), &type_word[1..]);
+    // CR 608.2c: "permanent" is not a CoreType (it spans CR 110.1's permanent card
+    // types). Build the condition via the existing parse_type_phrase building block —
+    // "permanent card" → TargetFilter::Typed(TypeFilter::Permanent) — and gate on it
+    // with TargetMatchesFilter (the same condition variant the sibling MV arms use).
+    if type_word == "permanent" {
+        let (filter, leftover) = crate::parser::oracle_target::parse_type_phrase("permanent card");
+        if !matches!(filter, TargetFilter::Any) && leftover.trim().is_empty() {
+            // allow-noncombinator: structural separator after parsed clause
+            let remainder = after_type.strip_prefix(", ").unwrap_or(after_type);
+            let offset = text.len() - remainder.len();
+            return (
+                Some(maybe_negate(
+                    AbilityCondition::TargetMatchesFilter {
+                        filter,
+                        use_lki: false,
+                    },
+                    negated,
+                )),
+                text[offset..].to_string(),
+            );
+        }
+    }
     if let Ok(card_type) = CoreType::from_str(&capitalized) {
         // CR 205.3m: Consume optional "of the chosen type" suffix after " card".
         let (after_type, additional_filter) = if let Ok((rest_after_chosen, _)) =
@@ -856,11 +878,23 @@ pub(super) fn strip_mana_value_conditional(text: &str) -> (Option<AbilityConditi
     let lower = text.to_lowercase();
     let tp = TextPair::new(text, &lower);
 
-    // Leading position: "If its mana value was N or less/greater, [effect]."
+    // Leading position, past tense: "If its mana value was N or less/greater, [effect]."
+    // CR 400.7: past-tense check → use_lki: true (LKI snapshot).
     if let Ok((rest, _)) =
         tag::<_, _, OracleError<'_>>("if its mana value was ").parse(lower.as_str())
     {
-        if let Some((condition, body)) = parse_past_mana_value_condition_body(text, rest) {
+        if let Some((condition, body)) = parse_leading_mana_value_condition_body(text, rest, true) {
+            return (Some(condition), body);
+        }
+    }
+
+    // Leading position, present tense: "If it has mana value N or less/greater, [effect]."
+    // CR 400.7: present-tense check → use_lki: false (current state). Covers Cosmic Rebirth.
+    if let Ok((rest, _)) =
+        tag::<_, _, OracleError<'_>>("if it has mana value ").parse(lower.as_str())
+    {
+        if let Some((condition, body)) = parse_leading_mana_value_condition_body(text, rest, false)
+        {
             return (Some(condition), body);
         }
     }
@@ -928,9 +962,14 @@ pub(super) fn strip_mana_value_conditional(text: &str) -> (Option<AbilityConditi
     (None, text.to_string())
 }
 
-fn parse_past_mana_value_condition_body(
+/// Parse the body of a leading mana-value conditional — "`<N>` or less/greater, [effect]" —
+/// and compute the body offset into `original`. `use_lki` is threaded into the constructed
+/// `TargetMatchesFilter` condition: past-tense ("was") callers pass `true` (CR 400.7 — LKI
+/// snapshot), present-tense ("has") callers pass `false` (current state).
+fn parse_leading_mana_value_condition_body(
     original: &str,
     condition_and_body: &str,
+    use_lki: bool,
 ) -> Option<(AbilityCondition, String)> {
     let (rest, threshold) = nom_primitives::parse_number(condition_and_body).ok()?;
     let (rest, _) = tag::<_, _, OracleError<'_>>(" or ").parse(rest).ok()?;
@@ -951,7 +990,7 @@ fn parse_past_mana_value_condition_body(
                 value: threshold as i32,
             },
         }])),
-        use_lki: true,
+        use_lki,
     };
     Some((condition, original[body_start..].to_string()))
 }
@@ -2108,6 +2147,22 @@ pub(super) fn try_nom_condition_as_ability_condition(
 
     if let Some(rest) = rest_after_prefix {
         let rest = rest.trim_end_matches(" card").trim();
+        // CR 608.2c: "permanent" is not a CoreType — gate on it via the existing
+        // parse_type_phrase building block + TargetMatchesFilter, keeping this handler
+        // in lockstep with strip_card_type_conditional's "permanent" arm.
+        if rest == "permanent" {
+            let (filter, leftover) =
+                crate::parser::oracle_target::parse_type_phrase("permanent card");
+            if !matches!(filter, TargetFilter::Any) && leftover.trim().is_empty() {
+                return Some(maybe_negate(
+                    AbilityCondition::TargetMatchesFilter {
+                        filter,
+                        use_lki: false,
+                    },
+                    negated,
+                ));
+            }
+        }
         let card_type = match rest {
             "creature" => Some(CoreType::Creature),
             "land" => Some(CoreType::Land),
@@ -2125,7 +2180,6 @@ pub(super) fn try_nom_condition_as_ability_condition(
             "artifact" => Some(CoreType::Artifact),
             "enchantment" => Some(CoreType::Enchantment),
             "planeswalker" => Some(CoreType::Planeswalker),
-            "permanent" => None,
             _ => None,
         };
         if let Some(card_type) = card_type {
@@ -3165,5 +3219,43 @@ mod tests {
             ))
         );
         assert_eq!(body, "target player discards three cards.");
+    }
+
+    /// CR 608.2c: "permanent" is not a CoreType — strip_card_type_conditional must
+    /// still gate on it via TargetMatchesFilter (parse_type_phrase building block).
+    /// Covers Primal Surge's "If it's a permanent card, you may put it onto the
+    /// battlefield."
+    #[test]
+    fn strip_card_type_conditional_permanent() {
+        let (cond, body) = strip_card_type_conditional("If it's a permanent card, draw a card.");
+        let Some(AbilityCondition::TargetMatchesFilter { filter, use_lki }) = cond else {
+            panic!("expected TargetMatchesFilter for 'permanent', got {cond:?}");
+        };
+        assert!(!use_lki, "present-tense 'it's a' check must not use LKI");
+        let TargetFilter::Typed(tf) = filter else {
+            panic!("expected Typed filter for permanent");
+        };
+        assert!(
+            tf.type_filters.contains(&TypeFilter::Permanent),
+            "expected Permanent type filter, got {:?}",
+            tf.type_filters
+        );
+        assert_eq!(body, "draw a card.");
+    }
+
+    #[test]
+    fn strip_card_type_conditional_nonpermanent_negated() {
+        let (cond, body) = strip_card_type_conditional("If it's a nonpermanent card, draw a card.");
+        let Some(AbilityCondition::Not { condition }) = cond else {
+            panic!("expected negated condition for 'nonpermanent', got {cond:?}");
+        };
+        let AbilityCondition::TargetMatchesFilter { filter, .. } = *condition else {
+            panic!("expected inner TargetMatchesFilter");
+        };
+        let TargetFilter::Typed(tf) = filter else {
+            panic!("expected Typed filter");
+        };
+        assert!(tf.type_filters.contains(&TypeFilter::Permanent));
+        assert_eq!(body, "draw a card.");
     }
 }
