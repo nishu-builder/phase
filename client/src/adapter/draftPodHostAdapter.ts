@@ -389,13 +389,17 @@ export class DraftPodHostAdapter {
 
   // ── Cleanup ────────────────────────────────────────────────────────
 
-  async dispose(): Promise<void> {
+  async dispose(options: { preserveSession?: boolean } = {}): Promise<void> {
     if (this.hostEventUnsub) {
       this.hostEventUnsub();
       this.hostEventUnsub = null;
     }
     if (this.host) {
-      await this.host.terminateDraft();
+      if (options.preserveSession) {
+        this.host.dispose();
+      } else {
+        await this.host.terminateDraft();
+      }
       this.host = null;
     }
     if (this.hostResult) {

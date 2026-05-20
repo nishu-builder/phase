@@ -12,6 +12,8 @@
 
 import { createStore, del, get, set } from "idb-keyval";
 
+import { ACTIVE_DRAFT_POD_KEY } from "../constants/storage";
+
 // ── Types ──────────────────────────────────────────────────────────────
 
 /**
@@ -56,10 +58,30 @@ export interface PersistedDraftGuestSession {
   timestamp: number;
 }
 
+export type ActiveDraftPodPhase =
+  | "lobby"
+  | "drafting"
+  | "deckbuilding"
+  | "pairing"
+  | "matchInProgress"
+  | "complete";
+
+export interface ActiveDraftPodMeta {
+  id: string;
+  roomCode: string;
+  kind: "Premier" | "Traditional";
+  podSize: number;
+  hostDisplayName: string;
+  phase: ActiveDraftPodPhase;
+  pickCount: number;
+  updatedAt: number;
+}
+
 // ── Store ──────────────────────────────────────────────────────────────
 
 const DRAFT_HOST_PREFIX = "phase-draft-host:";
 const DRAFT_GUEST_PREFIX = "phase-draft-guest:";
+const HOST_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 /** Guest token TTL — 4 hours matches the game session TTL. */
 const GUEST_SESSION_TTL_MS = 4 * 60 * 60 * 1000;
 
@@ -103,6 +125,32 @@ export async function clearDraftHostSession(id: string): Promise<void> {
   try {
     await del(DRAFT_HOST_PREFIX + id, getDraftStore());
   } catch { /* best-effort */ }
+}
+
+// ── Active Host Meta ──────────────────────────────────────────────────
+
+export function saveActiveDraftPod(meta: ActiveDraftPodMeta): void {
+  localStorage.setItem(ACTIVE_DRAFT_POD_KEY, JSON.stringify(meta));
+}
+
+export function loadActiveDraftPod(): ActiveDraftPodMeta | null {
+  try {
+    const raw = localStorage.getItem(ACTIVE_DRAFT_POD_KEY);
+    if (!raw) return null;
+    const meta = JSON.parse(raw) as ActiveDraftPodMeta;
+    if (Date.now() - meta.updatedAt > HOST_SESSION_TTL_MS) {
+      void clearDraftHostSession(meta.id);
+      clearActiveDraftPod();
+      return null;
+    }
+    return meta;
+  } catch {
+    return null;
+  }
+}
+
+export function clearActiveDraftPod(): void {
+  localStorage.removeItem(ACTIVE_DRAFT_POD_KEY);
 }
 
 // ── Guest Persistence ──────────────────────────────────────────────────

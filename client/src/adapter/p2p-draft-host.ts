@@ -155,6 +155,7 @@ export class P2PDraftHost {
       this.handleNewConnection(conn);
     });
     this.syncLobbyToGuests();
+    this.persistSession();
   }
 
   // ── Connection handling ────────────────────────────────────────────

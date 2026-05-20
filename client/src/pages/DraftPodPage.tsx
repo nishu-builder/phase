@@ -9,7 +9,7 @@
  */
 
 import { useCallback, useEffect, useState } from "react";
-import { useNavigate } from "react-router";
+import { useNavigate, useSearchParams } from "react-router";
 
 import { CardPreview } from "../components/card/CardPreview";
 import type { CardHoverInfo } from "../components/card/CardPreview";
@@ -652,18 +652,25 @@ export function DraftPodPage() {
   const phase = useMultiplayerDraftStore((s) => s.phase);
   const leave = useMultiplayerDraftStore((s) => s.leave);
   const resetPod = useDraftPodStore((s) => s.reset);
+  const resumeHostedPod = useDraftPodStore((s) => s.resumeHostedPod);
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
 
   // Cleanup on unmount
   useEffect(() => {
     return () => {
-      void leave();
+      void leave(true);
       resetPod();
     };
   }, [leave, resetPod]);
 
+  useEffect(() => {
+    if (searchParams.get("resume") !== "1") return;
+    void resumeHostedPod();
+  }, [resumeHostedPod, searchParams]);
+
   const handleLeave = useCallback(async () => {
-    await leave();
+    await leave(true);
     resetPod();
     navigate("/");
   }, [leave, resetPod, navigate]);

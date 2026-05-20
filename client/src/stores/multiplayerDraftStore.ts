@@ -34,6 +34,13 @@ import {
   type DraftPodGuestEvent,
   type DraftPodGuestStatus,
 } from "../adapter/draftPodGuestAdapter";
+import {
+  clearActiveDraftPod,
+  loadActiveDraftPod,
+  saveActiveDraftPod,
+  type ActiveDraftPodMeta,
+  type ActiveDraftPodPhase,
+} from "../services/draftPersistence";
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -142,7 +149,7 @@ interface MultiplayerDraftActions {
   /** Host: resume the draft. */
   requestResume: () => void;
   /** Both: tear down the connection and reset state. */
-  leave: () => Promise<void>;
+  leave: (preserveSession?: boolean) => Promise<void>;
   /** Reset store to initial state (without network cleanup). */
   reset: () => void;
   /** Both: start the match for the current pairing. */
@@ -234,6 +241,41 @@ function chooseAutoPickCard(view: DraftPlayerView | null): string | null {
   return bestCard.instance_id;
 }
 
+function saveDraftPodProgress(phase: ActiveDraftPodPhase, view?: DraftPlayerView | null): void {
+  const meta = loadActiveDraftPod();
+  if (!meta) return;
+  saveActiveDraftPod({
+    ...meta,
+    phase,
+    pickCount: view?.pool.length ?? meta.pickCount,
+    updatedAt: Date.now(),
+  });
+}
+
+function updateActiveDraftPod(patch: Partial<ActiveDraftPodMeta>): void {
+  const meta = loadActiveDraftPod();
+  if (!meta) return;
+  saveActiveDraftPod({ ...meta, ...patch, updatedAt: Date.now() });
+}
+
+function activePhaseForHostStatus(status: DraftPodHostStatus): ActiveDraftPodPhase | null {
+  switch (status) {
+    case "lobby":
+    case "drafting":
+    case "deckbuilding":
+    case "pairing":
+    case "matchInProgress":
+    case "complete":
+      return status;
+    case "roundComplete":
+      return "pairing";
+    case "idle":
+    case "connecting":
+    case "error":
+      return null;
+  }
+}
+
 /** Dispose the active match adapter (P2PHostAdapter or P2PGuestAdapter). */
 function disposeMatchAdapter(set: SetFn): void {
   const state = useMultiplayerDraftStore.getState();
@@ -297,6 +339,24 @@ export const useMultiplayerDraftStore = create<
 
     try {
       await adapter.initialize(config);
+      if (config.persistenceId) {
+        const view = get().view;
+        const phase: ActiveDraftPodPhase = view?.status === "Deckbuilding"
+          ? "deckbuilding"
+          : view?.status === "Drafting"
+            ? "drafting"
+            : "lobby";
+        saveActiveDraftPod({
+          id: config.persistenceId,
+          roomCode: adapter.roomCode ?? config.preferredRoomCode ?? "",
+          kind: config.kind,
+          podSize: config.podSize,
+          hostDisplayName: config.hostDisplayName,
+          phase,
+          pickCount: view?.pool.length ?? 0,
+          updatedAt: Date.now(),
+        });
+      }
     } catch {
       // Error already emitted via adapter event
     }
@@ -597,7 +657,7 @@ export const useMultiplayerDraftStore = create<
     });
   },
 
-  leave: async () => {
+  leave: async (preserveSession = false) => {
     // Dispose match adapter first (game P2P connection)
     const { matchAdapter } = get();
     if (matchAdapter) {
@@ -606,8 +666,11 @@ export const useMultiplayerDraftStore = create<
     }
 
     if (activeHostAdapter) {
-      await activeHostAdapter.dispose();
+      await activeHostAdapter.dispose({ preserveSession });
       activeHostAdapter = null;
+      if (!preserveSession) {
+        clearActiveDraftPod();
+      }
     }
     if (activeGuestAdapter) {
       await activeGuestAdapter.dispose();
@@ -683,9 +746,14 @@ function handleHostEvent(event: DraftPodHostEvent, set: SetFn): void {
   switch (event.type) {
     case "statusChanged":
       set({ phase: hostStatusToPhase(event.status) });
+      {
+        const activePhase = activePhaseForHostStatus(event.status);
+        if (activePhase) saveDraftPodProgress(activePhase);
+      }
       break;
     case "roomCreated":
       set({ roomCode: event.roomCode });
+      updateActiveDraftPod({ roomCode: event.roomCode });
       break;
     case "viewUpdated":
       set({
@@ -695,6 +763,10 @@ function handleHostEvent(event: DraftPodHostEvent, set: SetFn): void {
         currentRound: event.view.current_round ?? 0,
         pairings: event.view.pairings ?? [],
       });
+      saveDraftPodProgress(
+        event.view.status === "Deckbuilding" ? "deckbuilding" : "drafting",
+        event.view,
+      );
       break;
     case "lobbyUpdate":
       set({ joined: event.joined, total: event.total, seats: event.seats });
@@ -703,19 +775,24 @@ function handleHostEvent(event: DraftPodHostEvent, set: SetFn): void {
       break;
     case "draftStarted":
       set({ view: event.view, phase: "drafting" });
+      saveDraftPodProgress("drafting", event.view);
       break;
     case "draftComplete":
       set({ phase: "deckbuilding" });
+      saveDraftPodProgress("deckbuilding");
       break;
     case "allDecksSubmitted":
       set({ phase: "pairing" });
+      saveDraftPodProgress("pairing");
       break;
     case "pairingsGenerated":
       set({ phase: "matchInProgress", currentRound: event.round, pairings: event.pairings });
+      saveDraftPodProgress("matchInProgress");
       break;
     case "roundAdvanced":
       disposeMatchAdapter(set);
       set({ phase: "pairing", currentRound: event.newRound });
+      saveDraftPodProgress("pairing");
       break;
     case "roundComplete":
       disposeMatchAdapter(set);
@@ -744,6 +821,7 @@ function handleHostEvent(event: DraftPodHostEvent, set: SetFn): void {
       break;
     case "bo3GameStarted":
       set({ phase: "matchInProgress", sideboardPrompt: null, playDrawPrompt: null, sideboardSubmitted: false });
+      saveDraftPodProgress("matchInProgress");
       break;
   }
 }
