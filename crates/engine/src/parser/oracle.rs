@@ -674,6 +674,25 @@ fn starts_with_until_duration(line: &str) -> bool {
     .is_some()
 }
 
+fn ends_with_quoted_activated_ability(line: &str) -> bool {
+    let trimmed = line.trim_end();
+    if !matches!(trimmed.chars().next_back(), Some('"')) {
+        return false;
+    }
+
+    let mut quote_positions = trimmed
+        .char_indices()
+        .filter_map(|(idx, ch)| (ch == '"').then_some(idx))
+        .rev();
+    let Some(close_quote) = quote_positions.next() else {
+        return false;
+    };
+    let Some(open_quote) = quote_positions.next() else {
+        return false;
+    };
+    find_activated_colon(&trimmed[open_quote + 1..close_quote]).is_some()
+}
+
 fn is_standalone_spell_keyword_action_line(line: &str) -> bool {
     let lower = line.to_lowercase();
     let parsed = all_consuming(value(
@@ -2484,6 +2503,7 @@ pub(crate) fn parse_oracle_ir(
 
                 if next_prepared.has_ability_word_prefix
                     || starts_with_until_duration(&next_prepared.effect_text)
+                    || ends_with_quoted_activated_ability(&prepared_line.effect_text)
                     || is_self_exile_cleanup_line(&next_prepared.effect_text, card_name)
                     || is_standalone_spell_keyword_action_line(&prepared_line.effect_text)
                     || !is_spell_resolution_instruction_line(
@@ -5654,6 +5674,55 @@ mod tests {
         );
         assert!(r.abilities.is_empty());
         assert_eq!(r.statics.len(), 1);
+    }
+
+    #[test]
+    fn quoted_spell_grant_does_not_absorb_next_line_delayed_trigger() {
+        let r = parse(
+            "Until end of turn, target creature gains haste and \"{0}: Untap this creature. Activate only once.\"\nDraw a card at the beginning of the next turn's upkeep.",
+            "Touch of Vitae",
+            &[],
+            &["Instant"],
+            &[],
+        );
+
+        assert!(
+            r.parse_warnings
+                .iter()
+                .all(|warning| !matches!(warning, OracleDiagnostic::CascadeLoss { .. })),
+            "unexpected cascade-loss warning: {:?}",
+            r.parse_warnings
+        );
+        assert_eq!(r.abilities.len(), 2);
+
+        let first = &r.abilities[0];
+        assert_eq!(
+            first.duration,
+            Some(crate::types::ability::Duration::UntilEndOfTurn)
+        );
+        let Effect::GenericEffect {
+            static_abilities,
+            target,
+            ..
+        } = &*first.effect
+        else {
+            panic!("expected immediate GenericEffect, got {:?}", first.effect);
+        };
+        assert!(matches!(target, Some(TargetFilter::Typed(_))));
+        assert!(static_abilities.iter().any(|static_def| {
+            static_def.modifications.iter().any(|modification| {
+                matches!(
+                    modification,
+                    ContinuousModification::GrantAbility { definition }
+                        if matches!(&*definition.effect, Effect::Untap { .. })
+                )
+            })
+        }));
+
+        assert!(matches!(
+            *r.abilities[1].effect,
+            Effect::CreateDelayedTrigger { .. }
+        ));
     }
 
     #[test]
