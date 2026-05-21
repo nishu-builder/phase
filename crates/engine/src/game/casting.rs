@@ -6096,13 +6096,19 @@ pub fn pay_ability_cost(
             counter_type,
             target: None,
         } => {
-            super::effects::counters::remove_counter_with_replacement(
+            // CR 601.2h: Resolve `CounterMatch::Any` to the concrete counter
+            // type currently present on the source before the replacement
+            // pipeline sees it — `remove_counter_with_replacement` operates on
+            // a single concrete kind. `OfType(t)` passes through unchanged.
+            if let Some(resolved) = super::effects::counters::resolve_counter_match_for_removal(
                 state,
                 source_id,
-                counter_type.clone(),
-                *count,
-                events,
-            );
+                counter_type,
+            ) {
+                super::effects::counters::remove_counter_with_replacement(
+                    state, source_id, resolved, *count, events,
+                );
+            }
         }
         // Targeted remove-counter costs ("remove a counter from target X") would
         // need an interactive WaitingFor flow to let the player pick the permanent.
@@ -20064,7 +20070,7 @@ mod tests {
                 StaticDefinition::new(StaticMode::PayLifeAsColoredMana {
                     color: ManaColor::Black,
                 })
-                .affected(TargetFilter::Player),
+                .affected(TargetFilter::Controller),
             );
             id
         }
@@ -20130,6 +20136,45 @@ mod tests {
             assert!(
                 state.stack.iter().any(|s| s.source_id == spell),
                 "CR 601.2a: successful cast must push the spell onto the stack"
+            );
+        }
+
+        /// CR 107.4f: K'rrik's "you may" permission applies only to K'rrik's
+        /// controller. A battlefield K'rrik must not make an opponent's normal
+        /// `{B}` costs payable as though they were Phyrexian mana.
+        #[test]
+        fn krrik_life_payment_permission_affects_only_controller() {
+            use crate::types::mana::ManaColor;
+
+            let mut state = setup_game_at_main_phase();
+            add_krrik_static(&mut state, PlayerId(0));
+            state.players[0].life = 20;
+            state.players[1].life = 20;
+
+            assert!(
+                crate::game::static_abilities::player_life_payment_colors(&state, PlayerId(0))
+                    .contains(ManaColor::Black),
+                "CR 107.4f: K'rrik's controller gets the black life-payment permission"
+            );
+            assert!(
+                !crate::game::static_abilities::player_life_payment_colors(&state, PlayerId(1))
+                    .contains(ManaColor::Black),
+                "CR 107.4f: opponents must not get K'rrik's black life-payment permission"
+            );
+
+            let opponent_spell =
+                create_instant_with_cost(&mut state, PlayerId(1), vec![ManaCostShard::Black], 0);
+            assert!(
+                !can_pay_cost_after_auto_tap(
+                    &state,
+                    PlayerId(1),
+                    opponent_spell,
+                    &ManaCost::Cost {
+                        shards: vec![ManaCostShard::Black],
+                        generic: 0,
+                    },
+                ),
+                "CR 107.4f: opponent's ordinary {{B}} cost must not be payable via K'rrik life"
             );
         }
 
@@ -20497,7 +20542,7 @@ mod tests {
     // any activated ability whose cost is "Remove N {type} counters from ~".
     mod remove_counter_cost {
         use super::*;
-        use crate::types::counter::CounterType;
+        use crate::types::counter::{CounterMatch, CounterType};
 
         fn source_with_counters(
             state: &mut GameState,
@@ -20528,7 +20573,7 @@ mod tests {
             let source = source_with_counters(&mut state, CounterType::Plus1Plus1, 2);
             let cost = AbilityCost::RemoveCounter {
                 count: 2,
-                counter_type: CounterType::Plus1Plus1,
+                counter_type: CounterMatch::OfType(CounterType::Plus1Plus1),
                 target: None,
             };
             let mut events = Vec::new();
@@ -20565,7 +20610,7 @@ mod tests {
             let source = source_with_counters(&mut state, CounterType::Plus1Plus1, 0);
             let cost = AbilityCost::RemoveCounter {
                 count: 1,
-                counter_type: CounterType::Plus1Plus1,
+                counter_type: CounterMatch::OfType(CounterType::Plus1Plus1),
                 target: None,
             };
             assert!(
@@ -20584,7 +20629,7 @@ mod tests {
             let source = source_with_counters(&mut state, CounterType::Plus1Plus1, 1);
             let cost = AbilityCost::RemoveCounter {
                 count: 2,
-                counter_type: CounterType::Plus1Plus1,
+                counter_type: CounterMatch::OfType(CounterType::Plus1Plus1),
                 target: None,
             };
             assert!(
@@ -20604,7 +20649,7 @@ mod tests {
             let source = source_with_counters(&mut state, CounterType::Plus1Plus1, 3);
             let cost = AbilityCost::RemoveCounter {
                 count: 1,
-                counter_type: CounterType::Plus1Plus1,
+                counter_type: CounterMatch::OfType(CounterType::Plus1Plus1),
                 target: None,
             };
             let mut events = Vec::new();

@@ -216,6 +216,38 @@ pub(crate) fn apply_counter_removal(
     }
 }
 
+/// CR 601.2h: Resolve a `CounterMatch` cost intent against the counters
+/// currently on `object_id`, returning the concrete `CounterType` that the
+/// cost will actually remove. `OfType(t)` passes through unchanged; `Any`
+/// picks the type with the largest current count from the object's counter
+/// map (so the cost is satisfiable iff at least one counter is present). The
+/// largest-count heuristic is rules-correct for single-type permanents (Loch
+/// Mare's -1/-1 only) and deterministic-enough for multi-type fallbacks
+/// pending a NeedsChoice prompt for the player paying the cost to choose
+/// (CR 601.2h: the player makes the choices required to pay — follow-up work).
+///
+/// Returns `None` when `Any` is requested but the object has no counters.
+/// Callers should treat that as "skip the removal step" — the payability
+/// gate (`cost_payability::counter_on_object`) already prevents activation in
+/// that case, so this is defense-in-depth.
+pub fn resolve_counter_match_for_removal(
+    state: &GameState,
+    object_id: ObjectId,
+    counter_type: &crate::types::counter::CounterMatch,
+) -> Option<CounterType> {
+    match counter_type {
+        crate::types::counter::CounterMatch::OfType(t) => Some(t.clone()),
+        crate::types::counter::CounterMatch::Any => state
+            .objects
+            .get(&object_id)?
+            .counters
+            .iter()
+            .filter(|(_, &n)| n > 0)
+            .max_by_key(|(_, &n)| n)
+            .map(|(ty, _)| ty.clone()),
+    }
+}
+
 /// CR 614.1: Remove counters from an object through the replacement pipeline.
 ///
 /// Single authority for counter removal, mirroring `add_counter_with_replacement`.

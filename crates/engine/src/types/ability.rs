@@ -3987,9 +3987,16 @@ pub enum AbilityCost {
         count: u32,
         filter: TargetFilter,
     },
+    /// CR 122.1 + CR 601.2h: Remove `count` counters matching `counter_type`
+    /// as an additional cost. `CounterMatch::Any` is the untyped "remove a
+    /// counter" form (Loch Mare's `{1}{U}, Remove a counter from ~`); the
+    /// payment path sums across every counter type on the chosen permanent
+    /// and resolves to a concrete kind at payment time. `CounterMatch::OfType`
+    /// is the typed form ("remove a +1/+1 counter", "remove a charge counter"),
+    /// scoped to a single counter kind.
     RemoveCounter {
         count: u32,
-        counter_type: CounterType,
+        counter_type: CounterMatch,
         #[serde(default)]
         target: Option<TargetFilter>,
     },
@@ -11734,7 +11741,7 @@ mod tests {
         fn remove_counter() {
             let cost = AbilityCost::RemoveCounter {
                 count: 1,
-                counter_type: CounterType::Plus1Plus1,
+                counter_type: CounterMatch::OfType(CounterType::Plus1Plus1),
                 target: None,
             };
             assert_eq!(cost.categories(), vec![CostCategory::RemovesCounters]);

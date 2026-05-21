@@ -172,6 +172,22 @@ pub fn parse_counter_type(text: &str) -> CounterType {
     }
 }
 
+/// CR 122.1: Parse the type-word slot of cost text — the word that fills the
+/// `<type>` in "remove a `<type>` counter" / "remove N `<type>` counters" /
+/// "remove all `<type>` counters". The bare noun (no type word, just
+/// "counter"/"counters") parses to `CounterMatch::Any`, capturing the "any
+/// kind on the chosen permanent" semantics that the cost field is designed
+/// for. A real type word parses through `parse_counter_type` and wraps in
+/// `CounterMatch::OfType`. This is the single normalization site every cost
+/// parser should call when emitting `AbilityCost::RemoveCounter::counter_type`.
+pub fn parse_counter_match(text: &str) -> CounterMatch {
+    let trimmed = text.trim();
+    if trimmed.eq_ignore_ascii_case("counter") || trimmed.eq_ignore_ascii_case("counters") {
+        return CounterMatch::Any;
+    }
+    CounterMatch::OfType(parse_counter_type(text))
+}
+
 fn parse_parameterized_or_named_counter_type(other: &str) -> CounterType {
     if let Some((power, toughness)) = parse_power_toughness_counter(other) {
         return CounterType::PowerToughness { power, toughness };
