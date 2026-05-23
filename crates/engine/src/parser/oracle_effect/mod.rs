@@ -10089,6 +10089,13 @@ fn rewrite_player_scope_refs(def: &mut AbilityDefinition) {
                         player: PlayerScope::ScopedPlayer,
                     }
                 }
+                QuantityRef::HandSize {
+                    player: PlayerScope::Target,
+                } => {
+                    *qty = QuantityRef::HandSize {
+                        player: PlayerScope::ScopedPlayer,
+                    }
+                }
                 QuantityRef::TargetZoneCardCount { zone } => match zone {
                     crate::types::ability::ZoneRef::Hand => {
                         *qty = QuantityRef::HandSize {
@@ -20504,7 +20511,25 @@ mod tests {
             AbilityKind::Spell,
         );
         assert_eq!(def.player_scope, Some(PlayerFilter::All));
-        assert!(matches!(&*def.effect, Effect::Discard { .. }));
+        // CR 109.5 + CR 115.10: "their hand" under `player_scope: All` must
+        // resolve the count against the iterating player, not the caster.
+        // Regression for the Windfall bug where opponents drew without
+        // discarding because `HandSize { Controller }` survived the rebind.
+        assert!(
+            matches!(
+                &*def.effect,
+                Effect::Discard {
+                    count: QuantityExpr::Ref {
+                        qty: QuantityRef::HandSize {
+                            player: PlayerScope::ScopedPlayer,
+                        },
+                    },
+                    ..
+                }
+            ),
+            "expected HandSize {{ ScopedPlayer }}, got {:?}",
+            def.effect
+        );
         let sub = def
             .sub_ability
             .as_ref()
@@ -20517,6 +20542,24 @@ mod tests {
                     qty: QuantityRef::PreviousEffectAmount
                 },
                 target: TargetFilter::Controller,
+            }
+        ));
+    }
+
+    #[test]
+    fn target_player_discards_their_hand_uses_target_hand_size() {
+        let def = parse_effect_chain("Target player discards their hand.", AbilityKind::Spell);
+        assert_eq!(def.player_scope, None);
+        assert!(matches!(
+            &*def.effect,
+            Effect::Discard {
+                target: TargetFilter::Player,
+                count: QuantityExpr::Ref {
+                    qty: QuantityRef::HandSize {
+                        player: PlayerScope::Target,
+                    },
+                },
+                ..
             }
         ));
     }

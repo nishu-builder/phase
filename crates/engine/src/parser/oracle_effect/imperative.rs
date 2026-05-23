@@ -922,24 +922,24 @@ pub(super) fn parse_targeted_action_ast(
         .parse(after_discard)
         .map(|(rest, _)| rest)
         .unwrap_or(after_discard);
-        // Detect whole-hand discard patterns before falling through to count parsing.
-        // Uses tag prefix (not contains) to avoid matching "discard a card from your hand".
-        //
-        // CR 109.5: "your hand" is the caster (Controller). "their hand" /
-        // "his or her hand" is the discarding subject's OWN hand — under an
-        // each-player scope ("Each player discards their hand", Wheel of Fortune)
-        // this is the iterated player (ScopedPlayer), so each player discards
-        // their own hand instead of a count fixed to the caster's. ScopedPlayer
-        // falls back to Controller outside iteration, so non-scoped uses are
-        // unaffected. (#781)
-        if let Ok((_, hand_owner)) = alt((
-            value(
-                PlayerScope::Controller,
-                tag::<_, _, OracleError<'_>>("your hand"),
-            ),
-            value(PlayerScope::ScopedPlayer, tag("their hand")),
-            value(PlayerScope::ScopedPlayer, tag("his or her hand")),
-        ))
+        // CR 109.5 + CR 115.10: Whole-hand discard. The possessive pronoun
+        // disambiguates the hand-size owner. "Your hand" is the caster's hand
+        // (`Controller`); "their hand" / "his or her hand" is the subject's
+        // hand, represented here as `Target`. Under an each-player wrapper,
+        // `rewrite_player_scope_refs` rewrites that target-scoped hand-size to
+        // `ScopedPlayer`, so Windfall-style effects bind to the iterating
+        // player instead of the caster.
+        if let Ok((_, hand_owner)) = preceded(
+            alt((
+                value(
+                    PlayerScope::Controller,
+                    tag::<_, _, OracleError<'_>>("your"),
+                ),
+                value(PlayerScope::Target, tag("their")),
+                value(PlayerScope::Target, tag("his or her")),
+            )),
+            tag(" hand"),
+        )
         .parse(after_discard)
         {
             return Some(TargetedImperativeAst::Discard {
@@ -7617,12 +7617,10 @@ mod tests {
 
     #[test]
     fn parse_discard_their_hand() {
-        // CR 109.5 (#781): "their hand" is the discarding subject's OWN hand, not
-        // the caster's. Under an each-player scope ("Each player discards their
-        // hand", Wheel of Fortune) this must bind to the iterated player
-        // (ScopedPlayer) so each player discards their own hand; ScopedPlayer
-        // falls back to Controller outside iteration, so singular subjects are
-        // unaffected. Contrast `parse_discard_your_hand` ("your" = Controller).
+        // CR 109.5 + CR 115.10: "their" in a discard imperative refers to
+        // the subject, not the printed ability controller. The local
+        // imperative parser represents that as `Target`; an outer
+        // each-player scope rewrites it to `ScopedPlayer`.
         let text = "discard their hand";
         let lower = text.to_lowercase();
         let result = parse_targeted_action_ast(text, &lower, &mut ParseContext::default());
@@ -7633,11 +7631,11 @@ mod tests {
                         count,
                         QuantityExpr::Ref {
                             qty: QuantityRef::HandSize {
-                                player: PlayerScope::ScopedPlayer
+                                player: PlayerScope::Target
                             }
                         }
                     ),
-                    "Expected HandSize ref scoped to ScopedPlayer, got {count:?}"
+                    "Expected HandSize ref scoped to Target, got {count:?}"
                 );
             }
             other => panic!("Expected Discard with HandSize, got {other:?}"),
