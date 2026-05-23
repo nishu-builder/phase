@@ -35,6 +35,32 @@ The WebSocket endpoint is that host with `/ws`:
 wss://phase-lobby.<your-subdomain>.workers.dev/ws
 ```
 
+## Enable TURN relay (ephemeral credentials)
+
+The Worker mints short-lived Cloudflare Realtime TURN credentials at
+`GET /turn-credentials`, so the client never ships static TURN creds. Until this
+is configured, the endpoint returns 503 and the client falls back to STUN-only
+(direct connections work; symmetric-NAT/CGNAT peers can't relay).
+
+1. In the Cloudflare dashboard → **Realtime → TURN**, create a TURN key. Note
+   the **Key ID** and the **API token**.
+2. Put the Key ID in `wrangler.toml` under `[vars]` → `TURN_KEY_ID`.
+3. Set the API token as a secret (never commit it):
+   ```bash
+   npx wrangler secret put TURN_KEY_API_TOKEN
+   ```
+4. Redeploy: `npm run deploy`.
+5. Verify:
+   ```bash
+   curl https://lobby.phase-rs.dev/turn-credentials
+   # → {"iceServers":[{"urls":[...]},{"urls":[...],"username":"...","credential":"..."}]}
+   ```
+
+The client (`client/src/network/connection.ts`) fetches this from
+`TURN_CREDENTIALS_URL` and caches it for 6h. **Do CF TURN setup before deploying
+the client change**, or relay degrades to STUN-only until the endpoint is live.
+Free tier: 1,000 GB/mo relayed (≫ the prior Metered 20 GB).
+
 ## Test against the live app WITHOUT touching the production server
 
 The existing `phase-server` stays the default — this is exercised only via the

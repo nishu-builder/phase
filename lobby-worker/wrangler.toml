@@ -22,6 +22,22 @@ class_name = "LobbyDO"
 tag = "v1"
 new_sqlite_classes = ["LobbyDO"]
 
+[vars]
+# Cloudflare Realtime TURN key ID (NOT secret). Create a TURN key in the CF
+# dashboard (Realtime → TURN) — paste its Key ID here, then redeploy.
+TURN_KEY_ID = ""
+# Credential lifetime in seconds (Cloudflare max 48h). 24h covers any session.
+TURN_TTL_SECONDS = "86400"
+# Origin allowlist for the /turn-credentials fetch. "*" is fine during rollout
+# (TURN creds are short-lived; worst case is quota use). Tighten for prod, e.g.
+# "https://phase-rs.dev,http://localhost:5173".
+ALLOWED_ORIGINS = "*"
+
+# The TURN API token is a SECRET — never put it here. Set it with:
+#   npx wrangler secret put TURN_KEY_API_TOKEN
+# Until both TURN_KEY_ID and the secret are set, /turn-credentials returns 503
+# and the client falls back to STUN-only (relay disabled for symmetric NAT).
+
 # Test first on the automatic *.workers.dev URL (no config needed — just
 # `wrangler deploy`). When ready to serve from your own domain (the phase-rs.dev
 # zone is already on Cloudflare), uncomment this: `custom_domain = true` makes
