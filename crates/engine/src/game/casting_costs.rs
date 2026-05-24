@@ -5960,6 +5960,7 @@ mod tests {
                     choice: crate::types::game_state::ManaChoice::SingleColor(
                         crate::types::mana::ManaType::Red,
                     ),
+                    count: 1,
                 },
             )
             .expect("color choice succeeds");
@@ -6098,6 +6099,7 @@ mod tests {
                     choice: crate::types::game_state::ManaChoice::SingleColor(
                         crate::types::mana::ManaType::Red,
                     ),
+                    count: 1,
                 },
             )
             .expect("color choice succeeds");

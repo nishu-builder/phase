@@ -2013,18 +2013,46 @@ fn apply_action(
             WaitingFor::ChooseManaColor {
                 choice, context, ..
             },
-            GameAction::ChooseManaColor { choice: chosen },
+            GameAction::ChooseManaColor {
+                choice: chosen,
+                count,
+            },
         ) => {
             let events_before = events.len();
             let wf = match context {
                 crate::types::game_state::ManaChoiceContext::ManaAbility(pending_mana_ability) => {
-                    engine_casting::handle_choose_mana_color(
+                    // CR 605.3a: validate the requested batch size BEFORE any mana
+                    // is produced, so an out-of-range count rejects cleanly with
+                    // no partial application. The cap is the just-activated source
+                    // plus its choice-free identical twins.
+                    if count as usize > pending_mana_ability.batch_siblings.len() + 1 {
+                        return Err(EngineError::InvalidAction(format!(
+                            "ChooseManaColor count {count} exceeds the {} batchable sources",
+                            pending_mana_ability.batch_siblings.len() + 1
+                        )));
+                    }
+                    let wf = engine_casting::handle_choose_mana_color(
                         state,
                         pending_mana_ability,
                         choice,
                         chosen.clone(),
                         &mut events,
-                    )?
+                    )?;
+                    // CR 605.3a: one color choice may bulk-activate the player's
+                    // other identical, choice-free mana sources (their remaining
+                    // Treasures, etc.) with the same color. Sibling cost/mana
+                    // events append before the shared trigger scan below, so each
+                    // sacrifice's observers fire exactly once.
+                    if count > 1 {
+                        engine_casting::batch_activate_mana_siblings(
+                            state,
+                            pending_mana_ability,
+                            &chosen,
+                            count,
+                            &mut events,
+                        )?;
+                    }
+                    wf
                 }
                 crate::types::game_state::ManaChoiceContext::ResolvingEffect(pending_effect) => {
                     effects::mana::handle_choose_mana_effect(
@@ -7497,6 +7525,7 @@ mod tests {
                 choice: crate::types::game_state::ManaChoice::SingleColor(
                     crate::types::mana::ManaType::Green,
                 ),
+                count: 1,
             },
         )
         .unwrap();
@@ -9248,6 +9277,7 @@ mod tests {
                 choice: crate::types::game_state::ManaChoice::SingleColor(
                     crate::types::mana::ManaType::Green,
                 ),
+                count: 1,
             },
         )
         .unwrap();
@@ -9375,6 +9405,7 @@ mod tests {
                 choice: crate::types::game_state::ManaChoice::SingleColor(
                     crate::types::mana::ManaType::Green,
                 ),
+                count: 1,
             },
         )
         .unwrap();
@@ -9545,6 +9576,7 @@ mod tests {
                 choice: crate::types::game_state::ManaChoice::SingleColor(
                     crate::types::mana::ManaType::Green,
                 ),
+                count: 1,
             },
         )
         .unwrap();
@@ -9720,6 +9752,7 @@ mod tests {
             &mut state,
             GameAction::ChooseManaColor {
                 choice: crate::types::game_state::ManaChoice::SingleColor(ManaType::Green),
+                count: 1,
             },
         )
         .unwrap();
