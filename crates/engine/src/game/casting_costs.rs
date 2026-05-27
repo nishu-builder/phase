@@ -3960,6 +3960,18 @@ pub fn enter_payment_step(
         }
     }
 
+    if state
+        .pending_cast
+        .as_ref()
+        .is_some_and(|pending| pending.deferred_target_selection)
+    {
+        let pending = *state
+            .pending_cast
+            .take()
+            .expect("checked pending cast presence");
+        return begin_deferred_target_selection(state, player, pending, events);
+    }
+
     // CR 601.2h: Auto-finalize when no player-level decision remains. Convoke requires
     // the caster to choose which creatures to tap, so it always surfaces the modal.
     if convoke_mode.is_none() {

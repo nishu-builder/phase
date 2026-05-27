@@ -8182,9 +8182,9 @@ mod tests {
         ChosenSubtypeKind, Comparator, ContinuousModification, ControllerRef, CostCategory,
         FilterProp, GainLifePlayer, GameRestriction, KickerVariant, ManaContribution,
         ManaProduction, ManaSpendPermission, ManaSpendRestriction, ModalSelectionCondition,
-        ModalSelectionConstraint, ObjectProperty, ProhibitedActivity, QuantityExpr, QuantityRef,
-        RestrictionExpiry, RestrictionPlayerScope, SearchSelectionConstraint, StaticCondition,
-        StaticDefinition, TargetFilter, TypeFilter, TypedFilter,
+        ModalSelectionConstraint, ObjectProperty, ProhibitedActivity, PtValue, QuantityExpr,
+        QuantityRef, RestrictionExpiry, RestrictionPlayerScope, SearchSelectionConstraint,
+        StaticCondition, StaticDefinition, TargetFilter, TypeFilter, TypedFilter,
     };
     use crate::types::actions::GameAction;
     use crate::types::card_type::{CoreType, Supertype};
@@ -16854,6 +16854,165 @@ mod tests {
             }
             _ => panic!("expected Spell on stack"),
         }
+    }
+
+    #[test]
+    fn modal_x_target_legality_chooses_x_before_targets() {
+        let mut state = setup_game_at_main_phase();
+        let spell_id = create_object(
+            &mut state,
+            CardId(61),
+            PlayerId(0),
+            "Test Kozilek Command".to_string(),
+            Zone::Hand,
+        );
+        {
+            let obj = state.objects.get_mut(&spell_id).unwrap();
+            obj.card_types.core_types.push(CoreType::Instant);
+            obj.mana_cost = ManaCost::Cost {
+                shards: vec![
+                    ManaCostShard::X,
+                    ManaCostShard::Colorless,
+                    ManaCostShard::Colorless,
+                ],
+                generic: 0,
+            };
+            Arc::make_mut(&mut obj.abilities).push(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Token {
+                    name: "Eldrazi Spawn".to_string(),
+                    power: PtValue::Fixed(0),
+                    toughness: PtValue::Fixed(1),
+                    types: vec![
+                        "Creature".to_string(),
+                        "Eldrazi".to_string(),
+                        "Spawn".to_string(),
+                    ],
+                    colors: vec![],
+                    keywords: vec![],
+                    tapped: false,
+                    count: QuantityExpr::Ref {
+                        qty: QuantityRef::Variable {
+                            name: "X".to_string(),
+                        },
+                    },
+                    owner: TargetFilter::Controller,
+                    attach_to: None,
+                    enters_attacking: false,
+                    supertypes: vec![],
+                    static_abilities: vec![],
+                    enter_with_counters: vec![],
+                },
+            ));
+            Arc::make_mut(&mut obj.abilities).push(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::ChangeZone {
+                    origin: None,
+                    destination: Zone::Exile,
+                    target: TargetFilter::Typed(TypedFilter::creature().properties(vec![
+                        FilterProp::Cmc {
+                            comparator: Comparator::LE,
+                            value: QuantityExpr::Ref {
+                                qty: QuantityRef::Variable {
+                                    name: "X".to_string(),
+                                },
+                            },
+                        },
+                    ])),
+                    owner_library: false,
+                    enter_transformed: false,
+                    under_your_control: false,
+                    enter_tapped: false,
+                    enters_attacking: false,
+                    up_to: false,
+                    enter_with_counters: vec![],
+                },
+            ));
+            obj.modal = Some(crate::types::ability::ModalChoice {
+                min_choices: 2,
+                max_choices: 2,
+                mode_count: 2,
+                mode_descriptions: vec![
+                    "Create X Eldrazi Spawn tokens.".to_string(),
+                    "Exile target creature with mana value X or less.".to_string(),
+                ],
+                ..Default::default()
+            });
+        }
+
+        let creature = create_object(
+            &mut state,
+            CardId(62),
+            PlayerId(1),
+            "Two Drop".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&creature).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.power = Some(2);
+            obj.toughness = Some(2);
+            obj.mana_cost = ManaCost::generic(2);
+        }
+        let other_creature = create_object(
+            &mut state,
+            CardId(63),
+            PlayerId(1),
+            "Other Two Drop".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&other_creature).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.power = Some(2);
+            obj.toughness = Some(2);
+            obj.mana_cost = ManaCost::generic(2);
+        }
+        add_mana(&mut state, PlayerId(0), ManaType::Colorless, 4);
+
+        let mut events = Vec::new();
+        state.waiting_for =
+            handle_cast_spell(&mut state, PlayerId(0), spell_id, CardId(61), &mut events).unwrap();
+        state.waiting_for =
+            handle_select_modes(&mut state, PlayerId(0), vec![0, 1], &mut events).unwrap();
+        assert!(
+            matches!(state.waiting_for, WaitingFor::ChooseXValue { .. }),
+            "X must be chosen before building target slots whose legality depends on X"
+        );
+
+        state.waiting_for = apply_as_current(&mut state, GameAction::ChooseX { value: 2 })
+            .unwrap()
+            .waiting_for;
+        match &state.waiting_for {
+            WaitingFor::TargetSelection { target_slots, .. } => {
+                assert_eq!(target_slots.len(), 1);
+                assert!(target_slots[0]
+                    .legal_targets
+                    .contains(&TargetRef::Object(creature)));
+                assert!(target_slots[0]
+                    .legal_targets
+                    .contains(&TargetRef::Object(other_creature)));
+            }
+            other => panic!("expected target selection after choosing X, got {other:?}"),
+        }
+
+        state.waiting_for = apply_as_current(
+            &mut state,
+            GameAction::SelectTargets {
+                targets: vec![TargetRef::Object(creature)],
+            },
+        )
+        .unwrap()
+        .waiting_for;
+
+        stack::resolve_top(&mut state, &mut events);
+        assert_eq!(state.objects[&creature].zone, Zone::Exile);
+        let spawn_count = state
+            .battlefield
+            .iter()
+            .filter(|id| state.objects[id].name == "Eldrazi Spawn")
+            .count();
+        assert_eq!(spawn_count, 2);
     }
 
     #[test]

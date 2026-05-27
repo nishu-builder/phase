@@ -1,8 +1,9 @@
 use crate::types::ability::{
     AbilityCondition, AbilityDefinition, CardTypeSetSource, CastManaSpentMetric, ControllerRef,
-    Effect, GameRestriction, ModalChoice, ModalSelectionCondition, ModalSelectionConstraint,
-    ObjectScope, PlayerFilter, QuantityExpr, QuantityRef, ResolvedAbility, RestrictionPlayerScope,
-    SpellContext, TargetChoiceTiming, TargetFilter, TargetRef, TypeFilter, TypedFilter,
+    Effect, FilterProp, GameRestriction, ModalChoice, ModalSelectionCondition,
+    ModalSelectionConstraint, ObjectScope, PlayerFilter, QuantityExpr, QuantityRef,
+    ResolvedAbility, RestrictionPlayerScope, SpellContext, TargetChoiceTiming, TargetFilter,
+    TargetRef, TypeFilter, TypedFilter,
 };
 #[cfg(test)]
 use crate::types::counter::CounterType;
@@ -878,12 +879,11 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
             .filter(|filter| !filter.is_context_ref())
             .zip(validated.targets.iter())
             .filter_map(|(filter, target_ref)| {
-                let legal = targeting::validate_targets(
+                let legal = targeting::validate_targets_for_ability(
                     state,
                     std::slice::from_ref(target_ref),
                     filter,
-                    validated.controller,
-                    validated.source_id,
+                    &validated,
                 );
                 legal.into_iter().next()
             })
@@ -894,12 +894,11 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
             .filter(|filter| attach_filter_needs_target_slot(filter))
             .zip(validated.targets.iter())
             .filter_map(|(filter, target_ref)| {
-                let legal = targeting::validate_targets(
+                let legal = targeting::validate_targets_for_ability(
                     state,
                     std::slice::from_ref(target_ref),
                     filter,
-                    validated.controller,
-                    validated.source_id,
+                    &validated,
                 );
                 legal.into_iter().next()
             })
@@ -915,12 +914,11 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
                     .cloned()
                     .collect()
             }
-            Some(filter) => targeting::validate_targets(
+            Some(filter) => targeting::validate_targets_for_ability(
                 state,
                 &validated.targets,
                 filter,
-                validated.controller,
-                validated.source_id,
+                &validated,
             ),
             // CR 608.2b: A context-ref filter (`ParentTarget`,
             // `TriggeringSource`, etc.) carries a resolution-time *snapshot*,
@@ -1242,6 +1240,78 @@ fn quantity_expr_has_unresolved_variable(
         QuantityExpr::Difference { left, right } => {
             quantity_expr_has_unresolved_variable(state, ability, left)
                 || quantity_expr_has_unresolved_variable(state, ability, right)
+        }
+        QuantityExpr::Fixed { .. } | QuantityExpr::Ref { .. } => false,
+    }
+}
+
+pub fn ability_target_legality_needs_chosen_x(ability: &ResolvedAbility) -> bool {
+    if ability.chosen_x.is_some() {
+        return false;
+    }
+    ability_target_legality_needs_chosen_x_inner(ability)
+}
+
+fn ability_target_legality_needs_chosen_x_inner(ability: &ResolvedAbility) -> bool {
+    triggers::extract_target_filter_from_effect(&ability.effect)
+        .is_some_and(|filter| target_filter_needs_chosen_x(ability, filter))
+        || ability.multi_target.as_ref().is_some_and(|spec| {
+            spec.max
+                .as_ref()
+                .is_some_and(|expr| quantity_expr_has_unresolved_x(ability, expr))
+        })
+        || ability
+            .sub_ability
+            .as_deref()
+            .is_some_and(ability_target_legality_needs_chosen_x_inner)
+        || ability
+            .else_ability
+            .as_deref()
+            .is_some_and(ability_target_legality_needs_chosen_x_inner)
+}
+
+fn target_filter_needs_chosen_x(ability: &ResolvedAbility, filter: &TargetFilter) -> bool {
+    ability.chosen_x.is_none() && target_filter_contains_chosen_x_ref(filter)
+}
+
+fn target_filter_contains_chosen_x_ref(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::Typed(typed) => typed.properties.iter().any(|prop| match prop {
+            FilterProp::Cmc { value, .. } | FilterProp::Counters { count: value, .. } => {
+                quantity_expr_contains_x(value)
+            }
+            FilterProp::CanEnchant { target } => target_filter_contains_chosen_x_ref(target),
+            _ => false,
+        }),
+        TargetFilter::Not { filter } | TargetFilter::TrackedSetFiltered { filter, .. } => {
+            target_filter_contains_chosen_x_ref(filter)
+        }
+        TargetFilter::Or { filters } | TargetFilter::And { filters } => {
+            filters.iter().any(target_filter_contains_chosen_x_ref)
+        }
+        _ => false,
+    }
+}
+
+fn quantity_expr_has_unresolved_x(ability: &ResolvedAbility, expr: &QuantityExpr) -> bool {
+    ability.chosen_x.is_none() && quantity_expr_contains_x(expr)
+}
+
+fn quantity_expr_contains_x(expr: &QuantityExpr) -> bool {
+    match expr {
+        QuantityExpr::Ref {
+            qty: QuantityRef::Variable { name },
+        } => name == "X",
+        QuantityExpr::Offset { inner, .. }
+        | QuantityExpr::Multiply { inner, .. }
+        | QuantityExpr::DivideRounded { inner, .. }
+        | QuantityExpr::UpTo { max: inner }
+        | QuantityExpr::Power {
+            exponent: inner, ..
+        } => quantity_expr_contains_x(inner),
+        QuantityExpr::Sum { exprs } => exprs.iter().any(quantity_expr_contains_x),
+        QuantityExpr::Difference { left, right } => {
+            quantity_expr_contains_x(left) || quantity_expr_contains_x(right)
         }
         QuantityExpr::Fixed { .. } | QuantityExpr::Ref { .. } => false,
     }
@@ -1733,8 +1803,12 @@ fn legal_targets_for_ability_filter(
         return targets;
     }
 
+    let needs_ability_context = target_filter_contains_chosen_x_ref(filter);
     let relative_kind = relative_controller_kind(filter);
     if relative_kind.is_none() {
+        if needs_ability_context {
+            return targeting::find_legal_targets_for_ability(state, filter, ability);
+        }
         return targeting::find_legal_targets(state, filter, ability.controller, ability.source_id);
     }
 
@@ -1745,6 +1819,9 @@ fn legal_targets_for_ability_filter(
                 .iter()
                 .all(|target| matches!(target, TargetRef::Player(_)))
     }) else {
+        if needs_ability_context {
+            return targeting::find_legal_targets_for_ability(state, filter, ability);
+        }
         return targeting::find_legal_targets(state, filter, ability.controller, ability.source_id);
     };
 
@@ -1772,9 +1849,17 @@ fn legal_targets_for_ability_filter(
             TargetRef::Object(_) => None,
         })
     {
-        for target in
+        let targets = if needs_ability_context {
+            targeting::find_legal_targets_for_ability_with_controller(
+                state,
+                &enumeration_filter,
+                ability,
+                player_id,
+            )
+        } else {
             targeting::find_legal_targets(state, &enumeration_filter, player_id, ability.source_id)
-        {
+        };
+        for target in targets {
             if !legal_targets.contains(&target) {
                 legal_targets.push(target);
             }
@@ -2040,6 +2125,18 @@ fn legal_targets_for_selected_slot(
     } else {
         ability.controller
     };
+
+    if target_filter_contains_chosen_x_ref(&spec.filter) {
+        if controller == ability.controller {
+            return targeting::find_legal_targets_for_ability(state, &spec.filter, ability);
+        }
+        return targeting::find_legal_targets_for_ability_with_controller(
+            state,
+            &spec.filter,
+            ability,
+            controller,
+        );
+    }
 
     targeting::find_legal_targets(state, &spec.filter, controller, ability.source_id)
 }

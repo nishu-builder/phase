@@ -1426,9 +1426,11 @@ pub enum WaitingFor {
         convoke_mode: Option<ConvokeMode>,
     },
     /// CR 107.1b + CR 601.2f: Caster chooses the value of X for a pending cast
-    /// whose cost contains `ManaCostShard::X`. Fires after target selection and
-    /// before `ManaPayment`. `max` is the engine-computed upper bound for UI
-    /// display and AI enumeration (see `casting_costs::max_x_value`).
+    /// whose cost contains `ManaCostShard::X`. Usually fires after target
+    /// selection and before `ManaPayment`; fires before target selection when a
+    /// selected mode's target legality depends on X. `max` is the
+    /// engine-computed upper bound for UI display and AI enumeration (see
+    /// `casting_costs::max_x_value`).
     /// `min` defaults to zero and is raised by parser-stamped restrictions such
     /// as "X can't be 0."
     /// `convoke_mode` passes through to the subsequent `ManaPayment` step.
