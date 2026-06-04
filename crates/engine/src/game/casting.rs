@@ -19052,6 +19052,70 @@ mod tests {
         );
     }
 
+    #[test]
+    fn affinity_for_daleks_reduces_dalek_emperor_generic_cost() {
+        let mut state = setup_game_at_main_phase();
+        let emperor_id = create_object(
+            &mut state,
+            CardId(2184),
+            PlayerId(0),
+            "The Dalek Emperor".to_string(),
+            Zone::Hand,
+        );
+        {
+            let obj = state.objects.get_mut(&emperor_id).unwrap();
+            obj.card_types.core_types.push(CoreType::Artifact);
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.card_types.supertypes.push(Supertype::Legendary);
+            obj.card_types.subtypes.push("Dalek".to_string());
+            obj.mana_cost = ManaCost::Cost {
+                shards: vec![ManaCostShard::Black, ManaCostShard::Red],
+                generic: 5,
+            };
+            obj.keywords
+                .push("Affinity for Daleks".parse::<Keyword>().unwrap());
+        }
+
+        for i in 0u64..4 {
+            let id = create_object(
+                &mut state,
+                CardId(2200 + i),
+                PlayerId(0),
+                format!("Dalek Token {i}"),
+                Zone::Battlefield,
+            );
+            let obj = state.objects.get_mut(&id).unwrap();
+            obj.card_types.core_types.push(CoreType::Artifact);
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.card_types.subtypes.push("Dalek".to_string());
+        }
+        let opponent_dalek = create_object(
+            &mut state,
+            CardId(2300),
+            PlayerId(1),
+            "Opponent Dalek".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&opponent_dalek).unwrap();
+            obj.card_types.core_types.push(CoreType::Artifact);
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.card_types.subtypes.push("Dalek".to_string());
+        }
+
+        let cost = effective_spell_cost(&state, PlayerId(0), emperor_id)
+            .expect("Dalek Emperor cost should compute");
+        let ManaCost::Cost { generic, shards } = cost else {
+            panic!("expected mana cost");
+        };
+        assert_eq!(generic, 1, "four controlled Daleks reduce {{5}} to {{1}}");
+        assert_eq!(
+            shards,
+            vec![ManaCostShard::Black, ManaCostShard::Red],
+            "Affinity only reduces generic mana"
+        );
+    }
+
     // Witherbloom, the Balancer's second clause: "Instant and sorcery spells you cast
     // have affinity for creatures." This is a static ability that functions while
     // Witherbloom is on the battlefield. When the player casts an instant or sorcery,
