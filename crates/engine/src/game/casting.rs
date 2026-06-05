@@ -15127,6 +15127,7 @@ mod tests {
                         controller: Some(ControllerRef::You),
                     },
                     retarget: CopyRetargetPermission::MayChooseNewTargets,
+                    copier: None,
                 },
             )
             .cost(AbilityCost::Composite {
