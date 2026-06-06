@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::game::filter;
 use crate::game::speed::has_max_speed;
@@ -783,7 +783,38 @@ pub(crate) fn parent_referent_context_from_events(
         return Some(snapshot);
     }
 
-    revealed_object_context_from_events(state, events)
+    if let Some(snapshot) = revealed_object_context_from_events(state, events) {
+        return Some(snapshot);
+    }
+
+    // CR 608.2c: a later instruction's "that creature" may refer to a single
+    // creature an earlier instruction in the same resolution tapped — e.g.
+    // Enlist's "+X/+0 … where X is the tapped creature's power". Tried last so
+    // sacrifice/move/reveal referents continue to take precedence. The tapped
+    // permanent stays on the battlefield, so it is snapshot live.
+    tapped_object_context_from_events(state, events)
+}
+
+/// CR 608.2c: capture a single creature tapped by the parent instruction as the
+/// resolution's anaphoric referent. A multi-permanent tap has no singular "that
+/// creature", so it yields no snapshot (mirroring the sacrifice/move guards).
+fn tapped_object_context_from_events(
+    state: &GameState,
+    events: &[GameEvent],
+) -> Option<CostPaidObjectSnapshot> {
+    let mut seen = HashSet::new();
+    let mut tapped = events.iter().filter_map(|event| match event {
+        GameEvent::PermanentTapped { object_id, .. } if seen.insert(*object_id) => state
+            .objects
+            .get(object_id)
+            .map(|obj| CostPaidObjectSnapshot {
+                object_id: *object_id,
+                lki: obj.snapshot_for_mana_spent(),
+            }),
+        _ => None,
+    });
+    let first = tapped.next()?;
+    tapped.next().is_none().then_some(first)
 }
 
 fn sacrificed_object_context_from_events(
@@ -5590,6 +5621,120 @@ mod tests {
     use crate::types::statics::CastFrequency;
     use crate::types::triggers::TriggerMode;
     use crate::types::zones::Zone;
+
+    /// CR 608.2c: a single tapped creature becomes the resolution's anaphoric
+    /// referent, so a later "that creature's power" (Enlist) reads it.
+    #[test]
+    fn tapped_creature_is_captured_as_anaphoric_referent() {
+        let mut state = GameState::new_two_player(42);
+        let creature = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Tapped".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&creature).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_power = Some(3);
+            obj.base_toughness = Some(3);
+            obj.power = Some(3);
+            obj.toughness = Some(3);
+        }
+        let events = vec![GameEvent::PermanentTapped {
+            object_id: creature,
+            caused_by: None,
+        }];
+        let referent = parent_referent_context_from_events(&state, &events)
+            .expect("a single tapped creature must be captured as the anaphoric referent");
+        assert_eq!(referent.object_id, creature);
+        assert_eq!(
+            referent.lki.power,
+            Some(3),
+            "the referent snapshot carries the tapped creature's power"
+        );
+    }
+
+    /// A multi-creature tap has no singular "that creature" (mirrors the
+    /// sacrifice/move guards).
+    #[test]
+    fn multiple_tapped_creatures_yield_no_singular_referent() {
+        let mut state = GameState::new_two_player(42);
+        let a = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "A".to_string(),
+            Zone::Battlefield,
+        );
+        let b = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "B".to_string(),
+            Zone::Battlefield,
+        );
+        for id in [a, b] {
+            state
+                .objects
+                .get_mut(&id)
+                .unwrap()
+                .card_types
+                .core_types
+                .push(CoreType::Creature);
+        }
+        let events = vec![
+            GameEvent::PermanentTapped {
+                object_id: a,
+                caused_by: None,
+            },
+            GameEvent::PermanentTapped {
+                object_id: b,
+                caused_by: None,
+            },
+        ];
+        assert!(
+            parent_referent_context_from_events(&state, &events).is_none(),
+            "two tapped creatures have no singular anaphoric referent"
+        );
+    }
+
+    /// CR 608.2c: duplicate events for the same tapped creature still describe
+    /// one singular referent.
+    #[test]
+    fn duplicate_tap_events_for_same_creature_still_capture_single_referent() {
+        let mut state = GameState::new_two_player(42);
+        let creature = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Tapped".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&creature).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_power = Some(4);
+            obj.base_toughness = Some(4);
+            obj.power = Some(4);
+            obj.toughness = Some(4);
+        }
+        let events = vec![
+            GameEvent::PermanentTapped {
+                object_id: creature,
+                caused_by: None,
+            },
+            GameEvent::PermanentTapped {
+                object_id: creature,
+                caused_by: None,
+            },
+        ];
+        let referent = parent_referent_context_from_events(&state, &events)
+            .expect("duplicate tap events for one creature still have a singular referent");
+        assert_eq!(referent.object_id, creature);
+        assert_eq!(referent.lki.power, Some(4));
+    }
 
     #[test]
     fn is_known_effect_rejects_unimplemented() {

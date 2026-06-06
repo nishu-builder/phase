@@ -2045,6 +2045,10 @@ pub enum FilterProp {
     Tapped,
     /// CR 302.6 / CR 110.5: Untapped status as targeting qualifier.
     Untapped,
+    /// CR 302.6 + CR 702.10b + CR 702.154a: Matches creatures that either have
+    /// haste or have been under their controller's control continuously since
+    /// that player's most recent turn began. Used by Enlist's tap eligibility.
+    HasHasteOrControlledSinceTurnBegan,
     WithKeyword {
         value: Keyword,
     },
@@ -13837,6 +13841,7 @@ mod tests {
             FilterProp::Unblocked,
             FilterProp::Tapped,
             FilterProp::Untapped,
+            FilterProp::HasHasteOrControlledSinceTurnBegan,
             FilterProp::WithKeyword {
                 value: Keyword::Flying,
             },

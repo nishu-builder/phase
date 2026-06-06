@@ -147,6 +147,7 @@ fn filter_prop_uses_object_population(prop: &FilterProp) -> bool {
         | FilterProp::Unblocked
         | FilterProp::Tapped
         | FilterProp::Untapped
+        | FilterProp::HasHasteOrControlledSinceTurnBegan
         | FilterProp::WithKeyword { .. }
         | FilterProp::HasKeywordKind { .. }
         | FilterProp::WithoutKeyword { .. }
@@ -336,6 +337,7 @@ fn entered_object_perturbs_filter_prop(
         | FilterProp::Unblocked
         | FilterProp::Tapped
         | FilterProp::Untapped
+        | FilterProp::HasHasteOrControlledSinceTurnBegan
         | FilterProp::WithKeyword { .. }
         | FilterProp::HasKeywordKind { .. }
         | FilterProp::WithoutKeyword { .. }
@@ -2191,6 +2193,7 @@ fn spell_record_matches_property(record: &SpellCastRecord, prop: &FilterProp) ->
         | FilterProp::Unblocked
         | FilterProp::Tapped
         | FilterProp::Untapped
+        | FilterProp::HasHasteOrControlledSinceTurnBegan
         | FilterProp::Counters { .. }
         | FilterProp::Owned { .. }
         | FilterProp::Foretold
@@ -2496,6 +2499,12 @@ fn matches_filter_prop(
         FilterProp::Tapped => obj.tapped,
         // CR 302.6 / CR 110.5: Untapped status as targeting qualifier.
         FilterProp::Untapped => !obj.tapped,
+        // CR 302.6 + CR 702.10b + CR 702.154a: Enlist may tap a creature only
+        // if it has haste or has been controlled continuously since turn began.
+        FilterProp::HasHasteOrControlledSinceTurnBegan => {
+            obj.card_types.core_types.contains(&CoreType::Creature)
+                && !combat::has_summoning_sickness(obj)
+        }
         FilterProp::WithKeyword { value } => obj.has_keyword(value),
         FilterProp::CanEnchant { target } => obj.keywords.iter().any(|keyword| {
             let Keyword::Enchant(enchant_filter) = keyword else {
@@ -3278,6 +3287,7 @@ fn zone_change_record_matches_property(
         }),
         FilterProp::Tapped
         | FilterProp::Untapped
+        | FilterProp::HasHasteOrControlledSinceTurnBegan
         | FilterProp::AttackedThisTurn
         | FilterProp::BlockedThisTurn
         | FilterProp::AttackedOrBlockedThisTurn
@@ -4278,6 +4288,42 @@ mod tests {
             },
         ]));
         assert!(matches_target_filter(&state, bird, &filter, bird));
+    }
+
+    #[test]
+    fn has_haste_or_controlled_since_turn_began_matches_enlist_eligibility() {
+        let mut state = setup();
+        let source = add_creature(&mut state, PlayerId(0), "Enlister");
+        let established = add_creature(&mut state, PlayerId(0), "Established");
+        let sick = add_creature(&mut state, PlayerId(0), "Fresh");
+        let hasty = add_creature(&mut state, PlayerId(0), "Hasty");
+        let land = add_creature(&mut state, PlayerId(0), "Animated Land");
+
+        state.objects.get_mut(&sick).unwrap().summoning_sick = true;
+        {
+            let obj = state.objects.get_mut(&hasty).unwrap();
+            obj.summoning_sick = true;
+            obj.keywords.push(Keyword::Haste);
+        }
+        state.objects.get_mut(&land).unwrap().card_types.core_types = vec![CoreType::Land];
+
+        let filter = TargetFilter::Typed(
+            TypedFilter::default().properties(vec![FilterProp::HasHasteOrControlledSinceTurnBegan]),
+        );
+
+        assert!(matches_target_filter(&state, established, &filter, source));
+        assert!(
+            !matches_target_filter(&state, sick, &filter, source),
+            "summoning-sick creature without haste is not eligible for Enlist"
+        );
+        assert!(
+            matches_target_filter(&state, hasty, &filter, source),
+            "haste satisfies CR 702.154a even when the creature entered this turn"
+        );
+        assert!(
+            !matches_target_filter(&state, land, &filter, source),
+            "predicate is creature-specific when used without an outer creature filter"
+        );
     }
 
     /// CR 120.6 + CR 120.9 (audit H2): "Was dealt damage this turn" must consult
