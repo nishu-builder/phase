@@ -1530,7 +1530,7 @@ pub fn keyword_display_name(keyword: &Keyword) -> String {
         Keyword::Casualty(n) => format!("casualty {n}"),
         Keyword::Entwine(_) => "entwine".to_string(),
         Keyword::Affinity(_) => "affinity".to_string(),
-        Keyword::Splice(_) => "splice".to_string(),
+        Keyword::Splice { .. } => "splice".to_string(),
         Keyword::Bargain => "bargain".to_string(),
         Keyword::Sunburst => "sunburst".to_string(),
         Keyword::Champion(_) => "champion".to_string(),
@@ -2686,7 +2686,17 @@ mod tests {
         assert!(result.is_some(), "Should recognize as keyword line");
         let keywords = result.unwrap();
         assert_eq!(keywords.len(), 1);
-        assert!(matches!(keywords[0], Keyword::Splice(_)));
+        // CR 702.47a: the splice subtype AND its cost must both be captured.
+        match &keywords[0] {
+            Keyword::Splice { subtype, cost } => {
+                assert_eq!(subtype, "Arcane");
+                assert_eq!(
+                    *cost,
+                    crate::database::mtgjson::parse_mtgjson_mana_cost("{1}{W}")
+                );
+            }
+            other => panic!("expected Keyword::Splice, got {other:?}"),
+        }
     }
 
     #[test]

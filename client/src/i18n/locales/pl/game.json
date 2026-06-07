@@ -727,6 +727,14 @@
       "dontPay": "Nie płać",
       "takeEffect": "Przyjmij efekt"
     },
+    "spliceOffer": {
+      "title": "Połącz z Arcane?",
+      "subtitle": "Wybierz kartę do ujawnienia i połączenia z tym czarem albo rzuć go bez łączenia.",
+      "spliceCard": "Połącz {{name}}",
+      "decline": "Nie łącz",
+      "declineDescription": "Rzuć czar bez dodawania tekstu innej karty.",
+      "unknownCard": "Karta #{{id}}"
+    },
     "activationCost": {
       "title": "Wybierz koszt aktywacji"
     },

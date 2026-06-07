@@ -300,10 +300,13 @@ pub fn try_convert(rule: &Rule, path: &str) -> ConvResult<Option<Keyword>> {
         // the cost as `Box<Cost>`; engine takes only the mana cost.
         Rule::WebSlinging(c) => Keyword::WebSlinging(pure_mana(c, "Rule::WebSlinging", path)?),
 
-        // CR 702.47a: Splice onto [quality] [cost]. The engine keyword
-        // stores the quality string only (matching the native parser);
-        // splice-cost payment is not represented in the current keyword type.
-        Rule::SpliceOnto(spells, _cost) => Keyword::Splice(splice_quality(spells, path)?),
+        // CR 702.47a: Splice onto [quality] [cost]. The engine keyword carries
+        // both the quality string and the splice cost paid as an additional
+        // cost when the card is spliced onto a host spell.
+        Rule::SpliceOnto(spells, cost) => Keyword::Splice {
+            subtype: splice_quality(spells, path)?,
+            cost: pure_mana(cost, "Rule::SpliceOnto", path)?,
+        },
 
         // CR 702.56a: Replicate {cost} — additional-cost-on-cast copy
         // mechanic. Engine carries only the mana cost.

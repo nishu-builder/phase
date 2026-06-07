@@ -766,9 +766,13 @@ pub enum Keyword {
     /// Firebending N — produces N {R} when this creature attacks (Avatar crossover).
     Firebending(QuantityExpr),
 
-    /// CR 702.46a: Splice onto [type] — reveal from hand and pay splice cost while casting
-    /// a spell of the specified type to add this card's effects to that spell.
-    Splice(String),
+    /// CR 702.47a: Splice onto [type] [cost] — reveal this card from hand and pay
+    /// its splice cost as you cast a spell of the specified type to copy this
+    /// card's text box onto that spell.
+    Splice {
+        subtype: String,
+        cost: ManaCost,
+    },
     /// CR 702.166a: Bargain — you may sacrifice an artifact, enchantment, or token
     /// as an additional cost to cast this spell.
     Bargain,
@@ -1051,7 +1055,7 @@ impl Keyword {
             Keyword::Warp(_) => KeywordKind::Warp,
             Keyword::Devour(_) => KeywordKind::Devour,
             Keyword::Offspring(_) => KeywordKind::Offspring,
-            Keyword::Splice(_) => KeywordKind::Splice,
+            Keyword::Splice { .. } => KeywordKind::Splice,
             Keyword::Bargain => KeywordKind::Bargain,
             Keyword::Sunburst => KeywordKind::Sunburst,
             Keyword::Champion(_) => KeywordKind::Champion,
@@ -1866,12 +1870,18 @@ impl FromStr for Keyword {
                     // Strip "onto " prefix if present (e.g., "onto arcane {w}" → "arcane {w}")
                     let after_onto = p.strip_prefix("onto ").unwrap_or(p);
                     // Separate type name from cost — cost starts with '{'
-                    let type_str = match after_onto.find('{') {
-                        Some(brace_idx) => after_onto[..brace_idx].trim(),
-                        None => after_onto.trim(),
+                    let (type_str, cost_str) = match after_onto.find('{') {
+                        Some(brace_idx) => {
+                            (after_onto[..brace_idx].trim(), &after_onto[brace_idx..])
+                        }
+                        None => (after_onto.trim(), ""),
                     };
                     let capitalized = capitalize_first(type_str);
-                    return Ok(Keyword::Splice(capitalized));
+                    let cost = parse_keyword_mana_cost(cost_str);
+                    return Ok(Keyword::Splice {
+                        subtype: capitalized,
+                        cost,
+                    });
                 }
                 // CR 702.72a: Champion a [type]
                 "champion" => {
@@ -2680,7 +2690,28 @@ fn keyword_from_tagged(variant: &str, data: &serde_json::Value) -> Result<Keywor
         }
         // CR 702.47a / CR 702.166a / CR 702.43a / CR 702.72a / CR 702.149a
         // CR 702.132a / CR 702.133a / CR 702.99a / CR 702.53a / CR 702.148a / CR 702.125a
-        "Splice" => Ok(Keyword::Splice(data.as_str().unwrap_or("").to_string())),
+        "Splice" => {
+            // Struct form `{ "subtype": "Arcane", "cost": {..} }` (mirrors Typecycling).
+            // A bare string is treated as a costless legacy subtype.
+            if let Some(subtype) = data.as_str() {
+                return Ok(Keyword::Splice {
+                    subtype: subtype.to_string(),
+                    cost: ManaCost::zero(),
+                });
+            }
+            let obj = data
+                .as_object()
+                .ok_or("Splice: expected object or string")?;
+            let cost: ManaCost =
+                serde_json::from_value(obj.get("cost").cloned().unwrap_or_default())
+                    .map_err(|e| format!("Splice cost: {e}"))?;
+            let subtype = obj
+                .get("subtype")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Ok(Keyword::Splice { subtype, cost })
+        }
         "Bargain" => Ok(Keyword::Bargain),
         "Sunburst" => Ok(Keyword::Sunburst),
         "Champion" => Ok(Keyword::Champion(data.as_str().unwrap_or("").to_string())),

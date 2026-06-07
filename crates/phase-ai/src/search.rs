@@ -978,6 +978,7 @@ fn fallback_action(state: &GameState) -> Option<GameAction> {
         // for exhaustive match. ManaPayment is a pending-cast state.
         WaitingFor::ManaPayment { .. }
         | WaitingFor::OptionalCostChoice { .. }
+        | WaitingFor::SpliceOffer { .. }
         | WaitingFor::DefilerPayment { .. }
         | WaitingFor::PayCost {
             resume: CostResume::Spell { .. } | CostResume::SpellCost { .. },

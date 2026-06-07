@@ -727,6 +727,14 @@
       "dontPay": "Don’t Pay",
       "takeEffect": "Take the Effect"
     },
+    "spliceOffer": {
+      "title": "Splice onto Arcane?",
+      "subtitle": "Choose a card to reveal and splice into this spell, or cast without splicing.",
+      "spliceCard": "Splice {{name}}",
+      "decline": "Don’t Splice",
+      "declineDescription": "Cast the spell without adding another card’s text.",
+      "unknownCard": "Card #{{id}}"
+    },
     "activationCost": {
       "title": "Choose Activation Cost"
     },

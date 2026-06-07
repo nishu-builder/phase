@@ -1337,6 +1337,24 @@ pub fn candidate_actions_broad(state: &GameState) -> Vec<CandidateAction> {
                 Some(*player),
             ),
         ],
+        // CR 702.47a–e: splice another eligible card onto the spell, or finish.
+        WaitingFor::SpliceOffer {
+            player, eligible, ..
+        } => {
+            let mut actions = vec![candidate(
+                GameAction::RespondToSpliceOffer { card: None },
+                TacticalClass::Selection,
+                Some(*player),
+            )];
+            actions.extend(eligible.iter().map(|&card| {
+                candidate(
+                    GameAction::RespondToSpliceOffer { card: Some(card) },
+                    TacticalClass::Selection,
+                    Some(*player),
+                )
+            }));
+            actions
+        }
         // CR 107.4f + CR 601.2f: AI picks per-shard Phyrexian payment.
         // Heuristic (life threshold): with life > 6, the AI prefers 2-life per shard for
         // tempo (keep mana for other plays); with life <= 6, the AI preserves life.

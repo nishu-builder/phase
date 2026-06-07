@@ -57,6 +57,7 @@ import { ModalFaceModal } from "../components/modal/ModalFaceModal.tsx";
 import { AlternativeCostModal } from "../components/modal/AlternativeCostModal.tsx";
 import { CastingVariantModal } from "../components/modal/CastingVariantModal.tsx";
 import { MiracleRevealModal } from "../components/modal/MiracleRevealModal.tsx";
+import { SpliceOfferModal } from "../components/modal/SpliceOfferModal.tsx";
 import { CardChoiceModal } from "../components/modal/CardChoiceModal.tsx";
 import { ChoiceModal } from "../components/modal/ChoiceModal.tsx";
 import { OptionalEffectModalContent } from "../components/modal/OptionalEffectModal.tsx";
@@ -1395,6 +1396,10 @@ function GamePageContent({
         <CascadeChoiceModal />
         <ModalFaceModal />
         <MiracleRevealModal />
+        {waitingFor?.type === "SpliceOffer" &&
+          canActForWaitingState && (
+            <SpliceOfferModal />
+          )}
 
         {/* Scry/Dig/Surveil card choice modal */}
         <CardChoiceModal />

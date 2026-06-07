@@ -92,6 +92,9 @@ pub mod scenario;
 pub mod scenario_db;
 pub mod specialize;
 pub mod speed;
+pub mod splice;
+#[cfg(test)]
+mod splice_tests;
 pub mod stack;
 pub mod static_abilities;
 pub mod static_source_index;

@@ -727,6 +727,14 @@
       "dontPay": "Ne pas payer",
       "takeEffect": "Subir l'effet"
     },
+    "spliceOffer": {
+      "title": "Imprégner d’arcane ?",
+      "subtitle": "Choisissez une carte à révéler et à imprégner dans ce sort, ou lancez-le sans imprégnation.",
+      "spliceCard": "Imprégner {{name}}",
+      "decline": "Ne pas imprégner",
+      "declineDescription": "Lancez le sort sans ajouter le texte d’une autre carte.",
+      "unknownCard": "Carte #{{id}}"
+    },
     "activationCost": {
       "title": "Choisir le coût d'activation"
     },

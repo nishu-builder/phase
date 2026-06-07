@@ -727,6 +727,14 @@
       "dontPay": "Não Pagar",
       "takeEffect": "Aceitar o Efeito"
     },
+    "spliceOffer": {
+      "title": "Unir com Arcano?",
+      "subtitle": "Escolha uma carta para revelar e unir a esta mágica, ou conjure sem unir.",
+      "spliceCard": "Unir {{name}}",
+      "decline": "Não Unir",
+      "declineDescription": "Conjure a mágica sem adicionar o texto de outra carta.",
+      "unknownCard": "Carta #{{id}}"
+    },
     "activationCost": {
       "title": "Escolher Custo de Ativação"
     },

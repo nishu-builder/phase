@@ -727,6 +727,14 @@
       "dontPay": "No pagar",
       "takeEffect": "Aceptar el efecto"
     },
+    "spliceOffer": {
+      "title": "¿Empalmar con arcano?",
+      "subtitle": "Elige una carta para revelar y empalmar en este hechizo, o lánzalo sin empalmar.",
+      "spliceCard": "Empalmar {{name}}",
+      "decline": "No empalmar",
+      "declineDescription": "Lanza el hechizo sin añadir el texto de otra carta.",
+      "unknownCard": "Carta #{{id}}"
+    },
     "activationCost": {
       "title": "Elegir coste de activación"
     },

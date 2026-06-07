@@ -275,6 +275,7 @@ fn cheap_reject_candidate(state: &GameState, action: &GameAction) -> bool {
         | (WaitingFor::ClashChooseOpponent { .. }, GameAction::ChooseClashOpponent { .. })
         | (WaitingFor::ClashCardPlacement { .. }, GameAction::ChooseTopOrBottom { .. })
         | (WaitingFor::OptionalCostChoice { .. }, GameAction::DecideOptionalCost { .. })
+        | (WaitingFor::SpliceOffer { .. }, GameAction::RespondToSpliceOffer { .. })
         | (WaitingFor::DefilerPayment { .. }, GameAction::DecideOptionalCost { .. })
         | (WaitingFor::OptionalEffectChoice { .. }, GameAction::DecideOptionalEffect { .. })
         | (

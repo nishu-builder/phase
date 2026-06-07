@@ -727,6 +727,14 @@
       "dontPay": "Non pagare",
       "takeEffect": "Subisci l'effetto"
     },
+    "spliceOffer": {
+      "title": "Unire ad Arcano?",
+      "subtitle": "Scegli una carta da rivelare e unire a questa magia, oppure lanciala senza unire.",
+      "spliceCard": "Unisci {{name}}",
+      "decline": "Non unire",
+      "declineDescription": "Lancia la magia senza aggiungere il testo di un’altra carta.",
+      "unknownCard": "Carta #{{id}}"
+    },
     "activationCost": {
       "title": "Scegli il costo di attivazione"
     },

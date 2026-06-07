@@ -727,6 +727,14 @@
       "dontPay": "Nicht bezahlen",
       "takeEffect": "Den Effekt hinnehmen"
     },
+    "spliceOffer": {
+      "title": "An Arkan koppeln?",
+      "subtitle": "Wähle eine Karte, die du vorzeigst und in diesen Zauberspruch einkoppelst, oder wirke ohne Kopplung.",
+      "spliceCard": "{{name}} einkoppeln",
+      "decline": "Nicht einkoppeln",
+      "declineDescription": "Wirke den Zauberspruch, ohne den Text einer anderen Karte hinzuzufügen.",
+      "unknownCard": "Karte #{{id}}"
+    },
     "activationCost": {
       "title": "Aktivierungskosten wählen"
     },

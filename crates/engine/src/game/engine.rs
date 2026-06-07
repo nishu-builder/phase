@@ -43,6 +43,7 @@ use super::public_state::{
     mark_public_state_from_events, sync_waiting_for,
 };
 use super::sba;
+use super::splice;
 use super::triggers;
 use super::turn_control;
 use super::turns;
@@ -2056,6 +2057,31 @@ fn apply_action(
         )?,
         (
             WaitingFor::OptionalCostChoice {
+                player,
+                pending_cast,
+                ..
+            },
+            GameAction::CancelCast,
+        ) => engine_casting::cancel_pending_cast(state, *player, pending_cast, &mut events),
+        // CR 702.47a–e: Splice — caster reveals a card to splice onto the spell
+        // (re-offering for the rest), or declines to finish and proceed to targets.
+        (
+            WaitingFor::SpliceOffer {
+                player,
+                pending_cast,
+                eligible,
+            },
+            GameAction::RespondToSpliceOffer { card },
+        ) => splice::resolve_offer(
+            state,
+            *player,
+            *pending_cast.clone(),
+            eligible.clone(),
+            card,
+            &mut events,
+        )?,
+        (
+            WaitingFor::SpliceOffer {
                 player,
                 pending_cast,
                 ..
