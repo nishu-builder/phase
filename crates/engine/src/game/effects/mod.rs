@@ -2170,6 +2170,15 @@ fn effect_references_tracked_set(effect: &Effect) -> bool {
             return true;
         }
     }
+    // CR 608.2c + CR 707.2: `CopyTokenOf` may carry `TrackedSet` on
+    // `target` while `target_filter()` surfaces `owner` (context-ref copy
+    // sources). Sin, Spira's Punishment — random exile publishes the set for
+    // the chained copy.
+    if let Effect::CopyTokenOf { target, .. } = effect {
+        if filter_references_tracked_set(target) {
+            return true;
+        }
+    }
     if let Effect::GenericEffect {
         static_abilities, ..
     } = effect
@@ -15400,6 +15409,58 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// Issue #2403: Sin, Spira's Punishment — random exile must publish a
+    /// tracked set so the chained `CopyTokenOf` creates a tapped copy.
+    #[test]
+    fn issue_2403_sin_spira_random_exile_copy_token_from_tracked_set() {
+        let mut state = GameState::new_two_player(42);
+
+        let gy_card = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Grizzly Bears".to_string(),
+            Zone::Graveyard,
+        );
+        {
+            let obj = state.objects.get_mut(&gy_card).unwrap();
+            obj.card_types.core_types = vec![CoreType::Creature];
+            obj.base_power = Some(2);
+            obj.base_toughness = Some(2);
+            obj.power = Some(2);
+            obj.toughness = Some(2);
+            obj.base_card_types = obj.card_types.clone();
+            obj.base_name = "Grizzly Bears".to_string();
+        }
+        state.players[0].graveyard.push_back(gy_card);
+
+        let source = create_object(
+            &mut state,
+            CardId(99),
+            PlayerId(0),
+            "Sin, Spira's Punishment".to_string(),
+            Zone::Stack,
+        );
+
+        let def = crate::parser::oracle_effect::parse_effect_chain(
+            "Exile a permanent card from your graveyard at random, then create a tapped token that's a copy of that card.",
+            AbilityKind::Spell,
+        );
+        let mut ability =
+            crate::game::ability_utils::build_resolved_from_def(&def, source, PlayerId(0));
+        ability.target_selection_mode = crate::types::ability::TargetSelectionMode::Random;
+
+        let mut events = Vec::new();
+        resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+
+        let token_id = ObjectId(state.next_object_id - 1);
+        let token = state.objects.get(&token_id).expect("copy token created");
+        assert!(token.is_token);
+        assert!(token.tapped);
+        assert_eq!(token.name, "Grizzly Bears");
+        assert_eq!(state.objects[&gy_card].zone, Zone::Exile);
     }
 
     /// Issue #2400: Doubling Chant — `repeat_for: ObjectCount` over controlled
