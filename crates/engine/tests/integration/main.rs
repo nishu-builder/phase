@@ -146,6 +146,7 @@ mod issue_2430_shifting_woodland;
 mod issue_2431_ultima_tap_land_for_c;
 mod issue_2435_traumatic_critique;
 mod issue_2439_wayta_trigger_doubling;
+mod issue_2852_breya_sacrifice_cost;
 mod issue_2856_shatterskull_divide_softlock;
 mod issue_2857_caesar_reflexive_modal;
 mod issue_2863_commander_aura_zone_change;
