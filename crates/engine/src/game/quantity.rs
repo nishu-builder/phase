@@ -306,6 +306,7 @@ fn quantity_ref_uses_object_count(qty: &QuantityRef) -> bool {
         | QuantityRef::CrimesCommittedThisTurn
         | QuantityRef::LifeGainedThisTurn { .. }
         | QuantityRef::CardsDrawnThisTurn { .. }
+        | QuantityRef::BattlefieldEntriesThisTurn { .. }
         | QuantityRef::LandsPlayedThisTurn { .. }
         | QuantityRef::TurnsTaken
         | QuantityRef::ZoneChangeCountThisTurn { .. }
@@ -488,6 +489,7 @@ fn entered_object_perturbs_quantity_ref(
         | QuantityRef::CrimesCommittedThisTurn
         | QuantityRef::LifeGainedThisTurn { .. }
         | QuantityRef::CardsDrawnThisTurn { .. }
+        | QuantityRef::BattlefieldEntriesThisTurn { .. }
         | QuantityRef::LandsPlayedThisTurn { .. }
         | QuantityRef::TurnsTaken
         | QuantityRef::ZoneChangeCountThisTurn { .. }
@@ -2149,6 +2151,31 @@ fn resolve_ref(
             resolve_per_player_scalar(state, player, controller, ctx, targets, ability, |p| {
                 u32_to_i32_saturating(p.cards_drawn_this_turn)
             })
+        }
+        // CR 403.3 + CR 608.2h: Battlefield entries this turn for the scoped player.
+        QuantityRef::BattlefieldEntriesThisTurn { player, ref filter } => {
+            resolve_per_player_scalar(
+                state,
+                player,
+                controller,
+                ctx,
+                targets,
+                ability,
+                |scoped_player| {
+                    usize_to_i32_saturating(
+                        state
+                            .battlefield_entries_this_turn
+                            .iter()
+                            .filter(|record| {
+                                record.controller == scoped_player.id
+                                    && crate::game::restrictions::battlefield_entry_matches_filter(
+                                        record, filter, controller,
+                                    )
+                            })
+                            .count(),
+                    )
+                },
+            )
         }
         // CR 305.2a + CR 603.4: Lands played this turn by the scoped player.
         QuantityRef::LandsPlayedThisTurn { player, from_zones } => {
@@ -4128,8 +4155,10 @@ pub(crate) fn resolve_player_count(
                             let threshold = resolve_quantity(state, value, controller, source_id);
                             crate::game::players::matches_relation(
                                 state, p.id, controller, *relation,
-                            ) && crate::game::effects::candidate_player_scalar(p, attr)
-                                .is_some_and(|lhs| comparator.evaluate(lhs, threshold))
+                            ) && crate::game::effects::candidate_player_scalar_with_state(
+                                state, p, controller, attr,
+                            )
+                            .is_some_and(|lhs| comparator.evaluate(lhs, threshold))
                         }
                     }
             })

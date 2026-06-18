@@ -3871,6 +3871,15 @@ pub enum QuantityRef {
     /// "you've drawn two or more cards this turn" and "an opponent has drawn
     /// four or more cards this turn" reuse the existing per-player aggregate axis.
     CardsDrawnThisTurn { player: PlayerScope },
+    /// CR 403.3 + CR 608.2h: Count of battlefield entries this turn by the scoped
+    /// player matching `filter`, using `battlefield_entries_this_turn` snapshots
+    /// (lands that entered and later left still count). Smuggler's Share class:
+    /// "for each opponent who had two or more lands enter the battlefield under
+    /// their control this turn."
+    BattlefieldEntriesThisTurn {
+        player: PlayerScope,
+        filter: TargetFilter,
+    },
     /// CR 305.2a + CR 603.4: Count of lands played by the scoped player this turn.
     /// `from_zones: None` uses `Player::lands_played_this_turn`; `Some` reads the
     /// per-player land-play origin history for conditions like "played a land

@@ -391,7 +391,7 @@ pub(crate) fn matches_player_scope(
                             state, value, controller, source_id,
                         );
                         crate::game::players::matches_relation(state, p.id, controller, *relation)
-                            && candidate_player_scalar(p, attr)
+                            && candidate_player_scalar_with_state(state, p, controller, attr)
                                 .is_some_and(|lhs| comparator.evaluate(lhs, threshold))
                     }
                 }
@@ -459,6 +459,41 @@ pub(crate) fn candidate_player_scalar(p: &Player, attr: &QuantityRef) -> Option<
         // CR 122.1f (poison) + CR 122.1: the candidate's named player-counter total.
         QuantityRef::PlayerCounter { kind, .. } => {
             Some(u32_to_i32_saturating(p.player_counter(kind)))
+        }
+        // CR 121.1: cards drawn this turn is tracked per candidate player.
+        QuantityRef::CardsDrawnThisTurn { .. } => {
+            Some(u32_to_i32_saturating(p.cards_drawn_this_turn))
+        }
+        _ => None,
+    }
+}
+
+/// CR 402.1 / 119.1 / 403.3 / 608.2h: Per-candidate scalar lookup that needs game-state
+/// backing (battlefield entry ledger). Used by `PlayerFilter::PlayerAttribute`
+/// in `resolve_player_count` when `candidate_player_scalar` returns `None`.
+pub(crate) fn candidate_player_scalar_with_state(
+    state: &crate::types::game_state::GameState,
+    candidate: &Player,
+    controller: crate::types::player::PlayerId,
+    attr: &QuantityRef,
+) -> Option<i32> {
+    if let Some(value) = candidate_player_scalar(candidate, attr) {
+        return Some(value);
+    }
+    match attr {
+        QuantityRef::BattlefieldEntriesThisTurn { filter, .. } => {
+            Some(crate::game::arithmetic::usize_to_i32_saturating(
+                state
+                    .battlefield_entries_this_turn
+                    .iter()
+                    .filter(|record| {
+                        record.controller == candidate.id
+                            && crate::game::restrictions::battlefield_entry_matches_filter(
+                                record, filter, controller,
+                            )
+                    })
+                    .count(),
+            ))
         }
         _ => None,
     }
