@@ -250,6 +250,7 @@ mod issue_2941_vivien_reid;
 mod issue_2943_kayas_wrath;
 mod issue_3127_reveal_otherwise_graveyard;
 mod issue_3245_abhorrent_oculus_manifest_dread;
+mod issue_3251_force_of_negation;
 mod issue_3260_phantasmal_image_persist;
 mod issue_3264_jace_mind_sculptor_minus_twelve;
 mod issue_3265_knowledge_seeker_kwain;
