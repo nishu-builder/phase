@@ -14370,6 +14370,118 @@ mod tests {
     }
 
     #[test]
+    fn mana_spend_restriction_negative_nonartifact() {
+        // CR 106.6: "this mana can't be spent to cast nonartifact spells" (Karn,
+        // Legacy Reforged) restricts spell-casting to artifact spells but leaves
+        // ability activation unrestricted — so it lowers to the OR variant with
+        // `ability: Any`, NOT a spells-only `SpellType` (which would wrongly
+        // forbid paying for abilities).
+        use crate::parser::oracle_effect::mana::parse_mana_spend_restriction;
+        use crate::types::ability::ManaSpendRestriction;
+        use crate::types::mana::AbilityActivationScope;
+        let result =
+            parse_mana_spend_restriction("this mana can't be spent to cast nonartifact spells");
+        assert_eq!(
+            result.map(|(r, _)| r),
+            Some(ManaSpendRestriction::SpellTypeOrAbilityActivation {
+                spell_type: "Artifact".to_string(),
+                ability: AbilityActivationScope::Any,
+            })
+        );
+    }
+
+    #[test]
+    fn mana_spend_restriction_negative_article_singular_nonartifact() {
+        // CR 106.6: singular/article wording is the same restriction class
+        // (Hydraulic Helper: "a nonartifact spell"), and ability activation is
+        // still unrestricted because the clause only forbids casting spells.
+        let result = crate::parser::oracle_effect::mana::parse_mana_spend_restriction(
+            "this mana can't be spent to cast a nonartifact spell",
+        );
+        assert_eq!(
+            result.map(|(r, _)| r),
+            Some(
+                crate::types::ability::ManaSpendRestriction::SpellTypeOrAbilityActivation {
+                    spell_type: "Artifact".to_string(),
+                    ability: crate::types::mana::AbilityActivationScope::Any,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn mana_spend_restriction_negative_noncreature() {
+        // CR 106.6: the negative form generalizes across spell types — "non<TYPE>"
+        // strips to "<TYPE>" so the same combinator covers the whole class.
+        use crate::parser::oracle_effect::mana::parse_mana_spend_restriction;
+        use crate::types::ability::ManaSpendRestriction;
+        use crate::types::mana::AbilityActivationScope;
+        let result =
+            parse_mana_spend_restriction("this mana can't be spent to cast noncreature spells");
+        assert_eq!(
+            result.map(|(r, _)| r),
+            Some(ManaSpendRestriction::SpellTypeOrAbilityActivation {
+                spell_type: "Creature".to_string(),
+                ability: AbilityActivationScope::Any,
+            })
+        );
+    }
+
+    #[test]
+    fn karn_legacy_reforged_mana_carries_negative_spend_restriction() {
+        // End-to-end: the full Karn, Legacy Reforged Oracle text must lower the
+        // upkeep "add {C} for each artifact … this mana can't be spent to cast
+        // nonartifact spells" clause to an `Effect::Mana` carrying the restriction
+        // (no `Effect::Unimplemented`). Issue #3893.
+        use crate::types::ability::{Effect, ManaSpendRestriction};
+        use crate::types::mana::AbilityActivationScope;
+        let oracle = "Karn's power and toughness are each equal to the greatest mana value among artifacts you control.\n\
+At the beginning of your upkeep, add {C} for each artifact you control. This mana can't be spent to cast nonartifact spells. Until end of turn, you don't lose this mana as steps and phases end.";
+        let parsed = super::parse_oracle_text(
+            oracle,
+            "Karn, Legacy Reforged",
+            &[],
+            &["Legendary".to_string(), "Artifact".to_string()],
+            &[],
+        );
+        let mut found = false;
+        fn walk(effect: &Effect, found: &mut bool) {
+            if let Effect::Mana { restrictions, .. } = effect {
+                if restrictions.contains(&ManaSpendRestriction::SpellTypeOrAbilityActivation {
+                    spell_type: "Artifact".to_string(),
+                    ability: AbilityActivationScope::Any,
+                }) {
+                    *found = true;
+                }
+            }
+        }
+        fn walk_ability(ab: &crate::types::ability::AbilityDefinition, found: &mut bool) {
+            walk(&ab.effect, found);
+            if let Some(sub) = ab.sub_ability.as_deref() {
+                walk_ability(sub, found);
+            }
+            if let Some(els) = ab.else_ability.as_deref() {
+                walk_ability(els, found);
+            }
+        }
+        for ab in &parsed.abilities {
+            walk_ability(ab, &mut found);
+        }
+        // The upkeep mana production is a triggered ability — walk each trigger's
+        // `execute` chain too.
+        for trig in &parsed.triggers {
+            if let Some(exec) = trig.execute.as_deref() {
+                walk_ability(exec, &mut found);
+            }
+        }
+        assert!(
+            found,
+            "Karn's upkeep mana must carry the nonartifact spend restriction, triggers={:?}",
+            parsed.triggers
+        );
+    }
+
+    #[test]
     fn mana_spend_restriction_x_cost_only() {
         use crate::parser::oracle_effect::mana::parse_mana_spend_restriction;
         use crate::types::ability::ManaSpendRestriction;
