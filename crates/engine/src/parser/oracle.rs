@@ -15792,6 +15792,25 @@ Artifacts you control have \"{T}: Add {U}. Spend this mana only to cast a spell 
         assert_eq!(grants, vec![ManaSpellGrant::CantBeCountered]);
     }
 
+    /// CR 106.6: Activation-first disjunction — "to activate X or cast Y"
+    /// (Automated Artificer). Must produce `Any([ActivateOnly, SpellType])`.
+    #[test]
+    fn mana_spend_restriction_activation_first_disjunction() {
+        use crate::parser::oracle_effect::mana::parse_mana_spend_restriction;
+        let (restriction, grants) = parse_mana_spend_restriction(
+            "spend this mana only to activate an ability or cast an artifact spell",
+        )
+        .expect("activation-first disjunction should parse");
+        assert_eq!(
+            restriction,
+            ManaSpendRestriction::Any(vec![
+                ManaSpendRestriction::ActivateOnly,
+                ManaSpendRestriction::SpellType("Artifact".to_string()),
+            ])
+        );
+        assert!(grants.is_empty());
+    }
+
     #[test]
     fn top_level_static_flashback_grant_stays_on_graveyard_cards() {
         let result = parse(
