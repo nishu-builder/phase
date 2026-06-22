@@ -18,19 +18,6 @@ pub(super) fn token_is_outside_battlefield_and_stack(obj: &GameObject) -> bool {
     obj.is_token && obj.zone != Zone::Battlefield && obj.zone != Zone::Stack
 }
 
-fn has_hand_zone_continuous_effects(state: &GameState) -> bool {
-    state.objects.values().any(|obj| {
-        obj.static_definitions.iter_all().any(|def| {
-            def.mode == StaticMode::Continuous
-                && def
-                    .affected
-                    .as_ref()
-                    .and_then(|filter| filter.extract_in_zone())
-                    == Some(Zone::Hand)
-        })
-    })
-}
-
 /// CR 122.2 + CR 113.6b: Determine whether `object_id`'s counters survive a move
 /// into the `to` zone. The default (CR 122.2) is that counters cease to exist on
 /// any zone change. A `StaticMode::CountersPersistAcrossZones` ability overrides
@@ -694,14 +681,10 @@ pub fn move_to_zone(
         record_descend_on_graveyard_arrival(state, object_id, owner);
     }
 
-    // Mark layers dirty when objects enter the battlefield. Hand-zone moves only
-    // need a layer pass when a hand-zone continuous effect is present; ordinary
-    // spells leaving hand for the stack do not affect battlefield layers.
-    // CR 702.94a + CR 400.3: hand-zone continuous effects require re-evaluation
-    // when a hand object appears or departs.
-    if to == Zone::Battlefield
-        || ((to == Zone::Hand || from == Zone::Hand) && has_hand_zone_continuous_effects(state))
-    {
+    // CR 611.3a + CR 400.3: Hand size affects continuous effects gated on the
+    // controller's hand (Carnage Interpreter, issue #3991) and hand-zone
+    // effects (Miracle in hand). Re-evaluate layers on any hand entry/exit.
+    if to == Zone::Battlefield || to == Zone::Hand || from == Zone::Hand {
         crate::game::layers::mark_layers_full(state);
     }
 
@@ -1228,7 +1211,7 @@ mod tests {
     }
 
     #[test]
-    fn hand_to_stack_without_hand_zone_static_does_not_dirty_layers() {
+    fn hand_to_stack_marks_layers_dirty_for_hand_size_statics() {
         let mut state = setup();
         let id = create_object(
             &mut state,
@@ -1243,10 +1226,12 @@ mod tests {
         move_to_zone(&mut state, id, Zone::Stack, &mut events);
 
         assert_eq!(state.objects[&id].zone, Zone::Stack);
-        assert_eq!(
-            state.layers_dirty,
-            crate::types::game_state::LayersDirty::Clean,
-            "ordinary hand-to-stack movement must not force a full layer pass"
+        assert!(
+            matches!(
+                state.layers_dirty,
+                crate::types::game_state::LayersDirty::Full
+            ),
+            "hand-to-stack movement must mark layers dirty so hand-size-gated statics re-evaluate"
         );
     }
 

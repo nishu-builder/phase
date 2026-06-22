@@ -333,6 +333,7 @@ mod issue_3878_go_shintai_combat_damage;
 mod issue_3881_feed_swarm_darksteel_mutation;
 mod issue_3883_kari_zev_ragavan;
 mod issue_3988_vaultborn_tyrant;
+mod issue_3991_carnage_interpreter;
 mod issue_3994_malevolent_rumble;
 mod issue_3996_return_the_favor;
 mod issue_3999_latchkey_faerie_prowl_etb;
