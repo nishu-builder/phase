@@ -35,8 +35,8 @@ use super::ability_utils::{
     auto_select_targets_for_ability, begin_target_selection, begin_target_selection_for_ability,
     build_resolved_from_def, build_target_slots, compute_unavailable_modes,
     filter_references_target_player, flatten_targets_in_chain,
-    has_legal_target_assignment_for_ability, modal_choice_for_player,
-    target_constraints_from_modal,
+    has_legal_target_assignment_for_ability, kicker_instead_spell_has_legal_targets,
+    modal_choice_for_player, target_constraints_from_modal,
 };
 use super::casting_costs::{self, check_additional_cost_or_pay};
 use super::engine::EngineError;
@@ -9460,6 +9460,34 @@ fn continue_with_prepared(
         }
     }
 
+    // CR 601.2b + CR 702.33d: Kicker "instead" spells — prompt for kicker before
+    // building unkicked target slots (Bloodchief's Thirst on Pyrogoyf, #3989).
+    let has_kicker_cost = state
+        .objects
+        .get(&prepared.object_id)
+        .and_then(|obj| obj.additional_cost.as_ref())
+        .is_some_and(|additional| matches!(additional, AdditionalCost::Kicker { .. }));
+    if has_kicker_cost && requires_additional_cost_declaration_before_targets(&resolved) {
+        return casting_costs::begin_target_dependent_additional_cost_declaration(
+            state,
+            player,
+            prepared.object_id,
+            prepared.card_id,
+            resolved,
+            prepared.mana_cost,
+            Some(prepared.base_mana_cost.clone()),
+            prepared.casting_variant,
+            prepared.cast_timing_permission,
+            prepared
+                .ability_def
+                .as_ref()
+                .and_then(|a| a.distribute.clone()),
+            prepared.origin_zone,
+            prepared.payment_mode,
+            events,
+        );
+    }
+
     let mut target_slots = build_target_slots(state, &resolved)?;
     // CR 601.2c + CR 601.2d: A fixed-amount divided spell (no X to announce, e.g.
     // "2 damage divided among up to three targets") must likewise offer at most
@@ -9476,31 +9504,6 @@ fn continue_with_prepared(
             .as_ref()
             .map(|ability| ability.target_constraints.clone())
             .unwrap_or_default();
-        let has_kicker_cost = state
-            .objects
-            .get(&prepared.object_id)
-            .and_then(|obj| obj.additional_cost.as_ref())
-            .is_some_and(|additional| matches!(additional, AdditionalCost::Kicker { .. }));
-        if has_kicker_cost && requires_additional_cost_declaration_before_targets(&resolved) {
-            return casting_costs::begin_target_dependent_additional_cost_declaration(
-                state,
-                player,
-                prepared.object_id,
-                prepared.card_id,
-                resolved,
-                prepared.mana_cost,
-                Some(prepared.base_mana_cost.clone()),
-                prepared.casting_variant,
-                prepared.cast_timing_permission,
-                prepared
-                    .ability_def
-                    .as_ref()
-                    .and_then(|a| a.distribute.clone()),
-                prepared.origin_zone,
-                prepared.payment_mode,
-                events,
-            );
-        }
 
         // CR 601.2b: Casualty (optional sacrifice) must be declared before targets are
         // chosen. Detect an effective Casualty cost and route through the deferred target
@@ -9864,28 +9867,26 @@ pub fn spell_has_legal_targets(
     };
 
     let resolved = build_resolved_from_def(&ability_def, obj.id, player);
-    match build_target_slots(&simulated, &resolved) {
-        Ok(target_slots) => {
-            if target_slots.is_empty() {
-                true
-            } else {
-                has_legal_target_assignment_for_ability(
-                    &simulated,
-                    &resolved,
-                    &target_slots,
-                    &ability_def.target_constraints,
-                )
-            }
-        }
-        Err(_) => {
-            ability_target_legality_needs_chosen_x(&resolved, ability_def.distribute.as_ref())
-                && (casting_costs::required_additional_cost_can_declare_x(
-                    &simulated, player, obj.id,
-                )
-                .is_some()
-                    || casting_costs::cost_has_x(&obj.mana_cost))
-        }
+    let base_ok = match build_target_slots(&simulated, &resolved) {
+        Ok(target_slots) if target_slots.is_empty() => true,
+        Ok(target_slots) => has_legal_target_assignment_for_ability(
+            &simulated,
+            &resolved,
+            &target_slots,
+            &ability_def.target_constraints,
+        ),
+        Err(_) => false,
+    };
+    if base_ok {
+        return true;
     }
+    if kicker_instead_spell_has_legal_targets(&simulated, &ability_def, obj.id, player) {
+        return true;
+    }
+    ability_target_legality_needs_chosen_x(&resolved, ability_def.distribute.as_ref())
+        && (casting_costs::required_additional_cost_can_declare_x(&simulated, player, obj.id)
+            .is_some()
+            || casting_costs::cost_has_x(&obj.mana_cost))
 }
 
 /// CR 601.2b + CR 118.9a: Check whether `object_id` can legally be cast for

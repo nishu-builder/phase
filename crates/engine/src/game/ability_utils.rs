@@ -304,6 +304,40 @@ pub fn build_target_slots(
     Ok(acc.slots)
 }
 
+/// CR 601.2b + CR 702.33d: Kicker "instead" spells (e.g. Bloodchief's Thirst)
+/// replace their base targeting when the kicker is paid. Castability must admit
+/// the kicked target assignment when the unkicked assignment is unsatisfiable.
+pub fn kicker_instead_spell_has_legal_targets(
+    state: &GameState,
+    ability_def: &AbilityDefinition,
+    object_id: ObjectId,
+    player: PlayerId,
+) -> bool {
+    let Some(sub) = ability_def.sub_ability.as_deref() else {
+        return false;
+    };
+    if !matches!(
+        sub.condition,
+        Some(AbilityCondition::AdditionalCostPaidInstead)
+    ) {
+        return false;
+    }
+    let mut resolved = build_resolved_from_def(ability_def, object_id, player);
+    resolved.context.additional_cost_paid = true;
+    match build_target_slots(state, &resolved) {
+        Ok(slots) if slots.is_empty() => true,
+        Ok(slots) => {
+            let constraints = resolved
+                .sub_ability
+                .as_ref()
+                .map(|sub| &sub.target_constraints)
+                .unwrap_or(&resolved.target_constraints);
+            has_legal_target_assignment_for_ability(state, &resolved, &slots, constraints)
+        }
+        Err(_) => false,
+    }
+}
+
 /// CR 700.2 / CR 601.2b + CR 700.2c: Build target slots for a modal spell/ability
 /// along with a per-slot mode display label, so the targeting UI can show which
 /// mode the current target belongs to (CR 700.2). The label for `slots[i]` is

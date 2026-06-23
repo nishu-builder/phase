@@ -337,6 +337,7 @@ mod issue_3878_go_shintai_combat_damage;
 mod issue_3881_feed_swarm_darksteel_mutation;
 mod issue_3883_kari_zev_ragavan;
 mod issue_3988_vaultborn_tyrant;
+mod issue_3989_bloodchiefs_thirst;
 mod issue_3991_carnage_interpreter;
 mod issue_3992_lotleth_regenerate_combat;
 mod issue_3994_malevolent_rumble;
