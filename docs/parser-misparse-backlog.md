@@ -5227,7 +5227,7 @@ This is the prioritized "fix N root causes → unlock M cards" backlog: the top 
 
 <details><summary>Cards</summary>
 
-- Merfolk Falconer
+- Flaccify
 - Rush of Dread
 - The Goose Mother
 
