@@ -289,6 +289,9 @@
     "cleanupDescription": "Les blessures s'estompent et la taille maximale de main est vérifiée.",
     "tooltipStopSet": "Arrêt défini : cliquez pour retirer cet arrêt de passage automatique.",
     "tooltipNoStop": "Aucun arrêt défini : cliquez pour mettre en pause le passage automatique ici.",
+    "scopeAllTurns": "S'arrête à chaque tour.",
+    "scopeOwnTurn": "S'arrête uniquement lors de vos tours.",
+    "scopeOpponentsTurns": "S'arrête uniquement lors des tours des adversaires.",
     "tooltipCurrentPhase": "Phase actuelle.",
     "tooltip": "Arrêt de phase : {{label}}. {{description}} {{stopText}}{{activeText}}"
   },
@@ -564,6 +567,14 @@
     "paidKickedTimes": "kické ×{{count}}",
     "paidAdditionalCost": "coût supplémentaire",
     "paidConvoked": "convoqué ×{{count}}"
+  },
+  "priorityYield": {
+    "listHeader": "Renoncements de priorité",
+    "yieldThis": "Passer celui-ci",
+    "yieldAllCopies": "Passer toutes les copies",
+    "revoke": "Révoquer",
+    "clearAll": "Tout effacer",
+    "allCopiesHint": "Recommandé pour les capacités de jetons"
   },
   "targeting": {
     "choosePermanentToCopy": "Choisissez un permanent à copier",

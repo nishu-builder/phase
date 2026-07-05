@@ -289,6 +289,9 @@
     "cleanupDescription": "El daño desaparece y se comprueba el tamaño máximo de la mano.",
     "tooltipStopSet": "Parada establecida: haz clic para quitar esta parada de pasar automáticamente.",
     "tooltipNoStop": "Sin parada establecida: haz clic para pausar el pasar automáticamente aquí.",
+    "scopeAllTurns": "Se detiene en cada turno.",
+    "scopeOwnTurn": "Se detiene solo en tus turnos.",
+    "scopeOpponentsTurns": "Se detiene solo en los turnos de los oponentes.",
     "tooltipCurrentPhase": "Fase actual.",
     "tooltip": "Parada de fase: {{label}}. {{description}} {{stopText}}{{activeText}}"
   },
@@ -564,6 +567,14 @@
     "paidKickedTimes": "estímulo ×{{count}}",
     "paidAdditionalCost": "coste extra",
     "paidConvoked": "convocado ×{{count}}"
+  },
+  "priorityYield": {
+    "listHeader": "Cesiones de prioridad",
+    "yieldThis": "Ceder este",
+    "yieldAllCopies": "Ceder todas las copias",
+    "revoke": "Revocar",
+    "clearAll": "Borrar todo",
+    "allCopiesHint": "Recomendado para disparos de fichas"
   },
   "targeting": {
     "choosePermanentToCopy": "Elige un permanente para copiar",
