@@ -1426,6 +1426,21 @@ export type WaitingFor =
       all_kept: ObjectId[];
       scoped_players: PlayerId[];
     } }
+  | { type: "EachPlayerCopyChosenSelection"; data: {
+      player: PlayerId;
+      eligible: TargetRef[];
+      min: number;
+      max: number;
+      choose_filter: TargetFilter;
+      copy_modifications?: unknown[];
+      scale?: unknown;
+      source_id: ObjectId;
+      source_controller: PlayerId;
+      remaining_players: PlayerId[];
+      all_choices: { player: PlayerId; chosen: ObjectId[] }[];
+      scoped_players: PlayerId[];
+      trigger_event?: GameEvent;
+    } }
   // CR 107.1c + CR 701.21a (Slaughter the Strong): keep any number of eligible
   // creatures whose combined power is at most `cap`; the rest are sacrificed.
   | { type: "KeepWithinTotalPowerChoice"; data: {
