@@ -1741,6 +1741,8 @@
       "twoColors": "Choisir deux couleurs",
       "numberRange": "Choisir un nombre",
       "labeled": "Faire un choix",
+      "cardPredicate": "Choisir un type de carte",
+      "cardPredicateGuess": "Deviner un type de carte",
       "keyword": "Choisir une capacité",
       "counterKind": "Choisir un marqueur",
       "fallback": "Faire un choix"

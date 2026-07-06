@@ -1741,6 +1741,8 @@
       "twoColors": "Wybierz dwa kolory",
       "numberRange": "Wybierz liczbę",
       "labeled": "Dokonaj wyboru",
+      "cardPredicate": "Wybierz rodzaj karty",
+      "cardPredicateGuess": "Zgadnij rodzaj karty",
       "keyword": "Wybierz zdolność",
       "counterKind": "Wybierz żeton",
       "fallback": "Dokonaj wyboru"

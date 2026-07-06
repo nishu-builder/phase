@@ -1741,6 +1741,8 @@
       "twoColors": "Elige dos colores",
       "numberRange": "Elige un número",
       "labeled": "Toma una decisión",
+      "cardPredicate": "Elige un tipo de carta",
+      "cardPredicateGuess": "Adivina un tipo de carta",
       "keyword": "Elige una habilidad",
       "counterKind": "Elige un contador",
       "fallback": "Toma una decisión"

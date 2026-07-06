@@ -1778,6 +1778,8 @@
       "twoColors": "Choose Two Colors",
       "numberRange": "Choose a Number",
       "labeled": "Make a Choice",
+      "cardPredicate": "Choose a card kind",
+      "cardPredicateGuess": "Guess a card kind",
       "keyword": "Choose an Ability",
       "counterKind": "Choose a Counter",
       "fallback": "Make a Choice"
