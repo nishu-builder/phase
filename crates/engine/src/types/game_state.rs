@@ -8932,6 +8932,21 @@ impl GameState {
         }
     }
 
+    /// CR 603.5: Revoke a single stored "don't ask again" auto-choice for an
+    /// optional ("may") trigger. The key already scopes to one player, source,
+    /// and origin.
+    pub fn remove_may_trigger_auto_choice(&mut self, key: &MayTriggerAutoChoiceKey) {
+        self.may_trigger_auto_choices
+            .retain(|record| record.key != *key);
+    }
+
+    /// CR 603.5: Revoke all stored "don't ask again" auto-choices belonging to
+    /// `player` for optional ("may") triggers.
+    pub fn clear_may_trigger_auto_choices(&mut self, player: PlayerId) {
+        self.may_trigger_auto_choices
+            .retain(|record| record.key.player != player);
+    }
+
     /// CR 117.3d: True when `player` has a standing yield matching the top stack
     /// entry, meaning they have pre-committed to pass priority while it resolves.
     /// Only triggered abilities can be yielded — spells, activated abilities, and

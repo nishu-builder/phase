@@ -43,6 +43,7 @@ import { CardReportDialog } from "../components/card/CardReportDialog.tsx";
 import { ActionButton } from "../components/board/ActionButton.tsx";
 import { FullControlToggle } from "../components/controls/FullControlToggle.tsx";
 import { CombatPhaseIndicator } from "../components/controls/PhaseStopBar.tsx";
+import { MayTriggerAutoChoiceList } from "../components/board/MayTriggerAutoChoiceList.tsx";
 import { PriorityYieldList } from "../components/board/PriorityYieldList.tsx";
 import { OpponentHand } from "../components/hand/OpponentHand.tsx";
 import { MobileHandDrawer } from "../components/hand/MobileHandDrawer.tsx";
@@ -1422,6 +1423,7 @@ function GamePageContent({
             </div>
             <div className="flex items-center gap-1.5">
               <PriorityYieldList />
+              <MayTriggerAutoChoiceList />
               <FullControlToggle className="w-full" />
             </div>
           </div>
@@ -1449,6 +1451,9 @@ function GamePageContent({
                 {/* CR 117.3d: standing priority-yield summary chip, beside the
                     Full Control toggle (self-hides when no yields stand). */}
                 <PriorityYieldList />
+                {/* CR 603.5: standing "don't ask again" auto-choice summary chip,
+                    beside the priority-yield chip (self-hides when none stand). */}
+                <MayTriggerAutoChoiceList />
                 <FullControlToggle />
               </div>
               <ActionButton />

@@ -697,6 +697,19 @@ export interface MayTriggerAutoChoiceKey {
   origin: MayTriggerOrigin;
 }
 
+export interface MayTriggerAutoChoiceRecord {
+  key: MayTriggerAutoChoiceKey;
+  choice: AutoMayChoice;
+}
+
+// CR 603.5: The mutation a `SetMayTriggerAutoChoice` action performs on the
+// acting player's stored "don't ask again" auto-choices for optional ("may")
+// triggers. `Remove` echoes a stored key verbatim; `ClearAll` drops every
+// stored auto-choice belonging to the acting player.
+export type MayTriggerAutoChoiceOp =
+  | { type: "Remove"; data: { key: MayTriggerAutoChoiceKey } }
+  | { type: "ClearAll" };
+
 // ── Casting Permission ───────────────────────────────────────────────────
 
 export type CastingPermission =
@@ -1871,6 +1884,7 @@ export type GameAction =
   | { type: "CancelAutoPass" }
   | { type: "SetPhaseStops"; data: { stops: PhaseStop[] } }
   | { type: "SetPriorityYield"; data: { op: PriorityYieldOp } }
+  | { type: "SetMayTriggerAutoChoice"; data: { op: MayTriggerAutoChoiceOp } }
   | { type: "AssignCombatDamage"; data: { assignments: [ObjectId, number][]; trample_damage: number; controller_damage: number } }
   // CR 510.1d + CR 702.22k: blocker's combat-damage division among the attackers it blocks.
   | { type: "AssignBlockerDamage"; data: { assignments: [ObjectId, number][] } }
@@ -2420,6 +2434,8 @@ export interface GameState {
   phase_stops?: Record<number, PhaseStop[]>;
   /** CR 117.3d: the viewer's standing priority-yield preferences. */
   priority_yields?: PriorityYield[];
+  /** CR 603.5: the viewer's stored "don't ask again" auto-choices for optional ("may") triggers. */
+  may_trigger_auto_choices?: MayTriggerAutoChoiceRecord[];
   lands_tapped_for_mana?: Record<number, number[]>;
   scheduled_turn_controls?: Array<{
     target_player: PlayerId;

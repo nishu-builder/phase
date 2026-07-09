@@ -1828,6 +1828,16 @@
     "reportTitle": "Stuck decision: {{kind}}",
     "reportWhatHappened": "**What happened**\n_briefly describe what you were doing_\n\n**Diagnostic**\n```\n{{diagnostic}}\n```"
   },
+  "mayTriggerAutoChoice": {
+    "listHeader": "Choix automatiques",
+    "menuButtonShortActive": "Décision automatique",
+    "clearAll": "Tout effacer",
+    "remove": "Retirer",
+    "accept": "Oui",
+    "decline": "Non",
+    "sourceFallback": "Effet",
+    "entryLabel": "{{source}} — {{decision}}"
+  },
   "optionalEffect": {
     "sourceFallback": "Effet",
     "title": "{{name}} - Effet facultatif",

@@ -1865,6 +1865,16 @@
     "reportTitle": "Stuck decision: {{kind}}",
     "reportWhatHappened": "**What happened**\n_briefly describe what you were doing_\n\n**Diagnostic**\n```\n{{diagnostic}}\n```"
   },
+  "mayTriggerAutoChoice": {
+    "listHeader": "Auto-choices",
+    "menuButtonShortActive": "Auto-deciding",
+    "clearAll": "Clear all",
+    "remove": "Remove",
+    "accept": "Yes",
+    "decline": "No",
+    "sourceFallback": "Effect",
+    "entryLabel": "{{source}} — {{decision}}"
+  },
   "optionalEffect": {
     "sourceFallback": "Effect",
     "title": "{{name}} - Optional Effect",
