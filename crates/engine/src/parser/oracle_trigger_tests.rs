@@ -7302,6 +7302,44 @@ fn trigger_you_cast_a_spell_from_your_graveyard() {
     );
 }
 
+/// CR 205.3a + CR 601.2: "Whenever you cast an Aura, Equipment, or Vehicle
+/// spell" — an Oxford-comma subtype list must survive the payload truncation
+/// and produce an Or over all three subtypes. Regression for issue #5324
+/// (Sram, Senior Edificer), where naive first-comma truncation collapsed the
+/// filter to its first leg and the trigger fired only on Aura casts.
+#[test]
+fn trigger_you_cast_oxford_comma_subtype_list_spell() {
+    let def = parse_trigger_line(
+        "Whenever you cast an Aura, Equipment, or Vehicle spell, draw a card.",
+        "Sram, Senior Edificer",
+    );
+    assert_eq!(def.mode, TriggerMode::SpellCast);
+    let Some(TargetFilter::Or { filters }) = &def.valid_card else {
+        panic!("expected Or valid_card, got {:?}", def.valid_card);
+    };
+    let subtypes: Vec<&str> = filters
+        .iter()
+        .filter_map(|f| match f {
+            TargetFilter::Typed(tf) => tf.type_filters.iter().find_map(|t| match t {
+                TypeFilter::Subtype(s) => Some(s.as_str()),
+                _ => None,
+            }),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        subtypes,
+        vec!["Aura", "Equipment", "Vehicle"],
+        "expected all three subtype legs, got {filters:?}"
+    );
+    let execute = def.execute.expect("draw effect");
+    assert!(
+        matches!(execute.effect.as_ref(), Effect::Draw { .. }),
+        "expected Draw effect, got {:?}",
+        execute.effect
+    );
+}
+
 /// CR 205.2a + CR 601.2: "whenever you cast an artifact creature spell" must
 /// AND both core types into `valid_card`, so a non-creature artifact spell
 /// does NOT fire the trigger. Regression for Lux Artillery, whose spell-cast

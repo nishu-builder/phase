@@ -28,7 +28,7 @@ use super::oracle_nom::target::parse_type_phrase as parse_type_phrase_nom;
 use super::oracle_static::parse_commander_subject_filter_prefix;
 use super::oracle_target::{
     attachment_kinds_filter_prop, parse_attachment_kind_disjunction, parse_type_phrase,
-    starts_with_type_word,
+    starts_with_type_list_continuation, starts_with_type_word,
 };
 use super::oracle_util::{
     canonicalize_subtype_name, is_core_type_name, is_non_subtype_subject_name, merge_or_filters,
@@ -12356,11 +12356,27 @@ fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefiniti
             return Some((TriggerMode::SpellCast, def));
         }
 
-        // Truncate at ", " so any effect clause doesn't leak into the type parser.
-        let payload = nom_primitives::split_once_on(after, ", ")
-            .map(|(_, (before, _))| before)
-            .unwrap_or(after)
-            .trim();
+        // Truncate at ", " so any effect clause doesn't leak into the type
+        // parser — but skip commas that continue an Oxford-comma type list
+        // (CR 205.3a: "an Aura, Equipment, or Vehicle spell" is set-union
+        // sugar whose internal commas belong to the payload). Naive
+        // first-comma truncation collapsed such filters to their first leg,
+        // so the trigger fired only on the first listed type (issue #5324,
+        // Sram, Senior Edificer).
+        let payload = {
+            let mut scan = after;
+            let mut cut = after;
+            while let Ok((_, (_, rest))) = nom_primitives::split_once_on(scan, ", ") {
+                if starts_with_type_list_continuation(rest) {
+                    scan = rest;
+                } else {
+                    cut = &after[..after.len() - rest.len() - ", ".len()];
+                    break;
+                }
+            }
+            cut
+        }
+        .trim();
         let (payload, spell_not_owned_by_you) = strip_spell_not_owned_qualifier(payload);
         let (payload, turn_constraint) = peel_trailing_turn_constraint(payload);
         if let Some(constraint) = turn_constraint {

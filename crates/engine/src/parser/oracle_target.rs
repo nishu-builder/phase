@@ -3391,6 +3391,25 @@ fn starts_with_type_phrase_lead(text: &str) -> bool {
 /// Guard for comma/and/or type-list continuations where core-type segments may
 /// carry their own article — e.g. "an artifact, a creature, or a land" (Braids,
 /// Cabal Minion / issue #847).
+/// Guard for a post-comma continuation of an Oxford-comma type list — the
+/// segment may carry a leading list conjunction ("or " / "and " / "and/or ")
+/// before its type word or article + type word (CR 205.3a: "an Aura,
+/// Equipment, or Vehicle spell"). Used by payload truncation logic that must
+/// distinguish a ", " continuing a type list from the ", " that begins a
+/// trailing clause (issue #5324, Sram, Senior Edificer).
+pub(crate) fn starts_with_type_list_continuation(text: &str) -> bool {
+    let text = text.trim_start();
+    let text = opt(alt((
+        tag::<_, _, OracleError<'_>>("and/or "),
+        tag("or "),
+        tag("and "),
+    )))
+    .parse(text)
+    .map(|(rest, _)| rest)
+    .unwrap_or(text);
+    starts_with_or_article_type_segment(text)
+}
+
 fn starts_with_or_article_type_segment(text: &str) -> bool {
     let text = text.trim_start();
     if let Ok((rest, _)) = alt((tag::<_, _, OracleError<'_>>("an "), tag("a "))).parse(text) {
