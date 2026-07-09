@@ -34,6 +34,8 @@ import { DebugLibraryViewer } from "../components/chrome/DebugLibraryViewer.tsx"
 import { AttackTargetLines } from "../components/board/AttackTargetLines.tsx";
 import { BlockAssignmentLines } from "../components/board/BlockAssignmentLines.tsx";
 import { BlockRequirementBadges } from "../components/combat/BlockRequirementBadges.tsx";
+import { AttackRequirementBadges } from "../components/combat/AttackRequirementBadges.tsx";
+import { BlockerConstraintBadges } from "../components/combat/BlockerConstraintBadges.tsx";
 import { GameBoard } from "../components/board/GameBoard.tsx";
 import { CardImage } from "../components/card/CardImage.tsx";
 import { GameCardPreview } from "../components/card/GameCardPreview.tsx";
@@ -1651,6 +1653,13 @@ function GamePageContent({
           Self-gates: renders nothing unless the local player is assigning blockers
           to attackers that carry a minimum-blocker requirement. */}
       <BlockRequirementBadges />
+
+      {/* Per-creature must-attack / can't-attack and must-block / can't-block
+          badges (CR 508.1c/d, CR 509.1b/c). Each self-gates: renders nothing
+          unless the local player is at the matching declare step and the engine
+          supplied constraints. Display-only. */}
+      <AttackRequirementBadges />
+      <BlockerConstraintBadges />
 
       {/* Card preview overlay. Owns its own inspect-state subscriptions so a
           hover doesn't re-render GamePageContent (and the whole battlefield). */}

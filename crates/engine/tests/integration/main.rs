@@ -121,6 +121,7 @@ mod giant_ox_crew_toughness;
 mod giggling_skitterspike_issue_890;
 mod gimbal_gremlin_prodigy;
 mod gluntch_choose_player_chain;
+mod goaded_creature_under_pacifism_visible;
 mod gollum_scheming_guide_card_predicate_guess;
 mod good_king_mog_xii_chapter_iv_588;
 mod gran_gran_integration;

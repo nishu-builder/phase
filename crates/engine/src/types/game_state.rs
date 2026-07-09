@@ -3307,6 +3307,12 @@ pub enum WaitingFor {
         valid_attacker_ids: Vec<ObjectId>,
         #[serde(default)]
         valid_attack_targets: Vec<crate::game::combat::AttackTarget>,
+        /// CR 508.1c / CR 508.1d: per-creature combat requirement/restriction
+        /// (must-attack / can't-attack) for display badges and Confirm gating.
+        /// Display-only — computed by `combat::attacker_constraints_for_active_player`,
+        /// the same predicates that enforce legality in `validate_attackers`.
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        attacker_constraints: HashMap<ObjectId, crate::game::combat::CombatRequirement>,
     },
     DeclareBlockers {
         player: PlayerId,
@@ -3321,6 +3327,12 @@ pub enum WaitingFor {
         /// enforces the requirement in `validate_blocks`.
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         block_requirements: HashMap<ObjectId, u32>,
+        /// CR 509.1b / CR 509.1c: per-creature combat requirement/restriction
+        /// (must-block / can't-block) for display badges and Confirm gating.
+        /// Display-only — computed by `combat::blocker_constraints_for_player`,
+        /// the same predicate that enforces legality in `validate_blockers_for_player`.
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        blocker_constraints: HashMap<ObjectId, crate::game::combat::CombatRequirement>,
     },
     /// CR 502.3: During the untap step, the active player may choose not to
     /// untap permanents with "You may choose not to untap..." static abilities.
@@ -10273,12 +10285,14 @@ mod tests {
             player: PlayerId(0),
             valid_attacker_ids: vec![],
             valid_attack_targets: vec![],
+            attacker_constraints: Default::default(),
         }));
         variants.push(Box::new(WaitingFor::DeclareBlockers {
             player: PlayerId(0),
             valid_blocker_ids: vec![],
             valid_block_targets: HashMap::new(),
             block_requirements: HashMap::new(),
+            blocker_constraints: Default::default(),
         }));
         variants.push(Box::new(WaitingFor::GameOver {
             winner: Some(PlayerId(0)),
