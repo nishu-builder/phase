@@ -9322,6 +9322,22 @@ fn try_parse_event(
             SimpleEvent::BecomesTapped => {
                 def.mode = TriggerMode::Taps;
                 def.valid_card = Some(subject.clone());
+                // CR 603.2e: a "becomes tapped" trigger event may carry a "during
+                // your turn" turn restriction (Captain America, Living Legend —
+                // "Whenever a creature you control becomes tapped during your turn,
+                // if it's the first time …"). The intervening-if extractor (CR
+                // 603.4) strips the trailing "if …" clause but leaves the "during
+                // your turn" phrase
+                // on the event tail (`remaining`); peel it into the trigger's turn
+                // constraint so the ability only fires on the controller's turn,
+                // instead of being silently dropped. `remaining` still carries the
+                // trailing ", if …/untap it" clause, so match the turn phrase as a
+                // LEADING prefix (boundary-checked), not an all-consuming peel.
+                // Builds for the class — any "<subject> becomes tapped during
+                // your/opponent's turn" trigger.
+                if let Some(constraint) = parse_leading_turn_constraint(remaining) {
+                    def.constraint = Some(constraint);
+                }
             }
             SimpleEvent::TappedForMana => {
                 def.mode = TriggerMode::TapsForMana;
@@ -14858,31 +14874,65 @@ fn parse_turn_constraint(phase_text: &str) -> Option<TriggerConstraint> {
     None
 }
 
+/// CR 603.1: match the turn specifier that follows "during " in a trigger's
+/// turn-restriction clause → the corresponding trigger constraint. Single
+/// authority shared by the trailing peel ([`peel_trailing_turn_constraint`]) and
+/// the leading matcher ([`parse_leading_turn_constraint`]).
+fn parse_during_turn_spec(input: &str) -> OracleResult<'_, TriggerConstraint> {
+    alt((
+        value(
+            TriggerConstraint::OnlyDuringOpponentsTurn,
+            alt((
+                tag("an opponent's turn"),
+                tag("each opponent's turn"),
+                tag("each opponents\u{2019} turn"),
+                tag("each opponents' turn"),
+                tag("your opponent's turn"),
+                tag("your opponents\u{2019} turn"),
+                tag("your opponents' turn"),
+                tag("each of your opponents\u{2019} turn"),
+                tag("each of your opponents' turn"),
+            )),
+        ),
+        value(
+            TriggerConstraint::OnlyDuringYourTurn,
+            alt((tag("your turn"), tag("each of your turns"))),
+        ),
+    ))
+    .parse(input)
+}
+
+/// CR 603.1: match a "during `<your/opponent's>` turn" restriction at the START of
+/// a post-event tail (Captain America, Living Legend: "becomes tapped during your
+/// turn, if it's the first time …"). Unlike [`peel_trailing_turn_constraint`] the
+/// phrase need not consume the whole tail — the intervening-if / effect clause
+/// follows it. The trailing `terminated(..)` boundary combinator requires the turn
+/// spec to be followed by end-of-input or a `,` (the start of the ", if …/effect"
+/// clause), so it doesn't misfire on a longer phrase that merely starts with
+/// "during your …". Boundary acceptance stays inside the nom combinator (no
+/// string dispatch).
+fn parse_leading_turn_constraint(input: &str) -> Option<TriggerConstraint> {
+    terminated(
+        preceded(
+            tag::<_, _, OracleError<'_>>("during "),
+            parse_during_turn_spec,
+        ),
+        alt((
+            value((), eof),
+            value((), peek(tag::<_, _, OracleError<'_>>(","))),
+        )),
+    )
+    .parse(input.trim_start())
+    .map(|(_, constraint)| constraint)
+    .ok()
+}
+
 fn peel_trailing_turn_constraint(input: &str) -> (&str, Option<TriggerConstraint>) {
     let mut remaining = input.trim();
     loop {
         if let Ok((_, constraint)) = preceded(
             tag::<_, _, OracleError<'_>>("during "),
-            all_consuming(alt((
-                value(
-                    TriggerConstraint::OnlyDuringOpponentsTurn,
-                    alt((
-                        tag("an opponent's turn"),
-                        tag("each opponent's turn"),
-                        tag("each opponents\u{2019} turn"),
-                        tag("each opponents' turn"),
-                        tag("your opponent's turn"),
-                        tag("your opponents\u{2019} turn"),
-                        tag("your opponents' turn"),
-                        tag("each of your opponents\u{2019} turn"),
-                        tag("each of your opponents' turn"),
-                    )),
-                ),
-                value(
-                    TriggerConstraint::OnlyDuringYourTurn,
-                    alt((tag("your turn"), tag("each of your turns"))),
-                ),
-            ))),
+            all_consuming(parse_during_turn_spec),
         )
         .parse(remaining)
         {
