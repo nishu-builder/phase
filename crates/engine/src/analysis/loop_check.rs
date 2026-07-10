@@ -55,8 +55,8 @@
 //! soundness guarantee: no certificate for a non-loop or a non-progressing cycle.
 
 use crate::analysis::resource::{
-    loop_states_cover_modulo_growth, loop_states_equal_modulo_resources, CounterClass, ObjectClass,
-    ResourceAxis, ResourceVector,
+    loop_states_cover_modulo_growth, loop_states_equal_modulo_resources, BoardDelta, CounterClass,
+    ObjectClass, ResourceAxis, ResourceVector,
 };
 use crate::types::game_state::GameState;
 use crate::types::player::PlayerId;
@@ -119,6 +119,11 @@ pub struct LoopCertificate {
     /// to repeat. The detector cannot infer optionality from two states alone, so
     /// the caller (which drives the actions) supplies it.
     pub mandatory: bool,
+    /// CR 110.1: non-recycled per-cycle remainder of battlefield permanents (the "+1
+    /// untapped" seed). EMPTY for every certificate this phase produces (both detection
+    /// paths require an identical battlefield); wired now so an object-growth path
+    /// populates it with no further change. NOT a `ResourceAxis` — concrete permanents.
+    pub residual_board_delta: BoardDelta,
 }
 
 impl LoopCertificate {
@@ -187,6 +192,18 @@ pub fn detect_loop(
         unbounded,
         win_kind,
         mandatory,
+        // Empty by construction of the `:162` equal-board gate
+        // (`loop_states_equal_modulo_resources` guarantees `cycle_start`/`cycle_end`
+        // battlefields are equal, so `added`/`removed` are []). This is the SINGLE
+        // population seam: it calls `board_delta` rather than hard-coding
+        // `BoardDelta::default()` so that when a future object-growth path relaxes the
+        // `:162` gate, the residual lights up with no further edit (fail-loud), instead
+        // of a silent default that never fires until someone remembers to swap it. A
+        // computed-empty `BoardDelta` compares equal to `BoardDelta::default()`, so the
+        // derived-`PartialEq` certificate equalities in `corpus_tests.rs` stay intact.
+        // Invariant pinned by `residual_empty_for_constant_depth` (T12). (No CR
+        // annotation: this is an invariant/plumbing comment, not rule-implementing code.)
+        residual_board_delta: crate::analysis::resource::board_delta(cycle_start, cycle_end),
     })
 }
 
@@ -709,6 +726,7 @@ mod tests {
             ],
             win_kind: WinKind::LethalDamage,
             mandatory: true,
+            residual_board_delta: BoardDelta::default(),
         };
         assert!(cert.covers(&[ResourceAxis::DamageDealt(pid(1))]));
         assert!(cert.covers(&[
@@ -719,6 +737,28 @@ mod tests {
             CounterClass::Loyalty,
             ObjectClass::Planeswalker
         )]));
+    }
+
+    /// T12 (B4 invariant, Drift Correction 2): a real `detect_loop` certificate over the
+    /// equal-board frames its `:162` gate guarantees carries an EMPTY residual. Proves
+    /// the `board_delta` population seam returns empty on identical battlefields (a diff
+    /// that wrongly reported the recycled objects would fail this), keeping the wired
+    /// field honest until an object-growth detection path exists.
+    #[test]
+    fn residual_empty_for_constant_depth() {
+        let mut start = GameState::new_two_player(7);
+        battlefield_creature(&mut start, 500, 0);
+        let end = start.clone(); // identical board (the detect_loop equal-board gate)
+
+        let mut delta = ResourceVector::default();
+        delta.mana[5] = 1; // +1 colorless each cycle — a confirmed mana loop
+
+        let cert = detect_loop(&start, &end, &delta, pid(0), false).expect("mana loop confirmed");
+        assert_eq!(
+            cert.residual_board_delta,
+            BoardDelta::default(),
+            "an equal-board certificate carries an empty residual (Drift Correction 2)"
+        );
     }
 
     /// FINDING 2 (CR 704.5a): the loop's `controller` is caller-supplied, NOT

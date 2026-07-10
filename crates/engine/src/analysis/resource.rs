@@ -663,6 +663,77 @@ fn loyalty_activation_counts_match(a: &GameState, b: &GameState) -> bool {
     })
 }
 
+/// CR 110.1: a permanent is a card or token on the battlefield — this captures one such
+/// permanent that persists at a loop's fixpoint (a residual board object, NOT a
+/// [`ResourceAxis`] scalar). Identity via `oracle_id` (cross-incarnation stable,
+/// CR 400.7-proof) so a later materialization phase can recreate it; `controller` +
+/// `tapped` are the split B4 must preserve (the "+1 untapped").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResidualPermanent {
+    pub oracle_id: String,
+    pub controller: PlayerId,
+    pub tapped: bool,
+    // ponytail: counters/attachments deferred — YAGNI until a materializer consumes
+    // them; add when the first consumer needs them, not before.
+}
+
+/// CR 110.1: the loop-invariant, non-recycled remainder of battlefield permanents for
+/// ONE cycle — the concrete permanents present at the fixpoint that are NOT part of the
+/// repeating consumed/produced pair (e.g. the one untapped creature that seeds each
+/// tap). EMPTY for a constant-depth or stack-growth loop (their battlefields are
+/// identical by construction). Non-empty only once an object-growth detection path feeds
+/// [`board_delta`] non-identical battlefields.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BoardDelta {
+    /// Battlefield permanents present in `after` but not `before` (by `ObjectId`).
+    pub added: Vec<ResidualPermanent>,
+    /// Battlefield permanents present in `before` but not `after`.
+    pub removed: Vec<ResidualPermanent>,
+}
+
+/// Pure set-difference producer — analysis plumbing, deliberately UN-annotated per
+/// CLAUDE.md ("don't annotate serialization or plumbing — only code that implements a
+/// rule"): it computes `after − before` over battlefield permanents (the CR 110.1
+/// concept lives on the types it produces, [`BoardDelta`]/[`ResidualPermanent`], not on
+/// this diff). Iterates `state.objects.values()` filtered to `Zone::Battlefield`, keyed
+/// by `ObjectId`. `oracle_id` is read from `obj.printed_ref.oracle_id` (falls back to an
+/// empty string when absent — tokens without a printed ref). PURE.
+pub fn board_delta(before: &GameState, after: &GameState) -> BoardDelta {
+    fn battlefield_ids(state: &GameState) -> HashSet<ObjectId> {
+        state
+            .objects
+            .values()
+            .filter(|o| o.zone == crate::types::zones::Zone::Battlefield)
+            .map(|o| o.id)
+            .collect()
+    }
+    fn residual(state: &GameState, id: ObjectId) -> Option<ResidualPermanent> {
+        state.objects.get(&id).map(|o| ResidualPermanent {
+            oracle_id: o
+                .printed_ref
+                .as_ref()
+                .map(|p| p.oracle_id.clone())
+                .unwrap_or_default(),
+            controller: o.controller,
+            tapped: o.tapped,
+        })
+    }
+
+    let before_ids = battlefield_ids(before);
+    let after_ids = battlefield_ids(after);
+    let added = after_ids
+        .iter()
+        .filter(|id| !before_ids.contains(id))
+        .filter_map(|&id| residual(after, id))
+        .collect();
+    let removed = before_ids
+        .iter()
+        .filter(|id| !after_ids.contains(id))
+        .filter_map(|&id| residual(before, id))
+        .collect();
+    BoardDelta { added, removed }
+}
+
 /// Karp–Miller-style ω-acceleration (Karp–Miller 1969; Finkel et al. 2021), sound
 /// GIVEN the in-loop transition relation — the WHOLE beat: top-of-stack resolution
 /// (CR 608.1) with its resolution-time payments (CR 605.3a / CR 608.2g), trigger
@@ -1501,6 +1572,71 @@ mod tests {
         state.objects.insert(oid, object);
         state.battlefield.push_back(oid);
         oid
+    }
+
+    /// Insert a battlefield permanent with a chosen `tapped` state (B4 `board_delta`
+    /// fixtures). Distinct `card_id` per `id` so no fixture accidentally shares identity.
+    fn bf_obj(state: &mut GameState, id: u64, controller: u8, tapped: bool) {
+        let oid = ObjectId(id);
+        let mut object = GameObject::new(
+            oid,
+            CardId(id),
+            PlayerId(controller),
+            "Token".into(),
+            Zone::Battlefield,
+        );
+        object.tapped = tapped;
+        state.objects.insert(oid, object);
+    }
+
+    /// T10 (B4 core): `board_delta` isolates the one untapped seed a net-object-progress
+    /// loop adds, and nets out recycled tapped tokens present in BOTH frames.
+    #[test]
+    fn board_delta_isolates_untapped_seed() {
+        let mut before = GameState::new_two_player(7);
+        bf_obj(&mut before, 700, 0, true); // recycled tapped body...
+        bf_obj(&mut before, 701, 0, true); // ...present in both frames
+
+        let mut after = before.clone();
+        bf_obj(&mut after, 702, 0, false); // the extra untapped seed
+
+        let delta = board_delta(&before, &after);
+        assert_eq!(
+            delta.added.len(),
+            1,
+            "only the new seed is added; recycled tokens (in both) net out"
+        );
+        assert!(
+            !delta.added[0].tapped,
+            "the isolated seed is untapped — a pre-BoardDelta path drops this object entirely"
+        );
+        assert!(delta.removed.is_empty(), "nothing left the battlefield");
+    }
+
+    /// T11 (B4): `board_delta` reports the correct tap-state split — a tap-state-blind
+    /// diff would report the right count with wrong flags.
+    #[test]
+    fn board_delta_reports_tapped_split() {
+        let mut before = GameState::new_two_player(7);
+        bf_obj(&mut before, 700, 0, true); // recycled body in both
+
+        let mut after = before.clone();
+        bf_obj(&mut after, 800, 0, false); // 1 untapped seed
+        bf_obj(&mut after, 801, 0, true); // 2 tapped tokens
+        bf_obj(&mut after, 802, 0, true);
+
+        let delta = board_delta(&before, &after);
+        assert_eq!(delta.added.len(), 3);
+        assert_eq!(
+            delta.added.iter().filter(|r| !r.tapped).count(),
+            1,
+            "exactly one untapped seed"
+        );
+        assert_eq!(
+            delta.added.iter().filter(|r| r.tapped).count(),
+            2,
+            "exactly two tapped tokens"
+        );
     }
 
     /// Battlefield creature carrying exactly one activated ability whose

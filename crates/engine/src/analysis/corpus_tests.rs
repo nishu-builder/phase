@@ -32,7 +32,7 @@
 
 use crate::analysis::corpus;
 use crate::analysis::resource::ResourceAxis;
-use crate::analysis::{detect_loop, LoopCertificate, LoopProbe, WinKind};
+use crate::analysis::{detect_loop, BoardDelta, LoopCertificate, LoopProbe, WinKind};
 use crate::database::CardDatabase;
 use crate::game::derived_views::derive_views;
 use crate::game::scenario::{GameRunner, GameScenario, P0, P1};
@@ -293,6 +293,7 @@ fn classify_status_compares_against_spec_not_rubber_stamp() {
         unbounded: vec![ResourceAxis::DamageDealt(P1)],
         win_kind: WinKind::LethalDamage,
         mandatory: false,
+        residual_board_delta: BoardDelta::default(),
     };
     assert!(
         matches!(
@@ -307,6 +308,7 @@ fn classify_status_compares_against_spec_not_rubber_stamp() {
         unbounded: vec![ResourceAxis::TokensCreated],
         win_kind: WinKind::Advantage,
         mandatory: false,
+        residual_board_delta: BoardDelta::default(),
     };
     assert!(
         matches!(
@@ -331,6 +333,7 @@ fn classify_status_compares_against_spec_not_rubber_stamp() {
         unbounded: vec![ResourceAxis::Mana(ManaType::Green)],
         win_kind: WinKind::Advantage,
         mandatory: false,
+        residual_board_delta: BoardDelta::default(),
     };
     assert!(
         matches!(
