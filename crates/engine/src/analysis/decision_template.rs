@@ -189,6 +189,11 @@ pub enum ReplayMode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IterationCount {
     Fixed(u32),
+    /// CR 704.5a + CR 732.1b: repeat until a player is at 0-or-less life — the driver
+    /// PR-7 Phase 3 adds for the interactive loop-shortcut of a determinate lethal drain.
+    /// The terminating condition is the SBA, not a caller-supplied count. (`UntilResource`
+    /// stays deferred to Phase 4/B5.)
+    UntilLethal,
 }
 
 /// CR 732.2a "predictable results / no conditional actions": deterministic,

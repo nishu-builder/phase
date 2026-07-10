@@ -4251,6 +4251,25 @@ pub enum WaitingFor {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         remaining: Vec<PlayerId>,
     },
+    /// CR 732.2a: the interactive loop-shortcut OFFER. Raised (only under
+    /// `LoopDetectionMode::Interactive`) when the reconcile bridge confirms an OPTIONAL
+    /// determinate winning drain — the player with priority (`controller`, the loop's
+    /// determinate winner) may declare the shortcut. `acting_player()` routes to
+    /// `controller`. The `certificate` is the confirmed loop's public summary.
+    LoopShortcut {
+        controller: PlayerId,
+        certificate: crate::analysis::loop_check::LoopCertificate,
+    },
+    /// CR 732.2b/c: the APNAP accept-or-shorten window. After the proposer declares the
+    /// shortcut, each other living player is prompted in turn order (drain-one-advance
+    /// via `remaining_players`, mirroring `OpponentMayChoice.remaining`). `player` is the
+    /// current responder; `proposal` is the public offer summary.
+    RespondToShortcut {
+        player: PlayerId,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        remaining_players: Vec<PlayerId>,
+        proposal: crate::analysis::loop_check::ShortcutProposal,
+    },
     /// CR 118.12: Opponent must decide whether to pay a cost to prevent an effect.
     /// Used by "counter unless pays {X}" (Mana Leak), tax triggers (Esper Sentinel),
     /// and ward costs (CR 702.21a).
@@ -5213,6 +5232,8 @@ impl WaitingFor {
             WaitingFor::TributeChoice { .. } => "TributeChoice",
             WaitingFor::MiracleReveal { .. } => "MiracleReveal",
             WaitingFor::OpponentMayChoice { .. } => "OpponentMayChoice",
+            WaitingFor::LoopShortcut { .. } => "LoopShortcut",
+            WaitingFor::RespondToShortcut { .. } => "RespondToShortcut",
             WaitingFor::UnlessPayment { .. } => "UnlessPayment",
             WaitingFor::UnlessPaymentChooseCost { .. } => "UnlessPaymentChooseCost",
             WaitingFor::WardDiscardChoice { .. } => "WardDiscardChoice",
@@ -5360,6 +5381,7 @@ impl WaitingFor {
             | WaitingFor::OptionalEffectChoice { player, .. }
             | WaitingFor::PairChoice { player, .. }
             | WaitingFor::OpponentMayChoice { player, .. }
+            | WaitingFor::RespondToShortcut { player, .. }
             | WaitingFor::TributeChoice { player, .. }
             | WaitingFor::UnlessPayment { player, .. }
             | WaitingFor::UnlessPaymentChooseCost { player, .. }
@@ -5408,6 +5430,10 @@ impl WaitingFor {
             // CR 702.132a: the assisting (chosen) player acts on the payment step,
             // not the caster — route authorization to them.
             WaitingFor::AssistPayment { chosen, .. } => Some(*chosen),
+            // CR 732.2a: the loop-shortcut proposer is the loop's determinate winner,
+            // carried in `controller` (not a `player` field) — dedicated arm like
+            // `AssistPayment`.
+            WaitingFor::LoopShortcut { controller, .. } => Some(*controller),
             WaitingFor::GameOver { .. } => None,
         }
     }
@@ -5684,10 +5710,17 @@ pub enum LoopDetectionMode {
     /// Live combo-detector active: samples loops, fires the CR 732.2a mandatory-loop
     /// shortcut, and marks `unbounded_resources` for a confirmed loop.
     On,
+    /// CR 732.2a/b/c: samples loops like `On`, but instead of only auto-winning a
+    /// mandatory lethal drain it OFFERS the interactive loop-shortcut + runs the APNAP
+    /// accept-or-shorten window for an OPTIONAL winning drain, and adds the CR 732.4
+    /// all-mandatory net-progress no-loss DRAW. A mandatory winning drain still
+    /// auto-wins exactly as `On` does. Opt-in / default stays `Off`. (Phase 4 reuses
+    /// this same mode for B5's non-winning hold — one serialized-enum add, not two.)
+    Interactive,
 }
 
 impl LoopDetectionMode {
-    /// True when the live combo-detector is enabled.
+    /// True when the live combo-detector is enabled (auto-lethal-win only).
     pub fn is_on(self) -> bool {
         matches!(self, LoopDetectionMode::On)
     }
@@ -5696,6 +5729,15 @@ impl LoopDetectionMode {
     /// serve as a serde `skip_serializing_if` predicate on `MatchConfig.loop_detection`.
     pub fn is_off(&self) -> bool {
         matches!(self, LoopDetectionMode::Off)
+    }
+
+    /// CR 732.2a: whether this mode populates the loop-detect ring and enters the
+    /// reconcile shortcut block. Both `On` and `Interactive` sample; `Off` samples
+    /// neither. Crucially `samples() == is_on()` for `Off` (false) and `On` (true), so
+    /// swapping the two live gates from `is_on()` to `samples()` leaves the `Off` and
+    /// `On` code paths byte-identical — only `Interactive` newly samples/enters.
+    pub fn samples(self) -> bool {
+        matches!(self, LoopDetectionMode::On | LoopDetectionMode::Interactive)
     }
 }
 

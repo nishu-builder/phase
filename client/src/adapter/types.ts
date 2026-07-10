@@ -1413,6 +1413,8 @@ export type WaitingFor =
   | { type: "OptionalEffectChoice"; data: { player: PlayerId; source_id: ObjectId; description?: string; may_trigger_key?: MayTriggerAutoChoiceKey } }
   | { type: "PairChoice"; data: { player: PlayerId; source_id: ObjectId; choices: ObjectId[] } }
   | { type: "OpponentMayChoice"; data: { player: PlayerId; source_id: ObjectId; description?: string; remaining: PlayerId[] } }
+  | { type: "LoopShortcut"; data: { controller: PlayerId; certificate: LoopCertificate } }
+  | { type: "RespondToShortcut"; data: { player: PlayerId; remaining_players?: PlayerId[]; proposal: ShortcutProposal } }
   | { type: "UnlessPayment"; data: { player: PlayerId; cost: UnlessCost; pending_effect: unknown; trigger_event?: unknown; effect_description?: string; remaining?: PlayerId[] } }
   // CR 118.12a: Disjunctive unless-cost — player picks **which** sub-cost
   // to pay (or declines all). Drives Tergrid's Lantern and the broader
@@ -1928,6 +1930,8 @@ export type GameAction =
   | { type: "Debug"; data: DebugAction }
   | { type: "GrantDebugPermission"; data: { player_id: PlayerId } }
   | { type: "RevokeDebugPermission"; data: { player_id: PlayerId } }
+  | { type: "DeclareShortcut"; data: { count: IterationCount; template?: DecisionTemplate | null } }
+  | { type: "RespondToShortcut"; data: { response: ShortcutResponse } }
   | { type: "Concede"; data: { player_id: PlayerId } };
 
 // CR 605.3b + CR 106.1a: Shape of the prompt surfaced by WaitingFor::ChooseManaColor.
@@ -2183,6 +2187,63 @@ export interface UnboundedResourceView {
   player: PlayerId;
   axis: ResourceAxis;
 }
+
+/** Mirrors `engine::analysis::loop_check::WinKind` (unit variants → bare strings). */
+export type WinKind =
+  | "LethalDamage"
+  | "PoisonLoss"
+  | "Decking"
+  | "ImmediateWin"
+  | "ExtraTurns"
+  | "Advantage";
+
+/** Mirrors `engine::analysis::resource::ResidualPermanent`. */
+export interface ResidualPermanent {
+  oracle_id: string;
+  controller: PlayerId;
+  tapped: boolean;
+}
+
+/** Mirrors `engine::analysis::resource::BoardDelta`. */
+export interface BoardDelta {
+  added: ResidualPermanent[];
+  removed: ResidualPermanent[];
+}
+
+/** Mirrors `engine::analysis::loop_check::LoopCertificate`. */
+export interface LoopCertificate {
+  unbounded: ResourceAxis[];
+  win_kind: WinKind;
+  mandatory: boolean;
+  residual_board_delta: BoardDelta;
+}
+
+/**
+ * Mirrors `engine::analysis::decision_template::IterationCount` (serde externally
+ * tagged: unit variant → bare string, data variant → single-key object).
+ */
+export type IterationCount = "UntilLethal" | { Fixed: number };
+
+/**
+ * Opaque mirror of `engine::analysis::decision_template::DecisionTemplate`. Phase 3
+ * requires `DeclareShortcut.template === null`; the frontend never introspects the
+ * pin structure. The full field shape lands with the Phase-5 loop-shortcut modal.
+ */
+export type DecisionTemplate = Record<string, unknown>;
+
+/** Mirrors `engine::analysis::loop_check::ShortcutProposal`. */
+export interface ShortcutProposal {
+  controller: PlayerId;
+  count: IterationCount;
+  unbounded: ResourceAxis[];
+  win_kind: WinKind;
+}
+
+/**
+ * Mirrors `engine::analysis::loop_check::ShortcutResponse` (serde externally tagged:
+ * `Accept` → bare string; `Shorten` → single-key object).
+ */
+export type ShortcutResponse = "Accept" | { Shorten: { at_iteration: number } };
 
 /** Mirrors `engine::game::derived_views::TurnOrderSlotView`. */
 export interface TurnOrderSlotView {
@@ -2472,7 +2533,10 @@ export type AutoPassMode =
  * detector. `Off` (default) restores pre-detector behavior; `On` enables it.
  * Mirrors `engine::types::game_state::LoopDetectionMode`.
  */
-export type LoopDetectionMode = { type: "Off" } | { type: "On" };
+export type LoopDetectionMode =
+  | { type: "Off" }
+  | { type: "On" }
+  | { type: "Interactive" };
 
 // ── Source attribution (CR 613 layers) ───────────────────────────────────
 

@@ -11,8 +11,8 @@ use crate::types::actions::{
 use crate::types::events::{BendingType, ContestRound, GameEvent, ManaTapState, PlayerActionKind};
 use crate::types::game_state::{
     ActionResult, AssistState, AutoPassMode, AutoPassRequest, CastOfferKind, ConvokeMode,
-    CostResume, GameState, LandPlayRecord, MayTriggerAutoChoiceKey, PayCostKind, RetargetScope,
-    StackEntry, StackEntryKind, WaitingFor,
+    CostResume, GameState, LandPlayRecord, LoopDetectionMode, MayTriggerAutoChoiceKey, PayCostKind,
+    RetargetScope, StackEntry, StackEntryKind, WaitingFor,
 };
 use crate::types::identifiers::{CardId, ObjectId};
 use crate::types::match_config::MatchType;
@@ -330,7 +330,10 @@ fn reconcile_terminal_result(state: &mut GameState, result: &mut ActionResult) {
         // game-changing functionality ships OFF so it can be developed safely
         // (issue #4603). When OFF the ring is also never populated (the sampler is
         // gated identically), so this conjunct is defense-in-depth, not the sole gate.
-        && state.loop_detection.is_on()
+        // PR-7 Phase 3: `samples()` (not `is_on()`) so `Interactive` also enters. For
+        // `Off` (false) and `On` (true) `samples() == is_on()`, so both are unchanged;
+        // only `Interactive` newly enters, dispatched by the mode `match` in the body.
+        && state.loop_detection.samples()
         && !state.stack.is_empty()
         && !state.loop_detect_ring.is_empty()
         // PR-3 Defect-2: loop-shortcut detection is TOP-LEVEL-ONLY. Inside a
@@ -345,75 +348,442 @@ fn reconcile_terminal_result(state: &mut GameState, result: &mut ActionResult) {
         // explicit and robust to future §9/§2 changes.)
         && !in_simulation_probe()
     {
-        // Clone the Arc handles (cheap refcount bumps) to release the borrow on the
-        // ring before the GameOver mutation below.
+        // PR-7 Phase 3: dispatch the confirmed-loop body by mode. The `On` arm is the
+        // pre-change block VERBATIM — byte-identical event stream, proven by the T-ON
+        // golden captured from HEAD before this wrap. `Interactive` routes to the general
+        // classification bridge (offer + APNAP window + CR 732.4 draw). `Off` is
+        // unreachable: the `samples()` guard above excludes it.
+        match state.loop_detection {
+            LoopDetectionMode::On => {
+                // Clone the Arc handles (cheap refcount bumps) to release the borrow on the
+                // ring before the GameOver mutation below.
+                let priors: Vec<std::sync::Arc<GameState>> =
+                    state.loop_detect_ring.iter().cloned().collect();
+                let cur = crate::analysis::resource::ResourceVector::snapshot(state);
+                // Carry the matching cycle's `delta` out of the scan alongside the winner so
+                // the ∞ producer below can name the loop's unbounded axes without recomputing.
+                // INDEXED scan (not `find_map`) so the matched prior's ring index `k` is known:
+                // the m9 controller-non-dip and R5-B2 faller-simultaneity checks consume the
+                // SAME `frames[k..] ++ live` per-resolution window. On a candidate winner that
+                // fails either seam gate, continue scanning older priors (fail-safe).
+                if let Some((winner, delta)) = priors.iter().enumerate().find_map(|(k, prior)| {
+                    let delta = crate::analysis::resource::ResourceVector::delta(
+                        &crate::analysis::resource::ResourceVector::snapshot(prior),
+                        &cur,
+                    );
+                    let winner = crate::analysis::loop_check::live_mandatory_loop_winner(
+                        prior, state, &delta,
+                    )?;
+                    // The matched window: the prior frame at `k`, every subsequent ring frame,
+                    // then the live state — all per-resolution, no gaps (a non-sampling beat
+                    // clears the ring, so a confirmed window is gap-free).
+                    let mut frames: Vec<&GameState> =
+                        priors[k..].iter().map(|p| p.as_ref()).collect();
+                    frames.push(state);
+                    // CR 704.5a + CR 104.4a (m9): the winner (sole non-faller) must never dip
+                    // across the window — a transient intra-cycle dip a net-delta check cannot
+                    // see would kill it before the extrapolated win.
+                    if !crate::analysis::loop_check::winner_life_never_dips(&frames, winner) {
+                        return None;
+                    }
+                    // CR 704.3 + CR 800.4a + CR 104.2a (R5-B2): with ≥2 fallers, require
+                    // pairwise-equal faller life at every frame so all cross lethal in ONE SBA
+                    // batch (the first elimination is terminal — nothing past it is modeled).
+                    let fallers: Vec<crate::types::player::PlayerId> = state
+                        .players
+                        .iter()
+                        .filter(|p| !p.is_eliminated)
+                        .map(|p| p.id)
+                        .filter(|p| delta.life.get(p).copied().unwrap_or(0) < 0)
+                        .collect();
+                    if fallers.len() >= 2
+                        && !crate::analysis::loop_check::fallers_lives_pairwise_equal(
+                            &frames, &fallers,
+                        )
+                    {
+                        return None;
+                    }
+                    Some((winner, delta))
+                }) {
+                    // CR 732.5: shortcut ONLY a loop NO living player can break. The gate runs
+                    // ONCE after find_map (not per prior). At the per-beat drive this is the
+                    // entire soundness firewall.
+                    if no_living_player_has_meaningful_priority_action(state) {
+                        // CR 732.2a: persist the confirmed loop's unbounded axes so
+                        // `derive_views` projects the `∞` HUD rows. `winner` is the loop's
+                        // controller (the non-faller); `unbounded_axes_for(winner)` returns the
+                        // same axes `detect_loop` records in `LoopCertificate.unbounded`. This is
+                        // the live producer of `unbounded_resources` for a detected loop (the
+                        // debug `SetInfiniteMana` toggle is the only other producer). It runs
+                        // only inside this OFF-gated block, so a default-OFF game never marks ∞.
+                        state.mark_unbounded_loop(winner, &delta.unbounded_axes_for(winner));
+                        result.events.push(GameEvent::GameOver {
+                            winner: Some(winner),
+                        });
+                        state.waiting_for = WaitingFor::GameOver {
+                            winner: Some(winner),
+                        };
+                        result.waiting_for = state.waiting_for.clone();
+                        match_flow::handle_game_over_transition(state);
+                    }
+                }
+            }
+            LoopDetectionMode::Interactive => interactive_loop_bridge(state, result),
+            LoopDetectionMode::Off => {
+                unreachable!("reconcile shortcut body: samples() guard excludes Off")
+            }
+        }
+    }
+}
+
+/// PR-7 Phase 3 (CR 732.2a/b/c + CR 732.4 + CR 704.5a): the `Interactive`-mode branch of
+/// the reconcile shortcut block. Routes the SAME confirmed live loop signal the `On` arm
+/// consumes through the GENERAL classification instead of only the lethal auto-win:
+///
+/// - **Path A — determinate lethal single-winner** (constant-depth OR ω growing cascade,
+///   via the reused, UN-widened [`crate::analysis::loop_check::live_mandatory_loop_winner`]):
+///   if the loop is mandatory (CR 732.5: no living player can break it) this AUTO-WINS
+///   exactly as `On` does (mandatory winning drain). If it is OPTIONAL (some player could
+///   respond) it OFFERS the interactive shortcut (CR 732.2a) via `WaitingFor::LoopShortcut`.
+/// - **Path B — CR 732.4 all-mandatory, net-progress, no-loss draw**: a confirmed cycle
+///   with no determinate winner that drives NO player toward a loss and that no living
+///   player can break is a draw (CR 104.4b / 104.4f).
+///
+/// Everything else (staggered-pod losses, optional pure-advantage loops) falls through
+/// with no action — the pre-feature halt/continue behavior. Runs inside the same
+/// top-level-only `!in_simulation_probe()` guard as the `On` arm.
+///
+/// Multiplayer subset-lethality is safe by construction: [`find_live_loop_winner`] delegates
+/// to [`crate::analysis::loop_check::live_mandatory_loop_winner`], which partitions the living
+/// players into life-fallers vs non-fallers and requires EXACTLY one non-faller
+/// (`nonfallers.len() == 1`; CR 104.2a — a winner is determinate only when every other living
+/// player falls). A loop lethal to only SOME opponents leaves a surviving bystander as a
+/// second non-faller ⇒ `None` ⇒ neither Path A (no winner) nor Path B (a life-loss axis is
+/// present, so it is not a CR 732.4 no-loss draw) fires, and it falls through without crowning.
+fn interactive_loop_bridge(state: &mut GameState, result: &mut ActionResult) {
+    // CR 732.5 / CR 732.2b: is the loop mandatory (no living player has a meaningful
+    // priority action that could break it)? The single mandatory-vs-optional signal the
+    // engine already computes — not a new stored flag.
+    let mandatory = no_living_player_has_meaningful_priority_action(state);
+
+    // Path A: determinate lethal single-winner drain.
+    if let Some((winner, delta, prior)) = find_live_loop_winner(state) {
+        if mandatory {
+            // FIRM #1 — mandatory winning drain: identical to the `On` auto-win.
+            // CR 732.2a: mark the loop's unbounded axes; CR 704.5a: terminal GameOver.
+            state.mark_unbounded_loop(winner, &delta.unbounded_axes_for(winner));
+            result.events.push(GameEvent::GameOver {
+                winner: Some(winner),
+            });
+            state.waiting_for = WaitingFor::GameOver {
+                winner: Some(winner),
+            };
+            result.waiting_for = state.waiting_for.clone();
+            match_flow::handle_game_over_transition(state);
+        } else {
+            // CR 732.2a: OPTIONAL winning drain — OFFER the shortcut to the proposer (the
+            // determinate winner / priority holder). The certificate's residual is filled
+            // via the single `board_delta` population seam (non-empty on the ω path).
+            let certificate = build_cert(prior.as_ref(), state, &delta, winner);
+            state.waiting_for = WaitingFor::LoopShortcut {
+                controller: winner,
+                certificate,
+            };
+            result.waiting_for = state.waiting_for.clone();
+        }
+        return;
+    }
+
+    // Path B: CR 732.4 all-mandatory, net-progress, no-loss draw. Only reached when Path A
+    // found no determinate winner. `mandatory` gates it (CR 732.5); a loss axis or an
+    // optional loop falls through to the pre-feature halt.
+    if mandatory {
         let priors: Vec<std::sync::Arc<GameState>> =
             state.loop_detect_ring.iter().cloned().collect();
         let cur = crate::analysis::resource::ResourceVector::snapshot(state);
-        // Carry the matching cycle's `delta` out of the scan alongside the winner so
-        // the ∞ producer below can name the loop's unbounded axes without recomputing.
-        // INDEXED scan (not `find_map`) so the matched prior's ring index `k` is known:
-        // the m9 controller-non-dip and R5-B2 faller-simultaneity checks consume the
-        // SAME `frames[k..] ++ live` per-resolution window. On a candidate winner that
-        // fails either seam gate, continue scanning older priors (fail-safe).
-        if let Some((winner, delta)) = priors.iter().enumerate().find_map(|(k, prior)| {
+        for prior in &priors {
             let delta = crate::analysis::resource::ResourceVector::delta(
                 &crate::analysis::resource::ResourceVector::snapshot(prior),
                 &cur,
             );
-            let winner =
-                crate::analysis::loop_check::live_mandatory_loop_winner(prior, state, &delta)?;
-            // The matched window: the prior frame at `k`, every subsequent ring frame,
-            // then the live state — all per-resolution, no gaps (a non-sampling beat
-            // clears the ring, so a confirmed window is gap-free).
-            let mut frames: Vec<&GameState> = priors[k..].iter().map(|p| p.as_ref()).collect();
-            frames.push(state);
-            // CR 704.5a + CR 104.4a (m9): the winner (sole non-faller) must never dip
-            // across the window — a transient intra-cycle dip a net-delta check cannot
-            // see would kill it before the extrapolated win.
-            if !crate::analysis::loop_check::winner_life_never_dips(&frames, winner) {
-                return None;
-            }
-            // CR 704.3 + CR 800.4a + CR 104.2a (R5-B2): with ≥2 fallers, require
-            // pairwise-equal faller life at every frame so all cross lethal in ONE SBA
-            // batch (the first elimination is terminal — nothing past it is modeled).
-            let fallers: Vec<crate::types::player::PlayerId> = state
-                .players
-                .iter()
-                .filter(|p| !p.is_eliminated)
-                .map(|p| p.id)
-                .filter(|p| delta.life.get(p).copied().unwrap_or(0) < 0)
-                .collect();
-            if fallers.len() >= 2
-                && !crate::analysis::loop_check::fallers_lives_pairwise_equal(&frames, &fallers)
+            // CR 732.2a board-recurrence (constant-depth OR ω growing cascade) + net
+            // progress + NO loss axis for anyone ⇒ the loop grinds forever with nobody
+            // able to win or lose ⇒ CR 732.4 / 104.4b draw.
+            if (crate::analysis::resource::loop_states_equal_modulo_resources(prior, state)
+                || crate::analysis::resource::loop_states_cover_modulo_growth(prior, state))
+                && delta.is_net_progress()
+                && has_no_loss_axis(&delta)
             {
-                return None;
-            }
-            Some((winner, delta))
-        }) {
-            // CR 732.5: shortcut ONLY a loop NO living player can break. The gate runs
-            // ONCE after find_map (not per prior). At the per-beat drive this is the
-            // entire soundness firewall.
-            if no_living_player_has_meaningful_priority_action(state) {
-                // CR 732.2a: persist the confirmed loop's unbounded axes so
-                // `derive_views` projects the `∞` HUD rows. `winner` is the loop's
-                // controller (the non-faller); `unbounded_axes_for(winner)` returns the
-                // same axes `detect_loop` records in `LoopCertificate.unbounded`. This is
-                // the live producer of `unbounded_resources` for a detected loop (the
-                // debug `SetInfiniteMana` toggle is the only other producer). It runs
-                // only inside this OFF-gated block, so a default-OFF game never marks ∞.
-                state.mark_unbounded_loop(winner, &delta.unbounded_axes_for(winner));
-                result.events.push(GameEvent::GameOver {
-                    winner: Some(winner),
-                });
-                state.waiting_for = WaitingFor::GameOver {
-                    winner: Some(winner),
-                };
+                result.events.push(GameEvent::GameOver { winner: None });
+                state.waiting_for = WaitingFor::GameOver { winner: None };
                 result.waiting_for = state.waiting_for.clone();
                 match_flow::handle_game_over_transition(state);
+                return;
             }
         }
     }
+    // else: staggered-pod loss / optional advantage loop ⇒ no auto-resolve; fall through to
+    // the pre-feature behavior (halt / continue).
+}
+
+/// PR-7 Phase 3: scan the live loop-detect ring for a determinate lethal single-winner,
+/// applying the SAME per-frame window gates the `On` reconcile arm uses
+/// ([`crate::analysis::loop_check::winner_life_never_dips`] +
+/// [`crate::analysis::loop_check::fallers_lives_pairwise_equal`]). This is a deliberate,
+/// isolated copy of the `On` arm's `find_map` scan — the `On` arm stays VERBATIM (byte-
+/// identity gate), so it is not refactored to call this. Returns `(winner, per-cycle
+/// delta, cycle-start frame)`; the frame feeds `board_delta` for the offer certificate.
+fn find_live_loop_winner(
+    state: &GameState,
+) -> Option<(
+    PlayerId,
+    crate::analysis::resource::ResourceVector,
+    std::sync::Arc<GameState>,
+)> {
+    let priors: Vec<std::sync::Arc<GameState>> = state.loop_detect_ring.iter().cloned().collect();
+    let cur = crate::analysis::resource::ResourceVector::snapshot(state);
+    priors.iter().enumerate().find_map(|(k, prior)| {
+        let delta = crate::analysis::resource::ResourceVector::delta(
+            &crate::analysis::resource::ResourceVector::snapshot(prior),
+            &cur,
+        );
+        let winner = crate::analysis::loop_check::live_mandatory_loop_winner(prior, state, &delta)?;
+        let mut frames: Vec<&GameState> = priors[k..].iter().map(|p| p.as_ref()).collect();
+        frames.push(state);
+        if !crate::analysis::loop_check::winner_life_never_dips(&frames, winner) {
+            return None;
+        }
+        let fallers: Vec<PlayerId> = state
+            .players
+            .iter()
+            .filter(|p| !p.is_eliminated)
+            .map(|p| p.id)
+            .filter(|p| delta.life.get(p).copied().unwrap_or(0) < 0)
+            .collect();
+        if fallers.len() >= 2
+            && !crate::analysis::loop_check::fallers_lives_pairwise_equal(&frames, &fallers)
+        {
+            return None;
+        }
+        Some((winner, delta, prior.clone()))
+    })
+}
+
+/// PR-7 Phase 3: build the offer certificate for an OPTIONAL winning drain. Fills the
+/// residual via the SINGLE `board_delta` population seam (`loop_check.rs` invariant — NOT
+/// `BoardDelta::default()`); empty for a constant-depth drain, non-empty for the ω growing
+/// cascade where the Phase-4 materialization consumer reads it.
+fn build_cert(
+    prior: &GameState,
+    state: &GameState,
+    delta: &crate::analysis::resource::ResourceVector,
+    winner: PlayerId,
+) -> crate::analysis::loop_check::LoopCertificate {
+    crate::analysis::loop_check::LoopCertificate {
+        unbounded: delta.unbounded_axes_for(winner),
+        win_kind: crate::analysis::loop_check::classify_win_kind(winner, delta),
+        // The offer is only reached for an OPTIONAL loop.
+        mandatory: false,
+        residual_board_delta: crate::analysis::resource::board_delta(prior, state),
+    }
+}
+
+/// CR 732.4 + CR 104.4b: a net-progress mandatory loop draws ONLY if it drives NO player
+/// toward a loss — no life drain, no poison, no decking. Any loss axis means a determinate
+/// loser (Path A) or a staggered pod (fall through), never a draw. The live delta comes
+/// from two `snapshot`s, so `damage_dealt` is empty (state-fed) and life loss surfaces as
+/// a negative `life` delta.
+fn has_no_loss_axis(delta: &crate::analysis::resource::ResourceVector) -> bool {
+    use crate::analysis::resource::{CounterClass, ObjectClass};
+    delta.life.values().all(|&n| n >= 0)
+        && delta.library_delta.values().all(|&n| n >= 0)
+        && delta
+            .counters
+            .get(&(CounterClass::Poison, ObjectClass::Player))
+            .copied()
+            .unwrap_or(0)
+            <= 0
+}
+
+/// CR 800.4a: the seat that should receive priority when a loop-shortcut resolution hands
+/// priority back. Priority passes to the next player in turn order still in the game — the
+/// active player if it is still in the game, otherwise the next living seat in turn order
+/// (elimination does not advance `active_player` when a non-acting seat concedes during the
+/// APNAP window, so `active_player` may be a departed player).
+fn living_priority_seat(state: &GameState) -> PlayerId {
+    if crate::game::players::is_alive(state, state.active_player) {
+        state.active_player
+    } else {
+        crate::game::players::next_player_in_turn_order(state, state.active_player)
+    }
+}
+
+/// CR 732.2c + CR 704.5a: apply a confirmed loop shortcut. Reached ONLY on the Accept path
+/// (every living opponent accepted). CR 608.2b re-validation is satisfied BY CONSTRUCTION:
+/// the offer confirmed `proposal.controller` as the determinate winner over public board
+/// state, and between the offer and the final Accept the dispatch admits ONLY the protocol
+/// actions (`DeclareShortcut`/`RespondToShortcut`), none of which touch the board — so the
+/// loop is provably still intact and `controller` is still the winner. (A live ring re-scan
+/// here is unsound: intervening finalize/SBA/layer steps drift the paused state away from the
+/// sampled ring frames. The Shorten path — where a real board action CAN break the loop —
+/// deliberately hands priority instead of reaching here, and re-detection re-fires the bridge
+/// LIVE on a later beat.) `UntilLethal` ⇒ mark the unbounded axes + declare the terminal win;
+/// `Fixed(N)` short of lethal is Phase-4 finite materialization, so Phase 3 hands priority
+/// back (manual fallback).
+///
+/// The consumption-time controller-liveness guard below catches a `Concede` (CR 104.3a) or a
+/// `Debug` that ELIMINATES the proposer inside the still-open APNAP window. A `Debug` action
+/// that drifts the board WITHOUT killing the proposer (e.g. debug-removing a loop permanent)
+/// is deliberately out of scope: `debug_mode` is sandbox god-mode that can already produce
+/// arbitrarily inconsistent states, so loop-shortcut soundness under arbitrary debug mutation
+/// is not a competitive-correctness obligation.
+fn apply_confirmed_shortcut(
+    state: &mut GameState,
+    result: &mut ActionResult,
+    proposal: &crate::analysis::loop_check::ShortcutProposal,
+) {
+    // CR 104.3a / CR 104.2a / CR 800.4a: re-validate the latched winner's liveness at
+    // consumption. The offer confirmed `proposal.controller` when it was built, but
+    // `GameAction::Concede` (and a board-mutating `Debug`) bypass the `WaitingFor`
+    // dispatch and can remove the proposer inside the still-open APNAP window without
+    // re-validating the latch. CR 104.3a: a player who conceded has lost the game and
+    // cannot be crowned; CR 104.2a: the winner must still be in the game; CR 800.4a: the
+    // departed proposer's loop objects have already left the game, so the loop has
+    // dissolved. Do NOT crown a departed proposer — hand priority back so a later reconcile
+    // beat re-detects a genuinely LIVE winner (or, correctly, none).
+    if !crate::game::players::is_alive(state, proposal.controller) {
+        priority::reset_priority(state);
+        // CR 800.4a: priority passes to the next player in turn order still in the game.
+        // The departed proposer may have been the active player (elimination does not advance
+        // `active_player` when a non-acting seat concedes during the APNAP window), so route to
+        // a LIVING holder rather than a possibly-departed `active_player`.
+        let holder = living_priority_seat(state);
+        state.waiting_for = WaitingFor::Priority { player: holder };
+        result.waiting_for = state.waiting_for.clone();
+        return;
+    }
+    match proposal.count {
+        crate::analysis::decision_template::IterationCount::UntilLethal => {
+            // CR 732.2a: persist the confirmed loop's unbounded axes (the ∞ HUD producer);
+            // CR 704.5a: the drain is lethal ⇒ terminal win for the proposer.
+            state.mark_unbounded_loop(proposal.controller, &proposal.unbounded);
+            result.events.push(GameEvent::GameOver {
+                winner: Some(proposal.controller),
+            });
+            state.waiting_for = WaitingFor::GameOver {
+                winner: Some(proposal.controller),
+            };
+            result.waiting_for = state.waiting_for.clone();
+            match_flow::handle_game_over_transition(state);
+        }
+        // Phase-4 finite materialization; the priority fallback shares living_priority_seat with the UntilLethal path (CR 800.4a).
+        crate::analysis::decision_template::IterationCount::Fixed(_) => {
+            priority::reset_priority(state);
+            state.waiting_for = WaitingFor::Priority {
+                player: living_priority_seat(state),
+            };
+            result.waiting_for = state.waiting_for.clone();
+        }
+    }
+}
+
+/// CR 732.2a: the proposer declared the loop shortcut. Build the public proposal and open
+/// the APNAP accept-or-shorten window over the proposer's living opponents (turn order). No
+/// opponents (solitaire / all eliminated) ⇒ take the shortcut immediately.
+fn handle_declare_shortcut(
+    state: &mut GameState,
+    controller: PlayerId,
+    certificate: &crate::analysis::loop_check::LoopCertificate,
+    count: crate::analysis::decision_template::IterationCount,
+    _template: Option<crate::analysis::decision_template::DecisionTemplate>,
+    events: &mut Vec<GameEvent>,
+) -> Result<ActionResult, EngineError> {
+    let proposal = crate::analysis::loop_check::ShortcutProposal {
+        controller,
+        count,
+        unbounded: certificate.unbounded.clone(),
+        win_kind: certificate.win_kind,
+    };
+    // CR 732.2b: living opponents in APNAP turn order, starting after the controller.
+    let opps: Vec<PlayerId> = crate::game::players::apnap_order_from(
+        state,
+        Some(crate::types::ability::ControllerRef::You),
+        controller,
+    )
+    .into_iter()
+    .filter(|&p| p != controller)
+    .collect();
+    let mut result = ActionResult {
+        events: std::mem::take(events),
+        waiting_for: state.waiting_for.clone(),
+        log_entries: vec![],
+    };
+    if let Some((&first, rest)) = opps.split_first() {
+        state.waiting_for = WaitingFor::RespondToShortcut {
+            player: first,
+            remaining_players: rest.to_vec(),
+            proposal,
+        };
+        result.waiting_for = state.waiting_for.clone();
+    } else {
+        // CR 732.2c: nobody else to poll ⇒ take the shortcut.
+        apply_confirmed_shortcut(state, &mut result, &proposal);
+    }
+    Ok(result)
+}
+
+/// CR 732.2b/c: one opponent answered the shortcut offer. Mirrors the
+/// `OpponentMayChoice`/`UnlessPayment` APNAP fan-out (drain-one-advance via
+/// `remaining_players`). Accept advances to the next opponent, or — when the last accepts —
+/// takes the shortcut. Shorten conservatively hands THAT opponent a real priority window
+/// (CR 732.2c "a different choice"); the shortcut is NOT auto-applied, and a later beat
+/// re-detects the loop (a fresh offer if it still closes, normal play if broken).
+fn handle_respond_to_shortcut(
+    state: &mut GameState,
+    player: PlayerId,
+    remaining_players: Vec<PlayerId>,
+    proposal: crate::analysis::loop_check::ShortcutProposal,
+    response: crate::analysis::loop_check::ShortcutResponse,
+    events: &mut Vec<GameEvent>,
+) -> Result<ActionResult, EngineError> {
+    let mut result = ActionResult {
+        events: std::mem::take(events),
+        waiting_for: state.waiting_for.clone(),
+        log_entries: vec![],
+    };
+    match response {
+        crate::analysis::loop_check::ShortcutResponse::Accept => {
+            // CR 800.4a: never advance the offer onto a player who has left the game. A
+            // queued opponent can concede AFTER the window opened (Concede bypasses the
+            // `WaitingFor` dispatch, so `remaining_players` is never self-healed), so drop
+            // any departed seats before advancing. CR 732.2b: the queue is already in APNAP
+            // turn order, so the first surviving remainder is the next living opponent.
+            let mut living = remaining_players
+                .into_iter()
+                .filter(|&p| crate::game::players::is_alive(state, p));
+            if let Some(next) = living.next() {
+                state.waiting_for = WaitingFor::RespondToShortcut {
+                    player: next,
+                    remaining_players: living.collect(),
+                    proposal,
+                };
+                result.waiting_for = state.waiting_for.clone();
+            } else {
+                // CR 732.2c: the last living opponent accepted ⇒ take the shortcut
+                // (F1 re-validates the proposer's own liveness before crowning).
+                apply_confirmed_shortcut(state, &mut result, &proposal);
+            }
+        }
+        crate::analysis::loop_check::ShortcutResponse::Shorten { .. } => {
+            // CR 732.2c (Phase-3 conservative): hand this opponent a real priority window
+            // instead of taking the shortcut. Finite-K materialization is Phase 4.
+            priority::reset_priority(state);
+            state.priority_player = player;
+            state.waiting_for = WaitingFor::Priority { player };
+            result.waiting_for = state.waiting_for.clone();
+        }
+    }
+    Ok(result)
 }
 
 fn remember_public_reveals(state: &mut GameState, events: &[GameEvent]) {
@@ -681,7 +1051,9 @@ fn pass_priority_once_with_pipeline(
     // is never populated, so the engine pays none of the per-resolution
     // `normalize_for_loop` clone cost and the reconcile-seam shortcut (which guards on
     // a non-empty ring AND the same flag) can never fire — exact pre-detector behavior.
-    if resolved_this_beat && !in_simulation_probe() && state.loop_detection.is_on() {
+    // PR-7 Phase 3: `samples()` so `Interactive` populates the ring identically to `On`;
+    // `Off` (false) and `On` (true) are byte-preserved (`samples() == is_on()` for both).
+    if resolved_this_beat && !in_simulation_probe() && state.loop_detection.samples() {
         // REFILL gate: a self-refilling MANDATORY cascade holds the stack non-empty and
         // non-shrinking across the resolution, settling at a non-interactive priority
         // window reset to the active player (the canonical modulo-comparison point —
@@ -1432,6 +1804,7 @@ fn apply_action(
     // cascade and so must NOT clear. `run_auto_pass_loop` and `resolve_all_fast_forward`
     // call the resolution seam directly (not via `apply_action`), so this clear does
     // not fire during their internal iterations — the ring accumulates correctly there.
+    //
     if !matches!(action, GameAction::PassPriority) {
         state.loop_detect_ring.clear();
     }
@@ -2691,6 +3064,41 @@ fn apply_action(
                 state,
                 waiting_for.clone(),
                 accept,
+                &mut events,
+            );
+        }
+        // CR 732.2a: the proposer declares the loop shortcut.
+        (
+            WaitingFor::LoopShortcut {
+                controller,
+                certificate,
+            },
+            GameAction::DeclareShortcut { count, template },
+        ) => {
+            return handle_declare_shortcut(
+                state,
+                *controller,
+                certificate,
+                count,
+                template,
+                &mut events,
+            );
+        }
+        // CR 732.2b/c: an opponent answers the loop-shortcut offer.
+        (
+            WaitingFor::RespondToShortcut {
+                player,
+                remaining_players,
+                proposal,
+            },
+            GameAction::RespondToShortcut { response },
+        ) => {
+            return handle_respond_to_shortcut(
+                state,
+                *player,
+                remaining_players.clone(),
+                proposal.clone(),
+                response,
                 &mut events,
             );
         }

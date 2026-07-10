@@ -3003,6 +3003,30 @@ pub fn candidate_actions_broad_with_probe(
             ));
             v
         }
+        // CR 732.2a: the proposer declares the loop shortcut. Phase 3 only ever proposes
+        // `UntilLethal` with no pinned template (choice-bearing loops fall through, not
+        // offer). Keeps `legal_actions` non-empty so the AI/projection never bail here.
+        WaitingFor::LoopShortcut { controller, .. } => {
+            vec![candidate(
+                GameAction::DeclareShortcut {
+                    count: crate::analysis::decision_template::IterationCount::UntilLethal,
+                    template: None,
+                },
+                TacticalClass::Utility,
+                Some(*controller),
+            )]
+        }
+        // CR 732.2b/c: an opponent answers a loop-shortcut offer. Phase 3 always accepts
+        // (smart `Shorten` heuristics are Phase 4).
+        WaitingFor::RespondToShortcut { player, .. } => {
+            vec![candidate(
+                GameAction::RespondToShortcut {
+                    response: crate::analysis::loop_check::ShortcutResponse::Accept,
+                },
+                TacticalClass::Utility,
+                Some(*player),
+            )]
+        }
     };
 
     actions

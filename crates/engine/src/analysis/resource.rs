@@ -668,7 +668,9 @@ fn loyalty_activation_counts_match(a: &GameState, b: &GameState) -> bool {
 /// [`ResourceAxis`] scalar). Identity via `oracle_id` (cross-incarnation stable,
 /// CR 400.7-proof) so a later materialization phase can recreate it; `controller` +
 /// `tapped` are the split B4 must preserve (the "+1 untapped").
-#[derive(Debug, Clone, PartialEq, Eq)]
+// PR-7 Phase 3: serde-derived because it rides inside `LoopCertificate.residual_board_delta`,
+// which serializes into `WaitingFor::LoopShortcut`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResidualPermanent {
     pub oracle_id: String,
     pub controller: PlayerId,
@@ -683,7 +685,8 @@ pub struct ResidualPermanent {
 /// tap). EMPTY for a constant-depth or stack-growth loop (their battlefields are
 /// identical by construction). Non-empty only once an object-growth detection path feeds
 /// [`board_delta`] non-identical battlefields.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+// PR-7 Phase 3: serde-derived — serializes into `WaitingFor::LoopShortcut`'s certificate.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct BoardDelta {
     /// Battlefield permanents present in `after` but not `before` (by `ObjectId`).
     pub added: Vec<ResidualPermanent>,

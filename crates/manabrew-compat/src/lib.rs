@@ -1850,6 +1850,12 @@ pub fn convert_available_action(action: &GameAction, id: String) -> AvailableAct
         | GameAction::RevokeDebugPermission { .. } => {
             AvailableActionConversion::Unsupported("local.debug-action-unsupported")
         }
+        // CR 732.2a/b/c: the interactive loop-shortcut protocol is opt-in
+        // (`LoopDetectionMode::Interactive`) and never reached on the legacy manabrew
+        // protocol — a legacy client never sets that mode.
+        GameAction::DeclareShortcut { .. } | GameAction::RespondToShortcut { .. } => {
+            AvailableActionConversion::Unsupported("local.loop-shortcut-unsupported")
+        }
     }
 }
 

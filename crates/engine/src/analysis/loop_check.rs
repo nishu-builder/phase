@@ -54,12 +54,14 @@
 //! and the derived [`WinKind`]. When either fails, it returns `None` — the
 //! soundness guarantee: no certificate for a non-loop or a non-progressing cycle.
 
+use crate::analysis::decision_template::IterationCount;
 use crate::analysis::resource::{
     loop_states_cover_modulo_growth, loop_states_equal_modulo_resources, BoardDelta, CounterClass,
     ObjectClass, ResourceAxis, ResourceVector,
 };
 use crate::types::game_state::GameState;
 use crate::types::player::PlayerId;
+use serde::{Deserialize, Serialize};
 
 /// How a confirmed net-progress loop reaches a win (or merely accrues unbounded
 /// advantage), derived from its unbounded resource axes.
@@ -71,7 +73,13 @@ use crate::types::player::PlayerId;
 /// `LethalDamage`). The detector classifies the *measured* unbounded axis, so it
 /// needs the finer set below; PR-8 maps this onto `combo::WinKind` when it couples
 /// the certificate into the AI.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// PR-7 Phase 3: gains `Serialize`/`Deserialize` because it now rides inside
+/// `WaitingFor::LoopShortcut`'s `LoopCertificate` and `ShortcutProposal` across the
+/// serialization boundary (all fields are derived from public board state — no hidden
+/// info). Serde default (externally tagged): each unit variant serializes as its bare
+/// name string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WinKind {
     /// CR 704.5a: an opponent's life is driven to 0 or less — unbounded damage to
     /// or unbounded life loss from an opponent (burn pings, drains, lifeloss).
@@ -103,9 +111,11 @@ pub enum WinKind {
 ///
 /// Produced only by [`detect_loop`] when the board is identical modulo resources
 /// **and** the per-cycle resource delta is net-progress. It is an *analysis*
-/// value — never stored on `GameState`, never serialized into game flow; PR-3 is
-/// what (later) acts on an equivalent live signal.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// value — never stored on `GameState`; PR-3 acts on an equivalent live signal. PR-7
+/// Phase 3 serializes a certificate into `WaitingFor::LoopShortcut` for the interactive
+/// shortcut offer, so it gains `Serialize`/`Deserialize` (every field is public board
+/// state).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoopCertificate {
     /// The resource axes that grew (or, for a mill loop, shrank) each cycle — the
     /// unbounded resources, as named by [`ResourceVector::unbounded_components`].
@@ -134,6 +144,36 @@ impl LoopCertificate {
     pub fn covers(&self, expected: &[ResourceAxis]) -> bool {
         expected.iter().all(|e| self.unbounded.contains(e))
     }
+}
+
+/// CR 732.2a: the public, log/display summary a `WaitingFor::RespondToShortcut` carries
+/// to each responding opponent — "the player with priority suggests repeating this loop
+/// N times". Every field is derived from public board state (the confirmed certificate +
+/// the proposer's declared count), so there is no hidden information to redact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShortcutProposal {
+    /// CR 732.2a: the player who proposed the shortcut (the loop's determinate winner /
+    /// priority holder). `WaitingFor::acting_player` on the offer routes to them.
+    pub controller: PlayerId,
+    /// CR 732.1b: how many times to repeat before stopping. Phase 3 only ever proposes
+    /// [`IterationCount::UntilLethal`] (a determinate CR 704.5a drain).
+    pub count: IterationCount,
+    /// The confirmed unbounded axes (from the certificate) — display only.
+    pub unbounded: Vec<ResourceAxis>,
+    /// How the loop wins (from the certificate) — display only.
+    pub win_kind: WinKind,
+}
+
+/// CR 732.2b/c: an opponent's answer to a proposed loop shortcut. `Accept` lets the
+/// shortcut proceed; `Shorten` names an earlier stopping point (Phase 3 realizes this
+/// conservatively as decline-to-manual — the opponent receives a real priority window
+/// instead of the loop being auto-taken; finite-K materialization is Phase 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShortcutResponse {
+    /// CR 732.2c: this player agrees to take the shortcut.
+    Accept,
+    /// CR 732.2b: this player names an earlier ending point (`at_iteration` cycles in).
+    Shorten { at_iteration: u32 },
 }
 
 /// Engine A's primary offline classification entry point.

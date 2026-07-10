@@ -415,6 +415,17 @@ fn resolve_choice(
             actions.first().cloned().unwrap()
         }
 
+        // CR 732.2a/b/c: loop-shortcut protocol (PR-7 Phase 3). Construct the deterministic
+        // default DIRECTLY rather than leaning on the `_ =>` wildcard's arbitrary
+        // `actions.first()` — the controller declares `UntilLethal`, an opponent accepts.
+        WaitingFor::LoopShortcut { .. } => GameAction::DeclareShortcut {
+            count: engine::analysis::decision_template::IterationCount::UntilLethal,
+            template: None,
+        },
+        WaitingFor::RespondToShortcut { .. } => GameAction::RespondToShortcut {
+            response: engine::analysis::loop_check::ShortcutResponse::Accept,
+        },
+
         _ => {
             // All remaining variants: first legal action.
             actions.first().cloned().unwrap()

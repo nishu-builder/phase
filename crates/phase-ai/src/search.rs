@@ -755,6 +755,17 @@ fn fallback_action(state: &GameState) -> Option<GameAction> {
         // Priority is the only state where PassPriority is valid.
         WaitingFor::Priority { .. } => Some(GameAction::PassPriority),
 
+        // CR 732.2a/b/c: loop-shortcut protocol (PR-7 Phase 3). Construct the default
+        // action DIRECTLY (never lean on a wildcard / engine::ai_support::legal_actions):
+        // this is the live-AI deadlock-safe net for the interactive combo states.
+        WaitingFor::LoopShortcut { .. } => Some(GameAction::DeclareShortcut {
+            count: engine::analysis::decision_template::IterationCount::UntilLethal,
+            template: None,
+        }),
+        WaitingFor::RespondToShortcut { .. } => Some(GameAction::RespondToShortcut {
+            response: engine::analysis::loop_check::ShortcutResponse::Accept,
+        }),
+
         // Combat declarations: an empty declaration is NOT always legal —
         // CR 508.1d / CR 701.15b require goaded / "attacks if able" creatures
         // to be declared. Delegate to the engine's `legal_actions`, which runs
