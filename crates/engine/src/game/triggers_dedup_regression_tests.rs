@@ -5,7 +5,7 @@ use crate::types::ability::{
     TargetFilter, TargetRef, TriggerDefinition, TypedFilter,
 };
 use crate::types::actions::GameAction;
-use crate::types::card_type::CoreType;
+use crate::types::card_type::{CoreType, Supertype};
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
     AutoMayChoice, GameState, MayTriggerAutoChoiceKey, MayTriggerOrigin, WaitingFor,
@@ -1014,6 +1014,174 @@ fn install_doubler(state: &mut GameState, cause: TriggerCause) -> ObjectId {
             StaticMode::DoubleTriggers { cause },
         ));
     id
+}
+
+/// CR 603.2d + CR 603.6a + CR 603.6c: Gandalf the White-class doubler.
+fn install_gandalf_doubler(state: &mut GameState) -> ObjectId {
+    use crate::types::statics::{TriggerCause, ZoneChangeQualifier};
+    install_doubler(
+        state,
+        TriggerCause::BattlefieldTransition {
+            enter: true,
+            leave: true,
+            qualifiers: vec![
+                ZoneChangeQualifier::Supertype(Supertype::Legendary),
+                ZoneChangeQualifier::CoreType(CoreType::Artifact),
+            ],
+        },
+    )
+}
+
+/// CR 603.2d: Gandalf doubles ETB triggers caused by a legendary permanent.
+#[test]
+fn gandalf_doubles_legendary_etb_triggers() {
+    let (mut state, observer) = setup_with_observer(TriggerMode::ChangesZone);
+    state
+        .objects
+        .get_mut(&observer)
+        .unwrap()
+        .trigger_definitions[0]
+        .destination = Some(Zone::Battlefield);
+    let _gandalf = install_gandalf_doubler(&mut state);
+
+    let norin = create_object(
+        &mut state,
+        CardId(5332),
+        PlayerId(0),
+        "Norin the Wary".to_string(),
+        Zone::Battlefield,
+    );
+    state.objects.get_mut(&norin).unwrap().card_types = crate::types::card_type::CardType {
+        core_types: vec![CoreType::Creature],
+        supertypes: vec![Supertype::Legendary],
+        subtypes: vec![],
+    };
+
+    let event = GameEvent::ZoneChanged {
+        object_id: norin,
+        from: Some(Zone::Exile),
+        to: Zone::Battlefield,
+        record: Box::new(ZoneChangeRecord {
+            name: "Norin the Wary".to_string(),
+            core_types: vec![CoreType::Creature],
+            supertypes: vec![Supertype::Legendary],
+            ..ZoneChangeRecord::test_minimal(norin, Some(Zone::Exile), Zone::Battlefield)
+        }),
+    };
+
+    process_triggers(&mut state, &[event]);
+    super::drain_order_triggers_with_identity(&mut state);
+    let observer_triggers = state
+        .stack
+        .iter()
+        .filter(|e| e.source_id == observer)
+        .count();
+    assert_eq!(
+        observer_triggers, 2,
+        "Gandalf must double ETB triggers caused by a legendary permanent re-entering"
+    );
+}
+
+/// CR 603.2d: Gandalf doubles ETB triggers caused by an artifact.
+#[test]
+fn gandalf_doubles_artifact_etb_triggers() {
+    let (mut state, observer) = setup_with_observer(TriggerMode::ChangesZone);
+    state
+        .objects
+        .get_mut(&observer)
+        .unwrap()
+        .trigger_definitions[0]
+        .destination = Some(Zone::Battlefield);
+    let _gandalf = install_gandalf_doubler(&mut state);
+
+    let genesis = create_object(
+        &mut state,
+        CardId(5333),
+        PlayerId(0),
+        "Genesis Chamber".to_string(),
+        Zone::Battlefield,
+    );
+    state
+        .objects
+        .get_mut(&genesis)
+        .unwrap()
+        .card_types
+        .core_types
+        .push(CoreType::Artifact);
+
+    let event = GameEvent::ZoneChanged {
+        object_id: genesis,
+        from: Some(Zone::Hand),
+        to: Zone::Battlefield,
+        record: Box::new(ZoneChangeRecord {
+            name: "Genesis Chamber".to_string(),
+            core_types: vec![CoreType::Artifact],
+            ..ZoneChangeRecord::test_minimal(genesis, Some(Zone::Hand), Zone::Battlefield)
+        }),
+    };
+
+    process_triggers(&mut state, &[event]);
+    super::drain_order_triggers_with_identity(&mut state);
+    let observer_triggers = state
+        .stack
+        .iter()
+        .filter(|e| e.source_id == observer)
+        .count();
+    assert_eq!(
+        observer_triggers, 2,
+        "Gandalf must double ETB triggers caused by an artifact entering"
+    );
+}
+
+/// CR 603.2d: Gandalf does not double ETB triggers from ordinary non-artifact creatures.
+#[test]
+fn gandalf_does_not_double_ordinary_creature_etb_triggers() {
+    let (mut state, observer) = setup_with_observer(TriggerMode::ChangesZone);
+    state
+        .objects
+        .get_mut(&observer)
+        .unwrap()
+        .trigger_definitions[0]
+        .destination = Some(Zone::Battlefield);
+    let _gandalf = install_gandalf_doubler(&mut state);
+
+    let greeter = create_object(
+        &mut state,
+        CardId(5334),
+        PlayerId(0),
+        "Gala Greeters".to_string(),
+        Zone::Battlefield,
+    );
+    state
+        .objects
+        .get_mut(&greeter)
+        .unwrap()
+        .card_types
+        .core_types
+        .push(CoreType::Creature);
+
+    let event = GameEvent::ZoneChanged {
+        object_id: greeter,
+        from: Some(Zone::Hand),
+        to: Zone::Battlefield,
+        record: Box::new(ZoneChangeRecord {
+            name: "Gala Greeters".to_string(),
+            core_types: vec![CoreType::Creature],
+            ..ZoneChangeRecord::test_minimal(greeter, Some(Zone::Hand), Zone::Battlefield)
+        }),
+    };
+
+    process_triggers(&mut state, &[event]);
+    super::drain_order_triggers_with_identity(&mut state);
+    let observer_triggers = state
+        .stack
+        .iter()
+        .filter(|e| e.source_id == observer)
+        .count();
+    assert_eq!(
+        observer_triggers, 1,
+        "Gandalf must not double ETB triggers caused by a non-legendary non-artifact creature"
+    );
 }
 
 /// CR 603.2d: Isshin (CreatureAttacking cause) doubles attack triggers
