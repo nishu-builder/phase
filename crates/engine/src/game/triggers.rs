@@ -4049,7 +4049,19 @@ fn apply_trigger_order_template(
             .iter()
             .filter_map(|d| match d {
                 PinnedDecision::Order { source, pos } => Some((source.clone(), *pos)),
-                _ => None,
+                // CR 603.3b (N3 structural guard): a `TriggerOrdering` template carries ONLY
+                // `Order` pins; a targeting / modal / may / unless-break pin never belongs in a
+                // trigger-ordering group. EXHAUSTIVE (no `_`) so a future `PinnedDecision`
+                // variant build-breaks HERE and forces an explicit keep/drop decision, rather
+                // than the fail-open `_ => None` silently swallowing it out of the ordering
+                // extraction (which would change CR 603.3b trigger auto-ordering / replay).
+                PinnedDecision::Targets { .. }
+                | PinnedDecision::Mode { .. }
+                | PinnedDecision::MayChoice { .. }
+                | PinnedDecision::UnlessBreak { .. }
+                // CR 601.2h: a convoke cost-payment pin is a CR 732.2a loop-choice
+                // template pin, never a CR 603.3b trigger-ordering pin.
+                | PinnedDecision::ConvokeTaps { .. } => None,
             })
             .collect(),
         // A covering template exists but isn't persistent, or none at all ⇒ prompt.

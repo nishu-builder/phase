@@ -25,7 +25,7 @@ use engine::types::actions::GameAction;
 use engine::types::events::GameEvent;
 use engine::types::game_state::{GameState, LoopDetectionMode, WaitingFor, YieldTarget};
 use engine::types::identifiers::ObjectId;
-use engine::types::mana::ManaColor;
+use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
 
@@ -1619,3 +1619,418 @@ fn low2_smart_shortcut_self_preservation() {
          would fail first)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// PR-7 Phase 4d-ii — LIVE object-growth detection + offer (the 51st: Witherbloom,
+// the Balancer + Sprout Swarm token-growth infinite). Cast-pipeline tests: real
+// parsed AST (verbatim Oracle text), driven through `GameRunner::cast(..).resolve()`.
+// ---------------------------------------------------------------------------
+
+/// Sprout Swarm's verbatim Oracle text (Scryfall / card-data.json).
+const SPROUT_SWARM_ORACLE: &str = "Convoke (Your creatures can help cast this spell. Each creature you tap while casting this spell pays for {1} or one mana of that creature's color.)\nBuyback {3} (You may pay an additional {3} as you cast this spell. If you do, put this card into your hand as it resolves.)\nCreate a 1/1 green Saproling creature token.";
+
+/// Witherbloom's granted-affinity Oracle line (the loop-relevant clause).
+const WITHERBLOOM_AFFINITY_ORACLE: &str =
+    "Instant and sorcery spells you cast have affinity for creatures.";
+
+/// Build the 51st fixture: Witherbloom (granted affinity) + `n_fodder` untapped green
+/// 1/1 Saproling creatures + Sprout Swarm ({1}{G}, Buyback {3}, Convoke) in P0's hand.
+/// Returns `(runner, sprout_id, fodder_ids)`. `Interactive` loop-detection ON.
+fn sprout_swarm_scenario(n_fodder: usize) -> (GameRunner, ObjectId, Vec<ObjectId>) {
+    sprout_swarm_scenario_with_drain(n_fodder, None)
+}
+
+/// As [`sprout_swarm_scenario`], but optionally adds a big "Test Drain Engine" permanent whose
+/// `drain_oracle` (a `"Whenever you cast a spell, ..."` trigger) fires on EACH recast and drains
+/// a resource axis in the LIVE recast body — the N4/N5/N6 no-offer negative controls. The engine
+/// is a 9/9 so a self-damage drain does not kill it within the 2-iteration detection drive.
+fn sprout_swarm_scenario_with_drain(
+    n_fodder: usize,
+    drain_oracle: Option<&str>,
+) -> (GameRunner, ObjectId, Vec<ObjectId>) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_creature_from_oracle(
+        P0,
+        "Witherbloom, the Balancer",
+        5,
+        5,
+        WITHERBLOOM_AFFINITY_ORACLE,
+    );
+    if let Some(oracle) = drain_oracle {
+        scenario.add_creature_from_oracle(P0, "Test Drain Engine", 9, 9, oracle);
+    }
+    let mut fodder = Vec::new();
+    for _ in 0..n_fodder {
+        fodder.push(scenario.add_creature(P0, "Saproling", 1, 1).id());
+    }
+    let sprout = {
+        let mut b =
+            scenario.add_spell_to_hand_from_oracle(P0, "Sprout Swarm", true, SPROUT_SWARM_ORACLE);
+        b.with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Green],
+            generic: 1,
+        });
+        b.id()
+    };
+    let mut runner = scenario.build();
+    {
+        let st = runner.state_mut();
+        st.loop_detection = LoopDetectionMode::Interactive;
+        // The starting fodder must be GREEN so convoke can tap it for the {G} pip.
+        for &id in &fodder {
+            st.objects.get_mut(&id).unwrap().color = vec![ManaColor::Green];
+        }
+    }
+    (runner, sprout, fodder)
+}
+
+/// Count real Saproling tokens/creatures on P0's battlefield in a state.
+fn saproling_count(state: &GameState) -> usize {
+    state
+        .battlefield
+        .iter()
+        .filter(|id| state.objects.get(id).is_some_and(|o| o.name == "Saproling"))
+        .count()
+}
+
+/// P1 ⭐ — the 51st COVERS and OFFERS. A single real Witherbloom/Sprout-Swarm cast (paying
+/// buyback and convoke) settles with an empty stack; the empty-stack hook drives two recast
+/// iterations on a clone, confirms the fodder-growth cover and sign-check, and OFFERS the
+/// interactive shortcut. Discriminators: the offer reaches `LoopShortcut`; and clone-isolation,
+/// exactly ONE real Saproling was created by the single real cast (the drives ran on clones).
+#[test]
+fn object_growth_51st_sprout_swarm_covers_and_offers() {
+    let (mut runner, sprout, fodder) = sprout_swarm_scenario(4);
+    let before = saproling_count(runner.state());
+    let outcome = runner
+        .cast(sprout)
+        .accept_optional() // pay buyback {3}
+        .convoke_with(&[fodder[0]]) // tap one green Saproling for the {G} pip
+        .commit()
+        .resolve();
+
+    assert!(
+        matches!(
+            outcome.final_waiting_for(),
+            WaitingFor::LoopShortcut { controller, .. } if *controller == P0
+        ),
+        "expected LoopShortcut offer to P0, got {:?}",
+        outcome.final_waiting_for()
+    );
+    let WaitingFor::LoopShortcut { certificate, .. } = outcome.final_waiting_for() else {
+        unreachable!()
+    };
+    assert_eq!(
+        certificate.win_kind,
+        WinKind::Advantage,
+        "an inert token-growth loop is a CR 104.4b optional Advantage loop"
+    );
+    assert!(
+        certificate.unbounded.contains(&ResourceAxis::TokensCreated),
+        "the unbounded axis must name TokensCreated, got {:?}",
+        certificate.unbounded
+    );
+    // Clone-isolation (risk iii): the two detection drives ran on CLONES and must not
+    // leak — exactly 4 starting + 1 from the single real cast = 5 real Saprolings.
+    assert_eq!(
+        saproling_count(outcome.state()),
+        before + 1,
+        "the clone drives must not leak real tokens (INV-1)"
+    );
+    // Sprout Swarm returned to hand (CR 702.27a buyback) — recastable for the loop.
+    assert_eq!(outcome.zone_of(sprout), engine::types::zones::Zone::Hand);
+
+    // N7 CAPTURE-side (live, seam-not-line): the foundation's `fodder_cover_last_recast_context_
+    // two_sided` proves the COMPARE (`eq_except_growable`) rejects a heterogeneous context, but
+    // it CONSTRUCTS the field by hand — it cannot prove the live capture at
+    // `finalize_cast_with_phyrexian_choices` writes DISCRIMINATING values (a wrong-but-constant
+    // capture would pass P1's offer and the foundation test both). Assert the captured context
+    // holds the real cast's discriminating fields, so a constant/wrong capture fails here.
+    let ctx = outcome
+        .state()
+        .last_recast_context
+        .as_ref()
+        .expect("buyback + token-creating cast must capture a recast context");
+    assert_eq!(ctx.controller, P0);
+    assert_eq!(
+        ctx.from_zone,
+        engine::types::zones::Zone::Hand,
+        "CR 601.2a: buyback returns the spell to hand ⇒ from_zone is Hand"
+    );
+    assert!(
+        ctx.uses_buyback,
+        "the captured context records that buyback was paid"
+    );
+    assert_eq!(
+        ctx.convoke,
+        Some(engine::types::game_state::ConvokeMode::Convoke),
+        "Sprout Swarm has Convoke ⇒ the convoke mode is derived from the keyword, not a constant"
+    );
+    // card_id is the real recastable Sprout Swarm's identity (CR 400.7), not the churned ObjectId.
+    let hand_sprout = outcome
+        .state()
+        .objects
+        .values()
+        .find(|o| {
+            o.name == "Sprout Swarm"
+                && o.controller == P0
+                && o.zone == engine::types::zones::Zone::Hand
+        })
+        .expect("Sprout Swarm recastable in hand");
+    assert_eq!(
+        ctx.card_id, hand_sprout.card_id,
+        "captured card_id is the real recast card's CR 400.7 identity"
+    );
+}
+
+/// Find the (single) object named `name` controlled by `player` in `zone`.
+fn object_named_in_zone(
+    state: &GameState,
+    name: &str,
+    player: PlayerId,
+    zone: engine::types::zones::Zone,
+) -> Option<ObjectId> {
+    state
+        .objects
+        .values()
+        .find(|o| o.name == name && o.controller == player && o.zone == zone)
+        .map(|o| o.id)
+}
+
+/// P2 ⭐ — Accept materializes exactly N real Saprolings. Continue P1 to the offer, declare
+/// `Fixed(5)`, opponent Accepts ⇒ the injector drives 5 real recast cycles on a clone,
+/// committing each ⇒ exactly +5 net Saprolings, Sprout Swarm back in hand, priority handed
+/// back, ring cleared. Revert-failing: without the object-growth materializer routing the
+/// drain path's boundary check (equal / cover_growth, no fodder disjunct) never recognizes
+/// the growing board ⇒ 0 committed cycles ⇒ 0 tokens.
+#[test]
+fn object_growth_51st_materializes_five_saprolings_on_accept() {
+    let (mut runner, sprout, fodder) = sprout_swarm_scenario(4);
+    let outcome = runner
+        .cast(sprout)
+        .accept_optional()
+        .convoke_with(&[fodder[0]])
+        .commit()
+        .resolve();
+    assert!(
+        matches!(outcome.final_waiting_for(), WaitingFor::LoopShortcut { .. }),
+        "P2 precondition: the offer must fire, got {:?}",
+        outcome.final_waiting_for()
+    );
+    let at_offer = saproling_count(runner.state());
+
+    // P0 (LoopShortcut.controller — inferred submitter) declares a Fixed(5) shortcut; the
+    // template is rederived from `last_recast_context`.
+    runner
+        .act(GameAction::DeclareShortcut {
+            count: IterationCount::Fixed(5),
+            template: None,
+        })
+        .expect("declare shortcut");
+    // The lone opponent (P1 — inferred RespondToShortcut submitter) accepts ⇒ materialize.
+    runner
+        .act(GameAction::RespondToShortcut {
+            response: ShortcutResponse::Accept,
+        })
+        .expect("respond accept");
+
+    assert_eq!(
+        saproling_count(runner.state()),
+        at_offer + 5,
+        "5 real recast cycles ⇒ +5 net Saprolings"
+    );
+    assert!(
+        object_named_in_zone(
+            runner.state(),
+            "Sprout Swarm",
+            P0,
+            engine::types::zones::Zone::Hand
+        )
+        .is_some(),
+        "CR 702.27a: Sprout Swarm must still be in P0's hand after materialization"
+    );
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::Priority { .. }),
+        "priority handed back after materialization, got {:?}",
+        runner.state().waiting_for
+    );
+    assert!(runner.state().loop_detect_ring.is_empty());
+}
+
+/// N1 — finite-mana REJECTS (B4). Same fixture WITHOUT Witherbloom's affinity granter: each
+/// recast must pay the real {1}{G}+buyback{3} = {4}{G}, which 4 untapped green creatures
+/// cannot cover by convoke alone (needs 5 taps) ⇒ the injector aborts (UnpayableConvoke) ⇒
+/// no offer. Revert-failing paired reach-guard: P1 (with affinity) DOES offer, so the only
+/// difference is the affinity reduction feeding the sustainable {G}-only convoke cost.
+#[test]
+fn object_growth_no_affinity_does_not_offer() {
+    // Fixture with NO Witherbloom (no affinity): 4 green Saprolings + Sprout Swarm, plus a
+    // pool that funds ONE manual cast of {4}{G} so the first cast still resolves and captures
+    // the recast context — isolating the DRIVEN recast's unpayability as the discriminator.
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let mut fodder = Vec::new();
+    for _ in 0..4 {
+        fodder.push(scenario.add_creature(P0, "Saproling", 1, 1).id());
+    }
+    let sprout = {
+        let mut b =
+            scenario.add_spell_to_hand_from_oracle(P0, "Sprout Swarm", true, SPROUT_SWARM_ORACLE);
+        b.with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Green],
+            generic: 1,
+        });
+        b.id()
+    };
+    // Fund the FIRST cast entirely from the pool ({4} generic + {G}); no convoke needed, so
+    // the first cast resolves + captures the recast context, isolating the DRIVEN recast's
+    // convoke-only unpayability as the sole discriminator.
+    let mut mana = vec![ManaUnit::new(ManaType::Colorless, ObjectId(9_999), false, vec![]); 4];
+    mana.push(ManaUnit::new(
+        ManaType::Green,
+        ObjectId(9_999),
+        false,
+        vec![],
+    ));
+    scenario.with_mana_pool(P0, mana);
+    let mut runner = scenario.build();
+    {
+        let st = runner.state_mut();
+        st.loop_detection = LoopDetectionMode::Interactive;
+        for &id in &fodder {
+            st.objects.get_mut(&id).unwrap().color = vec![ManaColor::Green];
+        }
+    }
+    let outcome = runner.cast(sprout).accept_optional().commit().resolve();
+    assert!(
+        matches!(outcome.final_waiting_for(), WaitingFor::Priority { .. }),
+        "no affinity ⇒ the driven recast can't afford {{4}}{{G}} via convoke ⇒ NO offer, got {:?}",
+        outcome.final_waiting_for()
+    );
+}
+
+/// N3 — no-buyback REJECTS (B3). Sprout Swarm cast WITHOUT paying buyback ⇒ the spell goes to
+/// the graveyard, not hand ⇒ (a) `last_recast_context` is never captured (gate requires
+/// `additional_cost_paid`), and (b) even were it captured, the injector's per-cycle re-find
+/// in `ctx.from_zone` (Hand) would abort. Either way: no offer. Revert-failing paired
+/// reach-guard: P1 (buyback paid, card returns to hand) DOES offer.
+#[test]
+fn object_growth_no_buyback_does_not_offer() {
+    let (mut runner, sprout, fodder) = sprout_swarm_scenario(4);
+    // Decline buyback; convoke still pays the base {1}{G} (affinity reduces {1}→{0}).
+    let outcome = runner
+        .cast(sprout)
+        .decline_optional()
+        .convoke_with(&[fodder[0]])
+        .commit()
+        .resolve();
+    assert!(
+        matches!(outcome.final_waiting_for(), WaitingFor::Priority { .. }),
+        "no buyback ⇒ card to graveyard ⇒ no recast context ⇒ NO offer, got {:?}",
+        outcome.final_waiting_for()
+    );
+    assert!(
+        outcome.state().last_recast_context.is_none(),
+        "B3: last_recast_context must NOT be captured when buyback is unpaid"
+    );
+    // Reach-guard: confirm the cast actually resolved (a real Saproling was made), so the
+    // negative above is not vacuous on an aborted cast.
+    assert_eq!(
+        saproling_count(outcome.state()),
+        5,
+        "the base cast still created one token"
+    );
+}
+
+/// FIX 1 (#4603 opt-in gate): the RecastContext capture is gated on `loop_detection.samples()`,
+/// so DEFAULT/OFF mode never writes `last_recast_context` — keeping the serialized surface
+/// byte-identical to pre-PR-7 (the field is `skip_serializing_if=is_none`). Paired reach-guard:
+/// the SAME buyback + token cast in Interactive (sampling) mode DOES capture `Some(..)`, proving
+/// the OFF assertion is not vacuous on a cast that simply never captures.
+#[test]
+fn off_mode_capture_leaves_recast_context_none() {
+    // OFF (default): flip the fixture's mode back to Off before the identical cast.
+    let (mut runner, sprout, fodder) = sprout_swarm_scenario(4);
+    runner.state_mut().loop_detection = LoopDetectionMode::Off;
+    let off = runner
+        .cast(sprout)
+        .accept_optional()
+        .convoke_with(&[fodder[0]])
+        .commit()
+        .resolve();
+    assert!(
+        off.state().last_recast_context.is_none(),
+        "OFF (#4603): a buyback+token cast must NOT write last_recast_context on the serialized surface"
+    );
+
+    // ON/sampling reach-guard: the same cast captures Some(..) (else the OFF assertion is vacuous).
+    let (mut on_runner, on_sprout, on_fodder) = sprout_swarm_scenario(4);
+    let on = on_runner
+        .cast(on_sprout)
+        .accept_optional()
+        .convoke_with(&[on_fodder[0]])
+        .commit()
+        .resolve();
+    assert!(
+        on.state().last_recast_context.is_some(),
+        "Interactive/sampling: the same buyback+token cast DOES capture the recast context"
+    );
+}
+
+/// N6 (CR 704.5g, branch d) — LIVE no-offer control. Each recast fires a
+/// `"Whenever you cast a spell, ~ deals 1 damage to itself"` trigger on the controller's 9/9
+/// engine, so the controller-side `damage_marked` total STRICTLY increases s_n1→s_n2. A
+/// board-growing loop that also accrues damage on its own engine is self-terminating, not a
+/// CR 732.2a shortcut, so `driving_resources_non_decreasing` branch (d) vetoes ⇒ NO offer.
+/// Discriminating: revert-probe (delete branch (d)) ⇒ this WRONGLY offers. Paired reach-guard:
+/// the same base loop WITHOUT the drain (P1's scenario) DOES offer.
+#[test]
+fn object_growth_self_damage_recast_does_not_offer() {
+    let (mut runner, sprout, fodder) = sprout_swarm_scenario_with_drain(
+        4,
+        Some("Whenever you cast a spell, Test Drain Engine deals 1 damage to Test Drain Engine."),
+    );
+    let outcome = runner
+        .cast(sprout)
+        .accept_optional()
+        .convoke_with(&[fodder[0]])
+        .commit()
+        .resolve();
+    assert!(
+        !matches!(outcome.final_waiting_for(), WaitingFor::LoopShortcut { .. }),
+        "N6: a damage-accruing recast is self-terminating (CR 704.5g) ⇒ must NOT offer, got {:?}",
+        outcome.final_waiting_for()
+    );
+
+    // Reach-guard: the same base loop without the drain reaches the offer.
+    let (mut ok_runner, ok_sprout, ok_fodder) = sprout_swarm_scenario(4);
+    let ok = ok_runner
+        .cast(ok_sprout)
+        .accept_optional()
+        .convoke_with(&[ok_fodder[0]])
+        .commit()
+        .resolve();
+    assert!(
+        matches!(ok.final_waiting_for(), WaitingFor::LoopShortcut { .. }),
+        "reach-guard: without the self-damage drain the same loop offers"
+    );
+}
+
+// ── N4 (energy, branch a) + N5 (player-counter, branch b): UNIT + structural-wiring coverage,
+// NOT live fixtures — a LIVE per-recast drain on these two axes is architecturally infeasible in
+// this harness (team-lead-authorized fallback on GENUINE infeasibility, not convenience):
+//   • Energy is only spent via a cost. Adding a per-cast energy cost to the recast breaks
+//     Buyback's return-to-hand (measured: the spell does not return ⇒ the loop cannot recur), so
+//     any resulting "no offer" comes from NON-RECURRENCE, not the branch-(a) energy sign-check —
+//     a vacuous live test. (Revert-probing branch (a) did NOT flip such a fixture, confirming the
+//     vacuity; it was removed rather than shipped as false confidence.)
+//   • No engine effect decreases Experience/Ticket player-counters (only Rad, an automatic
+//     precombat turn action, not a per-cast cost), so branch (b) has no live per-recast drain.
+// Both branches are covered by the 4d-i foundation unit tests
+// `analysis::resource::sign_check_energy_decrease_rejects` / `_player_counter_decrease_rejects`,
+// and the live call-site (`driving_resources_non_decreasing` on the driven frames) is proven
+// LOAD-BEARING by N6 above, which vetoes through that same function (branches a/b/d share it).
+// The branch-(a)/(b) sign-checks are fail-closed DEFENSIVE guards — live-unreachable in TODAY's
+// buyback-recast mechanism, NOT dead code; they fire the moment a future recast mechanism or a
+// per-recast energy/player-counter-drain card makes them reachable. Add a live fixture then.

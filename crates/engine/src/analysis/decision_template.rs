@@ -5,8 +5,9 @@
 //! iterations as a predictable shortcut (CR 732.2a). PURELY ADDITIVE / offline —
 //! never called from the reducer in this phase.
 
-use crate::types::game_state::{GameState, YieldTarget};
+use crate::types::game_state::{GameState, WaitingFor, YieldTarget};
 use crate::types::identifiers::ObjectId;
+use crate::types::mana::ManaType;
 use crate::types::player::PlayerId;
 use crate::types::zones::Zone;
 use serde::{Deserialize, Serialize};
@@ -159,6 +160,13 @@ pub enum PinnedDecision {
     MayChoice { slot: DecisionSlot, take: bool },
     /// CR 732.6: pay or decline an "[A] unless [B]" break.
     UnlessBreak { slot: DecisionSlot, pay: bool },
+    /// CR 601.2h + CR 702.51a/b: pay a convoke `ManaPayment` by tapping the minimal
+    /// deterministic set of untapped creatures matching the live post-affinity color
+    /// requirement. State-independent: the concrete creatures are re-bound LIVE each
+    /// iteration (canonical order — lowest ObjectId per needed color) via
+    /// `select_convoke_taps`, a pure function of (live legal untapped set, locked cost)
+    /// per CR 732.2a — so no per-iteration creature is latched here.
+    ConvokeTaps { slot: DecisionSlot },
 }
 
 /// A pinned target. `ByIdentity` re-resolves to a live legal ObjectId each iteration
@@ -241,6 +249,13 @@ pub enum ConcreteDecision {
         slot: DecisionSlot,
         pay: bool,
     },
+    /// CR 601.2h + CR 702.51a/b: the live-resolved convoke tap-set for this iteration —
+    /// `(creature, mana_type)` pairs to feed as `GameAction::TapForConvoke`. Re-bound each
+    /// iteration by `select_convoke_taps` (lowest-ObjectId-per-color canonical order).
+    ConvokeTaps {
+        slot: DecisionSlot,
+        creatures: Vec<(ObjectId, ManaType)>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -271,6 +286,10 @@ pub enum ReplayFailure {
     MissingSource { source: DecisionSource },
     /// A `RoundRobin`/`Piecewise` schedule has no entry covering this iteration index.
     ScheduleExhausted { slot: DecisionSlot },
+    /// CR 702.51b: no legal untapped-creature tap-set covers the live convoke
+    /// requirement (the post-affinity locked cost can't be paid by the available
+    /// untapped creatures + pool) ⇒ abort the auto-shortcut, hand back to manual.
+    UnpayableConvoke { slot: DecisionSlot },
 }
 
 /// CR 732.2a + CR 608.2b: resolve every pin to concrete live values for `iteration`.
@@ -340,6 +359,26 @@ fn resolve_pin(
             slot: slot.clone(),
             pay: *pay,
         }),
+        // CR 601.2h + CR 702.51a/b: re-bind the convoke tap-set LIVE against this
+        // iteration's board. The caster + locked remaining cost come from the live
+        // `ManaPayment` prompt (CR 601.2f cost-lock); the single-authority selector
+        // `select_convoke_taps` picks the minimal deterministic set (lowest ObjectId
+        // per needed color). No legal set ⇒ `UnpayableConvoke` (CR 702.51b).
+        PinnedDecision::ConvokeTaps { slot } => {
+            let (player, cost) = match (&state.waiting_for, state.pending_cast.as_ref()) {
+                (WaitingFor::ManaPayment { player, .. }, Some(pending)) => {
+                    (*player, pending.cost.clone())
+                }
+                _ => return Err(ReplayFailure::UnpayableConvoke { slot: slot.clone() }),
+            };
+            match crate::game::mana_payment::select_convoke_taps(state, player, &cost) {
+                Some(creatures) => Ok(ConcreteDecision::ConvokeTaps {
+                    slot: slot.clone(),
+                    creatures,
+                }),
+                None => Err(ReplayFailure::UnpayableConvoke { slot: slot.clone() }),
+            }
+        }
     }
 }
 
@@ -461,7 +500,8 @@ fn pin_slot(pin: &PinnedDecision) -> DecisionSlot {
         PinnedDecision::Targets { slot, .. }
         | PinnedDecision::Mode { slot, .. }
         | PinnedDecision::MayChoice { slot, .. }
-        | PinnedDecision::UnlessBreak { slot, .. } => slot.clone(),
+        | PinnedDecision::UnlessBreak { slot, .. }
+        | PinnedDecision::ConvokeTaps { slot } => slot.clone(),
     }
 }
 
@@ -881,5 +921,88 @@ mod tests {
             };
             assert!(is_pure);
         }
+    }
+
+    /// Insert an untapped GREEN 1/1 creature controlled by P0 on the battlefield.
+    fn green_creature(state: &mut GameState, id: u64) {
+        use crate::types::card_type::CoreType;
+        let oid = ObjectId(id);
+        let mut o = GameObject::new(
+            oid,
+            CardId(id),
+            PlayerId(0),
+            "Saproling".to_string(),
+            Zone::Battlefield,
+        );
+        o.card_types.core_types = vec![CoreType::Creature];
+        o.color = vec![crate::types::mana::ManaColor::Green];
+        state.objects.insert(oid, o);
+        state.battlefield.push_back(oid);
+    }
+
+    /// Convoke-pin unit (§11): `resolve_pin(ConvokeTaps)` at a live `ManaPayment{Convoke}`
+    /// delegates to the single-authority `select_convoke_taps`, pulling the locked cost from
+    /// `pending_cast` and the payer from the prompt. Positive: a `{G}` pending cost + two
+    /// green creatures ⇒ `ConcreteDecision::ConvokeTaps` with the minimal lowest-id set.
+    /// Negative (revert-failing wiring): away from a `ManaPayment` prompt (no `pending_cast`)
+    /// ⇒ `Err(UnpayableConvoke)` — proves the pin never fabricates taps without a live cost.
+    #[test]
+    fn convoke_pin_resolves_minimal_set_and_fails_closed() {
+        use crate::types::game_state::{ConvokeMode, PendingCast};
+        use crate::types::mana::{ManaCost, ManaCostShard, ManaType};
+
+        let slot = DecisionSlot {
+            source: this_obj(99, None),
+            index: 0,
+        };
+        let pin = PinnedDecision::ConvokeTaps { slot: slot.clone() };
+
+        // Positive: at a live ManaPayment{Convoke} with a {G} locked cost + two green creatures.
+        let mut state = GameState::new_two_player(7);
+        green_creature(&mut state, 40);
+        green_creature(&mut state, 41);
+        let ability = crate::types::ability::ResolvedAbility::new(
+            crate::types::ability::Effect::unimplemented("test", "convoke pin fixture"),
+            Vec::new(),
+            ObjectId(40),
+            PlayerId(0),
+        );
+        let pending = PendingCast::new(
+            ObjectId(50),
+            CardId(50),
+            ability,
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::Green],
+                generic: 0,
+            },
+        );
+        state.pending_cast = Some(Box::new(pending));
+        state.waiting_for = WaitingFor::ManaPayment {
+            player: PlayerId(0),
+            convoke_mode: Some(ConvokeMode::Convoke),
+        };
+
+        let out = resolve_pin(&pin, 0, &state).expect("convoke pin resolves to a tap set");
+        match out {
+            ConcreteDecision::ConvokeTaps { creatures, .. } => {
+                assert_eq!(
+                    creatures,
+                    vec![(ObjectId(40), ManaType::Green)],
+                    "{{G}} ⇒ exactly one tap, lowest-id green (CR 702.51b), delegated to select_convoke_taps"
+                );
+            }
+            other => panic!("expected ConvokeTaps, got {other:?}"),
+        }
+
+        // Negative (fail-closed wiring): default two-player state is at Priority with no
+        // pending_cast ⇒ the pin cannot read a live cost ⇒ UnpayableConvoke.
+        let idle = GameState::new_two_player(7);
+        assert!(
+            matches!(
+                resolve_pin(&pin, 0, &idle),
+                Err(ReplayFailure::UnpayableConvoke { .. })
+            ),
+            "no live ManaPayment/pending_cast ⇒ UnpayableConvoke (never fabricate taps)"
+        );
     }
 }

@@ -358,6 +358,30 @@ impl Default for SpellCastRecord {
     }
 }
 
+/// CR 601.2a + CR 702.27a: the cast-time snapshot the PR-7 Phase 4d-ii object-growth
+/// detection hook replays. Captured at cast finalization (the single first-class point,
+/// `finalize_cast_with_phyrexian_choices`), carried on the loop-detection clone, replayed
+/// by the recast injector. NOT reconstructed at the hook seam — `SpellCastRecord` lacks
+/// both the buyback-paid flag and the convoke shape. Every field is loop-INVARIANT across
+/// a homogeneous recast (unit-variant `ConvokeMode` carries zero per-iteration data;
+/// `CardId` is cross-incarnation-stable per CR 400.7), so the whole struct is COMPARED
+/// (never excluded) in the object-growth cover gates — a heterogeneous recast (one whose
+/// iterations alternate `uses_buyback` or `from_zone`) is caught and rejected (fail-closed).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecastContext {
+    /// CR 400.7 card identity — re-found live in the castable zone each iteration (a
+    /// fresh incarnation on every hand-return), never an `ObjectId` that churns.
+    pub card_id: CardId,
+    pub controller: PlayerId,
+    /// CR 601.2a: the zone the recast is cast from (Hand — buyback returns the spell here).
+    pub from_zone: Zone,
+    /// CR 702.27a: the recast must re-pay buyback each iteration to sustain the loop.
+    pub uses_buyback: bool,
+    /// CR 702.51a: the convoke mode the injector's pin re-binds live each iteration
+    /// (`None` when the recast pays no convoke cost).
+    pub convoke: Option<ConvokeMode>,
+}
+
 /// Backwards-compatible deserializer for `SpellCastRecord.from_zone`. Accepts
 /// the modern non-Option encoding (`"Hand"`, `"Battlefield"`, …), the legacy
 /// `Option<Zone>` encoding (`null` → `Zone::Hand`), and absent fields (handled
@@ -8282,6 +8306,16 @@ pub struct GameState {
     /// it would recreate the identity-field loop leak Condition 2 fixes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution_source_relatch: Option<ResolutionSourceRelatch>,
+    /// CR 732.2a (PR-7 Phase 4d-ii): cast-time snapshot of the most recent buyback-paid,
+    /// permanent-creating spell — the object-growth recast the loop-shortcut hook replays.
+    /// Set at cast finalization, read at the post-resolution empty-stack `Priority` window.
+    /// Transient: deliberately EXCLUDED from `impl PartialEq for GameState` (a decision
+    /// context, not durable board state) and COMPARED explicitly only in the object-growth
+    /// cover gates (`analysis::resource::eq_except_growable` /
+    /// `loop_states_equal_modulo_resources`, fail-closed). `None` in filtered/serialized
+    /// snapshots (byte-preserving).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_recast_context: Option<RecastContext>,
     /// Transient plural form of `current_trigger_event` for batched triggers.
     /// Event-context filters that can legally compare against a group read this.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -9609,6 +9643,7 @@ impl GameState {
             current_trigger_match_count: None,
             resolving_stack_entry: None,
             resolution_source_relatch: None,
+            last_recast_context: None,
             current_trigger_events: Vec::new(),
             last_discover_value: None,
             stack_trigger_event_batches: HashMap::new(),
@@ -10644,6 +10679,13 @@ fn _gamestate_partition_is_total(s: &GameState) {
         //     copy-token loop, so COMPARING never suppresses a legitimate loop's detection.
         pending_player_scope_sacrifice_choice: _,
         post_replacement_token_substitution_count: _,
+        //   - `last_recast_context` (PR-7 Phase 4d-ii object-growth recast snapshot):
+        //     EXCLUDED from `impl PartialEq for GameState` (a transient decision context, not
+        //     durable board state), but COMPARED explicitly in `eq_except_growable` /
+        //     `loop_states_equal_modulo_resources` (fail-closed one-sided-safety — its fields
+        //     are loop-INVARIANT across a homogeneous recast, so COMPARING never suppresses a
+        //     legitimate loop; a heterogeneous recast is correctly caught and rejected).
+        last_recast_context: _,
         //   - `resolution_source_relatch` (CR 400.7j self-move re-latch): EXCLUDED-REQUIRED (measured
         //     by ordering trace, not doc-trust). The clear at stack.rs:194 fires at the START of the
         //     NEXT resolution, while `record_loop_detect_sample` fires at the Priority window AFTER

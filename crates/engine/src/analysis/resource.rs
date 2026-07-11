@@ -649,7 +649,14 @@ pub fn loop_states_equal_modulo_resources(a: &GameState, b: &GameState) -> bool 
     // `loop_states_equal`. Compare it analysis-locally (do NOT widen the strict
     // comparator, do NOT zero the field) so a loop that re-activates a loyalty
     // ability (count k -> k+1) compares UNEQUAL and is not falsely certified.
-    loop_states_equal(&pa, &pb) && loyalty_activation_counts_match(&pa, &pb)
+    // F1 (PR-7 Phase 4d-ii): `last_recast_context` is EXCLUDED from `impl PartialEq for
+    // GameState` (`loop_states_equal` never compares it) and NOT cleared by
+    // `project_out_resources`, so compare it explicitly here (fail-closed) — a heterogeneous
+    // recast is caught, a homogeneous loop's invariant context compares equal. `None == None`
+    // for every non-recast loop ⇒ zero regression to existing loop-equality tests.
+    loop_states_equal(&pa, &pb)
+        && loyalty_activation_counts_match(&pa, &pb)
+        && pa.last_recast_context == pb.last_recast_context
 }
 
 /// CR 606.3: per-object `loyalty_activations_this_turn` equality across two
@@ -1238,9 +1245,19 @@ fn eq_except_growable(pa: &GameState, pb: &GameState, grown: &HashSet<ObjectId>)
     // detection. (The self-referential incarnation field `resolution_source_relatch` is the
     // opposite case — it VARIES per iteration at the sample beat, so it MUST stay excluded,
     // like a timestamp; see the `_gamestate_partition_is_total` note.)
+    // F1 (PR-7 Phase 4d-ii, ONE-SIDED-SAFETY): compare `last_recast_context` here even
+    // though `impl PartialEq for GameState` excludes it. Excluding a decision context whose
+    // fields are loop-INVARIANT (unit-variant ConvokeMode, cross-incarnation-stable CardId,
+    // constant controller/from_zone/uses_buyback across a homogeneous recast) is the
+    // fail-DANGEROUS direction — a HETEROGENEOUS recast (alternating uses_buyback / from_zone)
+    // whose board coincidentally covers would compare EQUAL under exclusion and be falsely
+    // certified an infinite CR 732.2a shortcut. COMPARING catches the differing context and
+    // rejects. It is `None` at every non-recast loop's sample beat, so this never suppresses a
+    // legitimate loop's detection (this IS the sole discriminator — the custom PartialEq omits it).
     a == b
         && a.post_replacement_token_substitution_count
             == b.post_replacement_token_substitution_count
+        && a.last_recast_context == b.last_recast_context
 }
 
 /// §5.3a firewall (BLOCKER-S1 + S5 + MAJOR-A): does ANY live off-stack fire-time
@@ -2225,6 +2242,36 @@ fn project_out_player_consumables(p: &mut Player) {
 /// Clone a state through `normalize_for_loop` and additionally zero every
 /// monotone resource the modulo comparison must ignore. The result is only ever
 /// fed to `loop_states_equal`; it is never used as a live game state.
+/// CR 120 / CR 122.1 / CR 613.4c: project the monotone per-object resources out of one
+/// object (the single authority, shared by [`project_out_resources`] and the object-growth
+/// hook's fodder-class representative so the class compares in the SAME normalized form as
+/// the projected frame objects — otherwise a raw-P/T class member would fail
+/// `fodder_content_eq` against the P/T-zeroed frame and be mis-partitioned as stable-engine).
+pub(crate) fn project_object_for_loop(object: &mut crate::game::game_object::GameObject) {
+    // CR 120: marked damage is a monotone resource (lifelink/ping loops).
+    object.damage_marked = 0;
+    // CR 122.1: project out only *monotone* counters (CR 122.1a/613.4c +1/+1, -1/-1,
+    // P/T; CR 306.5b loyalty; CR 310.4c defense) — these are the pumped resource of a
+    // +1/+1 or loyalty loop, so two cycles compare as the same board. PRESERVE
+    // consumable/duration/state-gating counters (CR 122.1b/c/d stun/shield/keyword;
+    // CR 702.62a/63a time; CR 702.32a fade; CR 702.24a age; CR 714.3 lore; generic):
+    // consuming one of these is a real board change, not a monotone pump, so it must
+    // remain visible to `objects_content_eq` (game_state.rs counter comparison).
+    object
+        .counters
+        .retain(|ct, _| !ct.is_monotone_loop_resource());
+    // CR 613.4c: the counter-derived fields are zeroed because they derive ONLY from the
+    // monotone counters just projected out — power/toughness fold only
+    // `power_toughness_delta()==Some` counters, loyalty derives only from
+    // CounterType::Loyalty and defense only from CounterType::Defense. The preserved
+    // counters never reach these four fields, so zeroing cannot mask a consumed
+    // non-monotone counter.
+    object.power = None;
+    object.toughness = None;
+    object.loyalty = None;
+    object.defense = None;
+}
+
 fn project_out_resources(state: &GameState) -> GameState {
     let mut s = state.normalize_for_loop();
 
@@ -2235,29 +2282,7 @@ fn project_out_resources(state: &GameState) -> GameState {
     }
 
     for (_, object) in s.objects.iter_mut() {
-        // CR 120: marked damage is a monotone resource (lifelink/ping loops).
-        object.damage_marked = 0;
-        // CR 122.1: project out only *monotone* counters (CR 122.1a/613.4c
-        // +1/+1, -1/-1, P/T; CR 306.5b loyalty; CR 310.4c defense) — these are
-        // the pumped resource of a +1/+1 or loyalty loop, so two cycles compare
-        // as the same board. PRESERVE consumable/duration/state-gating counters
-        // (CR 122.1b/c/d stun/shield/keyword; CR 702.62a/63a time; CR 702.32a
-        // fade; CR 702.24a age; CR 714.3 lore; generic): consuming one of these
-        // is a real board change, not a monotone pump, so it must remain visible
-        // to `objects_content_eq` (game_state.rs counter comparison).
-        object
-            .counters
-            .retain(|ct, _| !ct.is_monotone_loop_resource());
-        // CR 613.4c: the counter-derived fields are zeroed because they derive
-        // ONLY from the monotone counters just projected out — power/toughness
-        // fold only `power_toughness_delta()==Some` counters, loyalty derives
-        // only from CounterType::Loyalty and defense only from CounterType::Defense.
-        // The preserved counters never reach these four fields, so zeroing cannot
-        // mask a consumed non-monotone counter.
-        object.power = None;
-        object.toughness = None;
-        object.loyalty = None;
-        object.defense = None;
+        project_object_for_loop(object);
     }
 
     // Per-turn / per-game *bookkeeping* accumulators the dynamic Engine-A path
@@ -2388,8 +2413,11 @@ fn project_out_resources(state: &GameState) -> GameState {
 /// destructure means the sign-check cannot silently miss a newly-projected scalar.
 /// `life`/`mana_pool` are bound `_` (their sign is the sole authority of
 /// `ResourceVector::net_progress_for` — not re-vetoed here, to avoid dual authority);
-/// `player_counters` is a HashMap compared per-kind by the caller (cross-frame key
-/// union), so it is bound `_` here and handled in [`driving_resources_non_decreasing`].
+/// `player_counters` is a map-typed consumable, so it is bound `_` here and returned by the
+/// SEPARATE no-`..` [`projected_player_maps`] (its own structural totality guard), then
+/// compared per-kind by [`driving_resources_non_decreasing`]. The two no-`..` destructures
+/// PARTITION the projected consumables (scalars here, maps there) with no field double-bound
+/// or dropped.
 #[cfg_attr(not(test), allow(dead_code))] // 4d-ii wires the live/offline caller; 4d-i exercises via unit tests.
 fn projected_player_axes(p: &Player) -> Vec<i64> {
     let Player {
@@ -2438,6 +2466,57 @@ fn projected_player_axes(p: &Player) -> Vec<i64> {
     ]
 }
 
+/// CR 122.1: the controller-side MAP-typed PROJECTED player consumables (today only
+/// `player_counters`), in a fixed order. The no-`..` destructure (the map-typed mirror of
+/// [`projected_player_axes`]) is the structural tie that BUILD-BREAKS the moment a second
+/// map-typed projected consumable is added — forcing the author to thread it into
+/// [`driving_resources_non_decreasing`]'s per-kind veto too, so a new map consumable can
+/// never be zeroed by [`project_out_player_consumables`] yet silently escape the sign-check
+/// (closes BLOCKER-2's "one field over" latent gap). Returns references so the caller unions
+/// keys without cloning.
+#[cfg_attr(not(test), allow(dead_code))] // 4d-ii wires the live/offline caller; 4d-i exercises via unit tests.
+fn projected_player_maps(
+    p: &Player,
+) -> Vec<&HashMap<crate::types::player::PlayerCounterKind, u32>> {
+    let Player {
+        player_counters,
+        // Scalar-projected + strict-equality fields (handled elsewhere), no-`..`:
+        life: _,
+        mana_pool: _,
+        poison_counters: _,
+        energy: _,
+        life_gained_this_turn: _,
+        life_lost_this_turn: _,
+        cards_drawn_this_turn: _,
+        cards_drawn_this_step: _,
+        id: _,
+        library: _,
+        hand: _,
+        graveyard: _,
+        attraction_deck: _,
+        contraption_deck: _,
+        contraption_crank_sprocket: _,
+        sticker_sheets: _,
+        has_drawn_this_turn: _,
+        lands_played_this_turn: _,
+        life_lost_last_turn: _,
+        descended_this_turn: _,
+        speed: _,
+        speed_trigger_used_this_turn: _,
+        crimes_committed_this_turn: _,
+        drew_from_empty_library: _,
+        turns_taken: _,
+        is_eliminated: _,
+        bending_types_this_turn: _,
+        status: _,
+        companion: _,
+        chosen_attributes: _,
+        can_look_at_top_of_library: _,
+        commander_color_identity: _,
+    } = p;
+    vec![player_counters]
+}
+
 /// CR 122.1 / CR 119 / CR 106.1: BLOCKER-2 structural sign-check — every projected
 /// controller consumable is non-decreasing across the driven pair. This closes the
 /// hole where `project_out_resources` erases `energy` / `player_counters` (and
@@ -2450,8 +2529,7 @@ fn projected_player_axes(p: &Player) -> Vec<i64> {
 ///
 /// MUST read RAW (un-projected) frames — `project_out_resources` zeroed these, so the
 /// caller passes the raw settle frames (4d-ii) / raw synthetic states (4d-i tests).
-#[cfg_attr(not(test), allow(dead_code))] // 4d-ii wires the live/offline caller; 4d-i exercises via unit tests.
-fn driving_resources_non_decreasing(
+pub(crate) fn driving_resources_non_decreasing(
     prior: &GameState,
     current: &GameState,
     controller: PlayerId,
@@ -2471,12 +2549,19 @@ fn driving_resources_non_decreasing(
     {
         return false;
     }
-    // (b) CR 122.1 per-kind player_counters (HashMap): union keys, veto any decrease.
-    for kind in pp.player_counters.keys().chain(cp.player_counters.keys()) {
-        if cp.player_counters.get(kind).copied().unwrap_or(0)
-            < pp.player_counters.get(kind).copied().unwrap_or(0)
-        {
-            return false;
+    // (b) CR 122.1 per-kind MAP-typed consumables: union keys, veto any decrease. Driven
+    //     from `projected_player_maps` (no-`..`) rather than hardcoding `player_counters`, so
+    //     a future 2nd map consumable BUILD-BREAKS `projected_player_maps` until it is threaded
+    //     here too (the structural tie closing BLOCKER-2's "one field over" gap). The two Vecs
+    //     zip index-for-index (same destructure order on both frames).
+    for (cur_map, pri_map) in projected_player_maps(cp)
+        .into_iter()
+        .zip(projected_player_maps(pp))
+    {
+        for kind in pri_map.keys().chain(cur_map.keys()) {
+            if cur_map.get(kind).copied().unwrap_or(0) < pri_map.get(kind).copied().unwrap_or(0) {
+                return false;
+            }
         }
     }
     // (c) monotone OBJECT-counter per-kind totals on the CONTROLLER's permanents
@@ -2506,6 +2591,25 @@ fn driving_resources_non_decreasing(
         if ct.get(kind).copied().unwrap_or(0) < pt.get(kind).copied().unwrap_or(0) {
             return false;
         }
+    }
+    // (d) CR 704.5g: veto a controller-side `damage_marked` INCREASE (carry b). OPPOSITE
+    //     polarity to the consumables above — a creature whose total marked damage reaches
+    //     its toughness is destroyed, so a board-growing loop that ALSO accrues damage on the
+    //     controller's own engine each cycle is self-terminating, not a sustainable CR 732.2a
+    //     shortcut. `project_out_resources` zeroes `damage_marked` (invisible to strict
+    //     loop-equality); this recovers the sign. Summed across the controller's battlefield
+    //     (damage is one scalar per object, no per-kind split). A DECREASE (heal) is allowed —
+    //     orthogonal to 4d-i's `sign_check_damage_marked_heal_not_vetoed`.
+    let damage_total = |s: &GameState| -> u64 {
+        s.battlefield
+            .iter()
+            .filter_map(|id| s.objects.get(id))
+            .filter(|o| o.controller == controller)
+            .map(|o| o.damage_marked as u64)
+            .sum()
+    };
+    if damage_total(current) > damage_total(prior) {
+        return false;
     }
     true
 }
@@ -4845,5 +4949,119 @@ mod tests {
     #[test]
     fn _projected_player_axes_is_total() {
         assert_eq!(projected_player_axes(&Player::default()).len(), 6);
+    }
+
+    /// carry a (`_projected_player_maps_is_total`, compiler-total guard): `Player::default()`
+    /// has exactly ONE map-typed projected consumable (`player_counters`). Breaks the build if
+    /// a second projected map consumable is added to `project_out_player_consumables` without a
+    /// matching `projected_player_maps` entry — the structural tie that keeps
+    /// `driving_resources_non_decreasing`'s per-kind map veto (branch b) from silently missing
+    /// it. Mirror of `_projected_player_axes_is_total`.
+    #[test]
+    fn _projected_player_maps_is_total() {
+        assert_eq!(projected_player_maps(&Player::default()).len(), 1);
+    }
+
+    /// carry b (CR 704.5g damage_marked-INCREASE veto). A controller-side marked-damage
+    /// INCREASE (2→3 on the controller's own permanent) REJECTS — a self-terminating loop.
+    /// First branch: `driving_resources_non_decreasing` branch (d). Revert-failing: deleting
+    /// branch (d) flips this to pass (a lethal-accruing board-growth loop would offer).
+    #[test]
+    fn sign_check_damage_marked_increase_rejects() {
+        let mut prior = GameState::new_two_player(7);
+        let oid = inert_token(&mut prior, 600, 0, "Engine"); // controller 0
+        prior.objects.get_mut(&oid).unwrap().damage_marked = 2;
+        let mut current = prior.clone();
+        current.objects.get_mut(&oid).unwrap().damage_marked = 3;
+        assert!(
+            !sign_check(&prior, &current),
+            "a controller-side damage_marked INCREASE (2→3) must REJECT (CR 704.5g, branch d)"
+        );
+        // Reach-guard + orthogonality with 4d-i's `sign_check_damage_marked_heal_not_vetoed`:
+        // a DECREASE (heal) still PASSES — the increase-veto is the opposite polarity.
+        let mut healed = prior.clone();
+        healed.objects.get_mut(&oid).unwrap().damage_marked = 0;
+        assert!(
+            sign_check(&prior, &healed),
+            "reach-guard: a damage_marked DECREASE (2→0 heal) must still PASS"
+        );
+    }
+
+    /// carry b controller-scoping: an OPPONENT's damage_marked increase is NOT vetoed (the
+    /// veto guards the CONTROLLER's own self-termination only).
+    #[test]
+    fn sign_check_opponent_damage_marked_increase_not_vetoed() {
+        let mut prior = GameState::new_two_player(7);
+        let oid = inert_token(&mut prior, 610, 1, "Bear"); // controller 1 = opponent
+        prior.objects.get_mut(&oid).unwrap().damage_marked = 1;
+        let mut current = prior.clone();
+        current.objects.get_mut(&oid).unwrap().damage_marked = 4;
+        assert!(
+            sign_check(&prior, &current),
+            "an OPPONENT's damage_marked increase must NOT be vetoed (controller-scoped)"
+        );
+    }
+
+    fn recast_ctx(uses_buyback: bool) -> crate::types::game_state::RecastContext {
+        crate::types::game_state::RecastContext {
+            card_id: CardId(4242),
+            controller: PlayerId(0),
+            from_zone: Zone::Hand,
+            uses_buyback,
+            convoke: Some(crate::types::game_state::ConvokeMode::Convoke),
+        }
+    }
+
+    /// N7 (F1 two-sided `last_recast_context` classify — COVER path via `eq_except_growable`).
+    /// (a) two object-cover-equal frames with EQUAL contexts still CERTIFY (no false-negative);
+    /// (b) the same frames with a MUTATED context (`uses_buyback` flipped) REJECT (no
+    /// false-positive — a heterogeneous recast is caught). Revert-failing: removing the
+    /// `a.last_recast_context == b.last_recast_context` conjunct in `eq_except_growable` flips
+    /// (b) to COVER while (a) stays COVER ⇒ this test's (b) assertion fails. (a) is the paired
+    /// positive reach-guard for (b). Non-vacuous: the custom `impl PartialEq for GameState`
+    /// EXCLUDES the field, so this conjunct is the SOLE discriminator.
+    #[test]
+    fn fodder_cover_last_recast_context_two_sided() {
+        // (a) equal contexts ⇒ still covers.
+        let (mut prior, mut current) = fodder_cover_base();
+        prior.last_recast_context = Some(recast_ctx(true));
+        current.last_recast_context = Some(recast_ctx(true));
+        assert!(
+            fodder_cover(&prior, &current),
+            "(a) equal last_recast_context ⇒ object-growth cover still CERTIFIES"
+        );
+        // (b) mutated context (uses_buyback true→false) ⇒ rejects.
+        let (mut p2, mut c2) = fodder_cover_base();
+        p2.last_recast_context = Some(recast_ctx(true));
+        c2.last_recast_context = Some(recast_ctx(false));
+        assert!(
+            !fodder_cover(&p2, &c2),
+            "(b) a heterogeneous recast (uses_buyback flipped) must REJECT (F1 COMPARED conjunct)"
+        );
+    }
+
+    /// N7 (equal path via `loop_states_equal_modulo_resources`). The same two-sided classify on
+    /// the constant-depth equality gate (the materializer-boundary first disjunct). In-test
+    /// invariance note: `ConvokeMode` is a unit-variant enum carrying zero per-iteration data
+    /// and `card_id` is a `CardId` (not an `ObjectId`), so a homogeneous loop's contexts are
+    /// byte-equal iteration-to-iteration ⇒ COMPARING is safe (no false-negative on a real loop).
+    #[test]
+    fn loop_states_equal_last_recast_context_two_sided() {
+        let mut a = GameState::new_two_player(7);
+        inert_token(&mut a, 900, 0, "Engine");
+        let mut b = a.clone();
+        // (a) equal contexts ⇒ equal.
+        a.last_recast_context = Some(recast_ctx(true));
+        b.last_recast_context = Some(recast_ctx(true));
+        assert!(
+            loop_states_equal_modulo_resources(&a, &b),
+            "equal last_recast_context ⇒ loop_states_equal_modulo_resources holds"
+        );
+        // (b) mutated context ⇒ unequal.
+        b.last_recast_context = Some(recast_ctx(false));
+        assert!(
+            !loop_states_equal_modulo_resources(&a, &b),
+            "a mutated last_recast_context (uses_buyback flipped) ⇒ NOT equal (F1 conjunct)"
+        );
     }
 }
