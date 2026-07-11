@@ -1189,10 +1189,22 @@ fn try_offer_object_growth_shortcut(
     if ctx.controller != caster {
         return None;
     }
-    // The recast card must be in its castable origin zone right now (recastable).
-    if !state.objects.values().any(|o| {
+    // The recast card must be in its castable origin zone right now (recastable) —
+    // capture it so the recast spell ability can be scanned for randomness below.
+    let recast_obj = state.objects.values().find(|o| {
         o.card_id == ctx.card_id && o.zone == ctx.from_zone && o.controller == ctx.controller
-    }) {
+    })?;
+    // CR 732.2a: a shortcut "can't include conditional actions, where the outcome of a
+    // game event determines the next action." A recast whose spell body bears an
+    // auto-resolved coin flip (CR 705.1) / die roll (CR 706.1a) / random selection
+    // (CR 701.9a/b) has more than one equally-likely outcome ⇒ not a legal shortcut.
+    // Reject it STATICALLY, before driving (cheap + compile-time exhaustive over
+    // `Effect`). Fail-closed: an undeterminable spell ability (no combined Spell def)
+    // also does not offer. (A2 determinism gate — the static half; the post-drive
+    // rng-position check below is the complete runtime backstop that additionally
+    // catches external triggered/replacement randomness firing in the cycle.)
+    let spell_def = crate::game::casting::combined_spell_ability_def(recast_obj)?;
+    if crate::game::ability_scan::spell_ability_bears_randomness(&spell_def) {
         return None;
     }
 
@@ -1205,6 +1217,25 @@ fn try_offer_object_growth_shortcut(
     let s_n1 = clone.clone();
     drive_recast_iteration(&mut clone, &template, &ctx, 1).ok()?;
     let s_n2 = clone;
+
+    // CR 732.2a: any randomness CONSUMED during the deterministic detection drive means the
+    // real loop is outcome-dependent (a coin flip CR 705.1 / die roll CR 706.1a / random
+    // selection CR 701.9b / shuffle) and is not a predictable shortcut. The seeded ChaCha20
+    // stream position advances iff randomness was drawn; the driven clone started as
+    // `state.clone()` (an equal baseline), so a word-position delta disqualifies the offer.
+    // This is the RUNTIME backstop to the static scan above: the fodder-cover's
+    // `fire_time_conditions_read_growing_class` already rejects a randomness-bearing *permanent*
+    // ability whose effect classifies `Axes::CONSERVATIVE` (`FlipCoin`/`RollDie`; a few
+    // dice-adjacent effects like `RollToVisitAttractions` classify `Axes::NONE` and slip the
+    // cover — this check catches those too), but it does NOT scan the resolving
+    // recast *spell's* own body — so a coin flip in the recast body advances the RNG yet passes
+    // the cover. This check closes that gap even when the static scan's `collect_effects` walk
+    // misses a nested payload. Fail-closed / strictly-more-conservative (only turns OFFERs into
+    // NO-OFFERs). (A2 determinism gate — discharges the b132ad9f8 "fail-closed-modulo-auto-
+    // randomness" carry.)
+    if s_n2.rng.get_word_pos() != state.rng.get_word_pos() {
+        return None;
+    }
 
     // CR 111.10: derive the reproduced token class from the first driven cycle, normalized
     // through the same per-object projection the cover applies to its frames (so the class

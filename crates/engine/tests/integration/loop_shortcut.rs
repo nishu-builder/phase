@@ -21,6 +21,7 @@ use engine::analysis::loop_check::{LoopCertificate, ShortcutProposal, ShortcutRe
 use engine::analysis::resource::{BoardDelta, ResourceAxis};
 use engine::game::engine::{apply, EngineError};
 use engine::game::scenario::{GameRunner, GameScenario};
+use engine::types::ability::Effect;
 use engine::types::actions::GameAction;
 use engine::types::events::GameEvent;
 use engine::types::game_state::{GameState, LoopDetectionMode, WaitingFor, YieldTarget};
@@ -2014,6 +2015,113 @@ fn object_growth_self_damage_recast_does_not_offer() {
     assert!(
         matches!(ok.final_waiting_for(), WaitingFor::LoopShortcut { .. }),
         "reach-guard: without the self-damage drain the same loop offers"
+    );
+}
+
+fn sprout_shell_scenario(body: &str) -> (GameRunner, ObjectId, Vec<ObjectId>) {
+    let oracle = format!(
+        "Convoke (Your creatures can help cast this spell. Each creature you tap while casting this spell pays for {{1}} or one mana of that creature's color.)\nBuyback {{3}} (You may pay an additional {{3}} as you cast this spell. If you do, put this card into your hand as it resolves.)\n{body}"
+    );
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_creature_from_oracle(
+        P0,
+        "Witherbloom, the Balancer",
+        5,
+        5,
+        WITHERBLOOM_AFFINITY_ORACLE,
+    );
+    let mut fodder = Vec::new();
+    for _ in 0..4 {
+        fodder.push(scenario.add_creature(P0, "Saproling", 1, 1).id());
+    }
+    let sprout = {
+        let mut b = scenario.add_spell_to_hand_from_oracle(P0, "Sprout Swarm", true, &oracle);
+        b.with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Green],
+            generic: 1,
+        });
+        b.id()
+    };
+    let mut runner = scenario.build();
+    {
+        let st = runner.state_mut();
+        st.loop_detection = LoopDetectionMode::Interactive;
+        for &id in &fodder {
+            st.objects.get_mut(&id).unwrap().color = vec![ManaColor::Green];
+        }
+    }
+    (runner, sprout, fodder)
+}
+
+/// A2 (CR 732.2a determinism gate) — RECAST-BODY randomness NO-OFFER control. The recast spell's
+/// own resolution body creates the fodder token AND flips a coin (CR 705.1). The board still grows
+/// deterministically by one Saproling per cycle (so the fodder cover + sign-check pass), but the
+/// coin makes the loop outcome-dependent ⇒ NOT a legal CR 732.2a shortcut ⇒ NO offer.
+///
+/// Why this fixture (not an external coin trigger): the fodder cover's
+/// `fire_time_conditions_read_growing_class` already rejects a randomness-bearing *permanent*
+/// ability (coin/die classify `Axes::CONSERVATIVE`), so an external coin trigger is caught by the
+/// cover regardless of A2 — it cannot discriminate A2. The cover does NOT scan the resolving
+/// recast *spell's* body, so a coin flip there is exactly the gap A2 closes; MEASURED: with BOTH
+/// A2 halves reverted this fixture wrongly OFFERS (the coin advances the RNG 2→6 yet the cover
+/// passes). Each A2 half independently rejects it: the static scan (a) bails pre-drive
+/// (`spell_ability_bears_randomness`), and the runtime rng-position check (b) bails post-drive.
+///
+/// Non-vacuity: (1) item-5 — the body parses to `Token` (deterministic growth) + a `FlipCoin`
+/// sub-effect (asserted below), so the coin genuinely fires; (2) revert-probe — reverting BOTH A2
+/// halves flips this to an OFFER; (3) reach-guard — the SAME shell with a coin-free body offers,
+/// isolating the coin (not the shell) as the disqualifier.
+#[test]
+fn object_growth_random_recast_body_does_not_offer() {
+    // item-5: verify the recast body carries a deterministic Token AND a FlipCoin (so the board
+    // grows each cycle while the coin advances the RNG — else the fixture would be vacuous).
+    let body_def = engine::parser::oracle_effect::parse_effect_chain(
+        "Create a 1/1 green Saproling creature token. Flip a coin.",
+        engine::types::ability::AbilityKind::Spell,
+    );
+    assert!(
+        matches!(*body_def.effect, Effect::Token { .. }),
+        "recast body head must be Token (deterministic growth), got {:?}",
+        body_def.effect
+    );
+    assert!(
+        body_def
+            .sub_ability
+            .as_ref()
+            .is_some_and(|s| matches!(*s.effect, Effect::FlipCoin { .. })),
+        "recast body must carry a FlipCoin sub-effect (the randomness A2 rejects), got {:?}",
+        body_def.sub_ability
+    );
+
+    let (mut runner, sprout, fodder) =
+        sprout_shell_scenario("Create a 1/1 green Saproling creature token. Flip a coin.");
+    let outcome = runner
+        .cast(sprout)
+        .accept_optional()
+        .convoke_with(&[fodder[0]])
+        .commit()
+        .resolve();
+    assert!(
+        !matches!(outcome.final_waiting_for(), WaitingFor::LoopShortcut { .. }),
+        "A2: a recast body bearing a coin flip is outcome-dependent (CR 732.2a) ⇒ must NOT offer, \
+         got {:?}",
+        outcome.final_waiting_for()
+    );
+
+    // Reach-guard: the SAME shell with a coin-free body offers, isolating the coin (not the
+    // buyback/convoke shell) as the sole disqualifier — and proving the input reaches the offer path.
+    let (mut ok_runner, ok_sprout, ok_fodder) =
+        sprout_shell_scenario("Create a 1/1 green Saproling creature token.");
+    let ok = ok_runner
+        .cast(ok_sprout)
+        .accept_optional()
+        .convoke_with(&[ok_fodder[0]])
+        .commit()
+        .resolve();
+    assert!(
+        matches!(ok.final_waiting_for(), WaitingFor::LoopShortcut { .. }),
+        "reach-guard: the same shell with a deterministic (coin-free) body offers"
     );
 }
 
