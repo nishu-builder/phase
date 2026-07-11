@@ -1237,6 +1237,11 @@ fn setup_3p_poison_draw(mode: LoopDetectionMode) -> (GameRunner, ObjectId) {
 /// the single-compound-trigger form drops the poison at parse). So the Path-B veto is proven
 /// load-bearing IN CODE and its runtime discriminator is WAIVED pending the poison-drop parser
 /// fix.
+///
+/// POST-RE-KEY NOTE (PR-7 poison pass): `has_no_loss_axis`'s poison veto now reads the
+/// per-victim `delta.poison` map (was the aggregate `delta.counters[(Poison, Player)]`).
+/// The veto FIELD moved; the Path-B reachability did NOT — this test is unchanged and stays
+/// the SBA-terminal behavioral anchor.
 #[test]
 fn interactive_recurring_poison_is_not_drawn() {
     // CONTROL (differential anchor): the SHARED pure-lifegain structure reaches the CR 732.4
@@ -1295,6 +1300,129 @@ fn interactive_recurring_poison_is_not_drawn() {
             .iter()
             .any(|e| matches!(e, GameEvent::GameOver { winner: None })),
         "no CR 732.4 draw event may be emitted for a poison-dripping loop"
+    );
+}
+
+/// Single-trigger drain that ALSO drips poison onto each opponent — the compound
+/// "loses 1 life AND gets a poison counter" survives the parser as BOTH conjuncts
+/// (measured), so the per-cycle delta carries `poison[opp] = +1` alongside `life[opp] = -1`.
+const DRAIN_POISON_CLERIC: &str =
+    "Whenever you gain life, each opponent loses 1 life and gets a poison counter.";
+
+/// 2-player OPTIONAL self-refilling drain-that-also-poisons controlled by P0. The pairing of
+/// `DRAIN_POISON_CLERIC` with `BLOOD_SIPPER` forms the proven ring-accumulating
+/// single-trigger-per-event ping-pong (`setup_2p_optional_drain` shape); the compound adds a
+/// poison counter to each opponent each cycle. P1 holds a castable Bolt off a Mountain ⇒ the
+/// loop is OPTIONAL ⇒ Path A OFFERS.
+fn setup_2p_optional_drain_poison(mode: LoopDetectionMode) -> (GameRunner, ObjectId) {
+    let mut scenario = GameScenario::new_n_player(2, 7);
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_life(P0, 20);
+    scenario.with_life(P1, 20);
+    scenario.add_creature_from_oracle(P0, "Test Drain Poison Cleric", 2, 2, DRAIN_POISON_CLERIC);
+    scenario.add_creature_from_oracle(P0, "Test Blood Sipper", 2, 2, BLOOD_SIPPER);
+    scenario.add_basic_land(P1, ManaColor::Red);
+    scenario.add_bolt_to_hand(P1);
+    let kickoff = scenario
+        .add_spell_to_hand_from_oracle(P0, "Test Lifegain Kickoff", false, KICKOFF)
+        .id();
+    let mut runner = scenario.build();
+    runner.state_mut().loop_detection = mode;
+    (runner, kickoff)
+}
+
+/// PR-7 poison-axis E2E: the re-keyed per-victim `ResourceAxis::Poison(PlayerId)` surfaces in a
+/// REAL offer certificate, produced end-to-end through the live sampler → `interactive_loop_bridge`
+/// (Path A) → `find_live_loop_winner` → `build_cert` → `unbounded_axes_for`. This is the
+/// production-path proof that the Option-A re-key (G-5 `unbounded_components` / G-6 the enum
+/// variant) flows into a live certificate, not just a hand-built `mark_unbounded_loop` (T5).
+///
+/// SCOPE (measured — do NOT overclaim): the loop's DECIDING win_kind here is `LethalDamage`
+/// (CR 704.5a life drain — classify checks opponent-life-loss before poison), so this is NOT the
+/// `win_kind == PoisonLoss` full-drive witness. That witness is WAIVED (§6 rung-3): NO
+/// single-compound-trigger poison-DECIDING loop can drive the live sampler —
+///   • the self-refilling PROLIFERATE form (`"...you gain 1 life, then proliferate."`) opens a
+///     `ProliferateChoice` beat every cycle, which is neither `Priority{active}` nor
+///     `OrderTriggers` ⇒ it hits the sampler CLEAR arm (engine.rs `record_loop_detect_sample`
+///     gate), so the ring never accumulates a recurrence and the loop reaches the natural
+///     CR 704.5c 10-poison SBA instead of offering (MEASURED: 0 offers, natural GameOver);
+///   • the `"you gain N life and each opponent gets a poison counter"` compound DROPS the poison
+///     conjunct at parse (keeps only `GainLife`), so poison never reaches the delta.
+/// Both are pre-existing sampler/parser limitations, independent of this change (see
+/// `interactive_recurring_poison_is_not_drawn` above, loop_shortcut.rs:1191-1239). The novel
+/// per-victim classify/faller logic is proven by the `loop_check.rs` unit tests
+/// (`live_winner_names_poison_faller`, `detects_poison_loop_as_poison_loss`, the refuse cases);
+/// this test adds the missing END-TO-END proof that the re-keyed axis reaches a live cert.
+///
+/// TWO-PATH ARCHITECTURE (why this is a boundary, not scope-shrink): the real Kilo/Freed/Relic
+/// activation combo IS covered — by the OFFLINE certification driver `drive_offline_kilo_freed_relic`
+/// (`analysis/corpus.rs` DRIVERS row 1), the same path the PR-7 combo-declaration UI feeds. The
+/// live equality-sampler cannot see an activation loop BY CONSTRUCTION (a player-driven activation
+/// drains the stack between activations → the `record_loop_detect_sample` CLEAR arm fires →
+/// `loop_detect_ring` never accumulates → the bridge gate `!ring.is_empty()` never passes). So the
+/// two detection paths partition cleanly: offline/declared certification → activation & pinned
+/// loops; the live sampler → self-refilling trigger cascades. This test exercises the live G1
+/// poison-cert path with the self-refilling drain trigger — the shape the sampler actually detects.
+/// // ponytail: activation/proliferate loops aren't live-sampled (stack drains / ring clears);
+/// // the self-refilling drain trigger IS the detectable shape — it carries the poison axis into
+/// // the offer cert even though life is the deciding clock.
+///
+/// DISCRIMINATOR / revert-probe: revert G-5 (drop the `for (pid, &n) in &self.poison` push in
+/// `unbounded_components`) ⇒ after G-2 moved poison out of `.counters`, the cert would carry
+/// NEITHER `Poison(P1)` NOR `Counter(Poison, Player)` ⇒ assertion (3) flips to fail.
+#[test]
+fn interactive_poison_axis_surfaces_in_offer_certificate() {
+    let (mut runner, kickoff) = setup_2p_optional_drain_poison(LoopDetectionMode::Interactive);
+    let _ = runner.cast(kickoff).resolve();
+    let (_events, wf) = drive_collect(&mut runner, 500);
+
+    // (1) Path A OFFERED (not an auto-win): the proposer is the determinate winner P0.
+    let WaitingFor::LoopShortcut {
+        controller,
+        certificate,
+    } = wf.clone()
+    else {
+        panic!("optional drain-poison loop must OFFER a LoopShortcut, got {wf:?}");
+    };
+    assert_eq!(controller, P0, "the proposer is the determinate winner P0");
+
+    // (2) Positive reach-guard (non-vacuity): the offer fired EARLY (not the natural CR 704.5c
+    // 10-poison SBA), and the poison axis genuinely MOVED — P1 bears >=1 poison but <10 and is
+    // still alive at positive life. Without this, "cert carries Poison" could hold on a
+    // degenerate cert where poison never actually accrued.
+    assert!(
+        !is_eliminated(&runner, P1) && life(&runner, P1) > 0,
+        "reach-guard: P1 must be alive at positive life when the offer fires (early, not natural death)"
+    );
+    let p1_poison = runner.state().players[1].poison_counters;
+    assert!(
+        (1..10).contains(&p1_poison),
+        "reach-guard: P1 must bear 1..10 poison at offer time (the loss axis genuinely moved); got {p1_poison}"
+    );
+
+    // (3) THE DISCRIMINATOR: the re-keyed per-victim poison axis is carried in a REAL cert.
+    assert!(
+        certificate.unbounded.contains(&ResourceAxis::Poison(P1)),
+        "the offer certificate must carry the re-keyed Poison(P1) axis; got {:?}",
+        certificate.unbounded
+    );
+
+    // (4) The offer resolves: proposer declares, the sole opponent accepts ⇒ GameOver{P0}.
+    runner
+        .act(GameAction::DeclareShortcut {
+            count: IterationCount::UntilLethal,
+            template: None,
+        })
+        .expect("P0 declares the shortcut");
+    runner
+        .act(GameAction::RespondToShortcut {
+            response: ShortcutResponse::Accept,
+        })
+        .expect("P1 accepts (sole opponent) → take the shortcut");
+    assert_eq!(
+        runner.state().waiting_for,
+        WaitingFor::GameOver { winner: Some(P0) },
+        "accepted ⇒ the shortcut resolves to P0's win"
     );
 }
 

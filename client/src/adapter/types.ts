@@ -2156,7 +2156,9 @@ export type ResourceAxis =
   | "DeathTriggers"
   | "EtbTriggers"
   | "LtbTriggers"
-  | "SacTriggers";
+  | "SacTriggers"
+  // CR 704.5c: poison counters on a player (10 ⇒ that player loses).
+  | { Poison: PlayerId };
 
 /** The externally-tagged discriminant of a `ResourceAxis` (its variant name).
  *  Exhaustive over `ResourceAxis` so a new engine axis forces a TS update. */
@@ -2176,7 +2178,8 @@ export type ResourceAxisTag =
   | "DeathTriggers"
   | "EtbTriggers"
   | "LtbTriggers"
-  | "SacTriggers";
+  | "SacTriggers"
+  | "Poison";
 
 /**
  * One `∞` HUD row. Mirrors `engine::game::derived_views::UnboundedResourceView`.

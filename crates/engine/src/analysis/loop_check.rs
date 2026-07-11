@@ -300,14 +300,20 @@ pub(crate) fn live_mandatory_loop_winner(
         return None;
     }
 
-    // CR 704.5a: partition living into strict life fallers vs. non-fallers (life
-    // delta ≥ 0, an absent key reading 0). Exactly one non-faller is the sole
-    // survivor candidate; since fallers/non-fallers partition `living`, that single
-    // non-faller condition IS "every other living player falls" (CR 104.2a).
+    // CR 704.5a (life ≤ 0) OR CR 704.5c (poison → 10): partition living into strict
+    // fallers vs. non-fallers. A player whose life is draining OR whose poison is
+    // accumulating each cycle extrapolates to a loss. Delta-based (not the absolute SBA
+    // threshold): the loop works on per-cycle deltas + extrapolation. Exactly one
+    // non-faller is the sole survivor candidate; since fallers/non-fallers partition
+    // `living`, that single non-faller condition IS "every other living player falls"
+    // (CR 104.2a).
     let fallers: Vec<PlayerId> = living
         .iter()
         .copied()
-        .filter(|p| delta.life.get(p).copied().unwrap_or(0) < 0)
+        .filter(|p| {
+            delta.life.get(p).copied().unwrap_or(0) < 0
+                || delta.poison.get(p).copied().unwrap_or(0) > 0
+        })
         .collect();
     let nonfallers: Vec<PlayerId> = living
         .iter()
@@ -328,17 +334,11 @@ pub(crate) fn live_mandatory_loop_winner(
     {
         return None;
     }
-    // CR 704.5c: poison is keyed by an aggregate (Poison, Player) pair (unattributable
-    // per player), so any poison gain is conservatively a second loss path.
-    if delta
-        .counters
-        .get(&(CounterClass::Poison, ObjectClass::Player))
-        .copied()
-        .unwrap_or(0)
-        > 0
-    {
-        return None;
-    }
+    // CR 704.5c: poison is now per-victim (delta.poison) and handled by the faller
+    // partition (G-7) — a player whose poison rises IS a faller, and a rising poison on
+    // the winner would make the winner a faller (so it can't be the sole non-faller).
+    // The former aggregate-poison firewall (unattributable → conservative None) is
+    // superseded and removed.
 
     // CR 101.2 firewalls, generalized. CR 104.3b + CR 101.2: NO faller may be a player
     // who can't lose the game (Platinum Angel). CR 104.2b + CR 101.2: the winner can't
@@ -376,9 +376,15 @@ pub(crate) fn live_mandatory_loop_winner(
     if !delta.net_progress_for(winner) {
         return None;
     }
-    // Scope the live shortcut to the CR 704.5a life axis (a drain, not an advantage
-    // engine or a mill): `classify_win_kind` sees ≥1 faller life<0 ⇒ `LethalDamage`.
-    if classify_win_kind(winner, delta) != WinKind::LethalDamage {
+    // Scope the live shortcut to a determinate loss axis — CR 704.5a life drain
+    // (`LethalDamage`) or CR 704.5c poison (`PoisonLoss`) — never a pure advantage
+    // engine or mill. classify's branch order (damage → opp-life<0 → poison>0 → …)
+    // reaches the poison branch before the Advantage fallthrough, so the winner's own
+    // lifegain does not mask a rising-poison loss.
+    if !matches!(
+        classify_win_kind(winner, delta),
+        WinKind::LethalDamage | WinKind::PoisonLoss
+    ) {
         return None;
     }
 
@@ -395,6 +401,33 @@ pub(crate) fn live_mandatory_loop_winner(
             .iter()
             .any(|p| delta.life.get(p).copied().unwrap_or(0) != first)
         {
+            return None;
+        }
+        // CR 704.3 poison simultaneity: all poison-fallers must cross 10 in the SAME SBA
+        // batch. Require BOTH equal per-cycle poison delta AND equal ABSOLUTE poison at
+        // cycle_end — equal-absolute alone is a fail-open (differing deltas with equal
+        // current totals cross at different future cycles); equal-delta alone is a
+        // fail-open (equal +1/cycle from staggered starts). Staggered on either axis ⇒
+        // fail-safe None. This also rejects mixed life+poison pods (a life-faller has
+        // poison 0, a poison-faller has poison>0 → unequal → None). Unlike the life
+        // arm, poison is monotone (proliferate only adds), so no intra-cycle dip check
+        // is needed (contrast `winner_life_never_dips`, which stays life-only).
+        let first_pd = delta.poison.get(&fallers[0]).copied().unwrap_or(0);
+        if fallers
+            .iter()
+            .any(|p| delta.poison.get(p).copied().unwrap_or(0) != first_pd)
+        {
+            return None;
+        }
+        let poison_at = |p: &PlayerId| {
+            cycle_end
+                .players
+                .iter()
+                .find(|q| q.id == *p)
+                .map_or(0, |q| q.poison_counters as i64)
+        };
+        let first_pois = poison_at(&fallers[0]);
+        if fallers.iter().any(|p| poison_at(p) != first_pois) {
             return None;
         }
     }
@@ -487,10 +520,17 @@ pub(crate) fn classify_win_kind(controller: PlayerId, delta: &ResourceVector) ->
     {
         return WinKind::LethalDamage;
     }
-    // CR 704.5c: unbounded poison counters on a player.
-    if delta.counters.iter().any(|(&(class, who), &n)| {
-        class == CounterClass::Poison && who == ObjectClass::Player && n > 0
-    }) {
+    // CR 704.5c: unbounded poison counters on any player. The live path feeds poison
+    // via `delta.poison`; the static `candidate_cycles_from_nodes` path feeds it via
+    // `delta.counters[(Poison, Player)]` (ability_graph.rs `add_counter`). This is a
+    // shared single-authority classifier, so honor BOTH sources — reading only one
+    // would silently degrade the other path's poison SCC to `Advantage`.
+    if delta.poison.values().any(|&n| n > 0)
+        || delta
+            .counters
+            .get(&(CounterClass::Poison, ObjectClass::Player))
+            .is_some_and(|&n| n > 0)
+    {
         return WinKind::PoisonLoss;
     }
     // CR 104.3c / CR 121.4: an unbounded *downward* library delta on a player
@@ -659,9 +699,8 @@ mod tests {
         let end = start.clone();
 
         let mut delta = ResourceVector::default();
-        delta
-            .counters
-            .insert((CounterClass::Poison, ObjectClass::Player), 1);
+        // CR 704.5c: poison is now per-victim — discriminates G-9's live `delta.poison` read.
+        delta.poison.insert(pid(1), 1);
 
         let cert = detect_loop(&start, &end, &delta, pid(0), false).expect("poison loop confirmed");
         assert_eq!(cert.win_kind, WinKind::PoisonLoss);
@@ -1156,22 +1195,86 @@ mod tests {
         );
     }
 
-    /// U7 SOUNDNESS (CR 704.5c): opponent life ↓ AND a poison gain is a SECOND
-    /// (unattributable) loss path ⇒ None. Revert: dropping `any_poison_gain`
-    /// wrongly yields `Some(P0)`.
+    /// T2 (CR 704.5c, G-7 faller generalization): a board-equal cycle whose ONLY loss
+    /// axis is rising poison on opponent P1 names P0 the winner — proving the faller
+    /// partition now recognizes poison, not just life. Revert-probe: drop the
+    /// `|| delta.poison > 0` faller term (G-7) ⇒ fallers = {} ⇒ nonfallers = {P0, P1} ⇒
+    /// `Some(pid(0))` flips to `None`.
     #[test]
-    fn live_winner_dual_faller_poison_is_none() {
+    fn live_winner_names_poison_faller() {
+        let end = GameState::new_two_player(7);
+        let start = end.clone();
+        let mut delta = ResourceVector::default();
+        delta.poison.insert(pid(1), 1);
+        assert_eq!(
+            live_mandatory_loop_winner(&start, &end, &delta),
+            Some(pid(0)),
+            "a pure-poison faller (opponent P1) makes P0 the sole non-faller winner"
+        );
+    }
+
+    /// U7 (CR 704.5a + CR 704.5c): opponent P1 both loses life AND accrues poison — the
+    /// SAME player is doomed by either clock, so P1 is a SINGLE faller and P0 is the sole
+    /// non-faller winner. This REPLACES the former over-conservative aggregate-poison
+    /// firewall (which refused any poison gain because poison was unattributable per
+    /// victim); per-victim attribution now correctly names the winner.
+    /// INTENDED BEHAVIOR CHANGE (not a regression): the prior assertion was `None`.
+    /// Revert-probe: drop the `|| delta.poison > 0` faller term (G-7) ⇒ P1 is no longer a
+    /// faller ⇒ nonfallers = {P0, P1} ⇒ None.
+    #[test]
+    fn live_winner_same_player_life_and_poison_is_determinate() {
         let end = GameState::new_two_player(7);
         let start = end.clone();
         let mut delta = ResourceVector::default();
         delta.life.insert(pid(1), -1);
-        delta
-            .counters
-            .insert((CounterClass::Poison, ObjectClass::Player), 1);
+        delta.poison.insert(pid(1), 1);
+        assert_eq!(
+            live_mandatory_loop_winner(&start, &end, &delta),
+            Some(pid(0)),
+            "same-player life-loss AND poison is ONE faller (either clock dooms P1) — P0 wins"
+        );
+    }
+
+    /// U7b SOUNDNESS (CR 104.2a): when EVERY living player accrues poison, there is no
+    /// sole non-faller ⇒ no determinate winner ⇒ None. (Poisoning only ONE player in 2p
+    /// hands the win to the other — the interesting refusal needs all seats poisoned.)
+    /// Revert-probe: dropping the G-7 poison faller term ⇒ nonfallers = both ⇒ still None,
+    /// so this pairs with the positive `same_player` test above to bracket the G-7 term.
+    #[test]
+    fn live_winner_all_players_poisoned_is_none() {
+        let end = GameState::new_two_player(7);
+        let start = end.clone();
+        let mut delta = ResourceVector::default();
+        delta.poison.insert(pid(0), 1);
+        delta.poison.insert(pid(1), 1);
         assert_eq!(
             live_mandatory_loop_winner(&start, &end, &delta),
             None,
-            "opponent life-loss AND poison gain is two loss paths — refuse to name a winner"
+            "every living player poisoned ⇒ zero non-fallers ⇒ no determinate winner"
+        );
+    }
+
+    /// U7c SOUNDNESS (CR 704.3, G-11): a ≥3p pod with two poison-fallers that cross 10 at
+    /// DIFFERENT future cycles (equal per-cycle delta but UNEQUAL absolute poison at
+    /// cycle_end) must NOT be named a determinate win — the first crossing eliminates one
+    /// opponent while the other is still alive (a premature GameOver). Fail-safe None.
+    /// Revert-probe: delete the G-11 absolute-poison equality check ⇒ this yields
+    /// `Some(pid(0))` (a fail-open premature win).
+    #[test]
+    fn live_winner_staggered_absolute_poison_is_none() {
+        let mut end = n_player(3);
+        // Equal per-cycle poison delta (+1 each) but staggered absolute totals: P1 at 3,
+        // P2 at 5 ⇒ they cross the 10-poison SBA in different batches.
+        end.players[1].poison_counters = 3;
+        end.players[2].poison_counters = 5;
+        let start = end.clone();
+        let mut delta = ResourceVector::default();
+        delta.poison.insert(pid(1), 1);
+        delta.poison.insert(pid(2), 1);
+        assert_eq!(
+            live_mandatory_loop_winner(&start, &end, &delta),
+            None,
+            "staggered absolute poison among ≥2 fallers ⇒ non-simultaneous 10-crossing ⇒ None"
         );
     }
 

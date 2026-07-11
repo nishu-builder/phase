@@ -159,6 +159,10 @@ impl From<&ResourceAxis> for AxisKey {
             ResourceAxis::EtbTriggers => AxisKey::Etb,
             ResourceAxis::LtbTriggers => AxisKey::Ltb,
             ResourceAxis::SacTriggers => AxisKey::Sac,
+            // CR 704.5c: the per-victim poison axis projects onto the same aggregate
+            // AxisKey the static ability-graph path uses (`add_counter` → Poison/Player),
+            // preserving poison's prior key identity for graph analysis.
+            ResourceAxis::Poison(_) => AxisKey::Counter(CounterClass::Poison, ObjectClass::Player),
         }
     }
 }

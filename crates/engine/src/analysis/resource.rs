@@ -175,6 +175,11 @@ pub struct ResourceVector {
     /// **State-readable** (absolute library size at snapshot time).
     pub library_delta: BTreeMap<PlayerId, i64>,
 
+    /// CR 122.1 + CR 704.5c: poison counters keyed by VICTIM `PlayerId` (10 ⇒ that
+    /// player loses). Per-victim so a multiplayer poison ∞ attributes the loss to the
+    /// afflicted seat, not the loop's controller. **State-readable.**
+    pub poison: BTreeMap<PlayerId, i64>,
+
     /// CR 111: tokens created this analysis window. **Event-fed.**
     pub tokens_created: i64,
 
@@ -245,25 +250,9 @@ impl ResourceVector {
             // CR 401: per-player library size.
             v.library_delta
                 .insert(player.id, player.library.len() as i64);
-            // CR 122.1 + CR 704.5c: poison counters live in a dedicated field.
-            //
-            // GAP-5 (multiplayer prerequisite): the poison axis is AGGREGATE-keyed —
-            // `(CounterClass::Poison, ObjectClass::Player)` carries NO victim `PlayerId`,
-            // so a poison delta is summed across the whole table, not attributed to the
-            // afflicted player. `live_mandatory_loop_winner` reads this summed pair
-            // conservatively (loop_check.rs ~239), and `derive_views`' `attribution_player`
-            // routes any poison ∞ to the loop's controller (see the note at
-            // derived_views.rs). That is correct ONLY because no live producer emits a
-            // poison axis today; before any future live poison/infect loop producer is
-            // enabled this key MUST be re-keyed by victim `PlayerId` (CR 704.5c: the
-            // afflicted player owns the loss), or a multiplayer poison ∞ would attribute
-            // to the wrong seat. Inert documentation — no behavior change here.
-            if player.poison_counters > 0 {
-                v.counters.insert(
-                    (CounterClass::Poison, ObjectClass::Player),
-                    player.poison_counters as i64,
-                );
-            }
+            // CR 704.5c: poison counters, keyed by the VICTIM's `PlayerId` (10 ⇒ that
+            // player loses) — mirrors the per-player `life`/`library_delta` maps above.
+            v.poison.insert(player.id, player.poison_counters as i64);
             // CR 122.1: energy reserve.
             if player.energy > 0 {
                 v.counters.insert(
@@ -327,6 +316,7 @@ impl ResourceVector {
             life: map_delta(&before.life, &after.life),
             damage_dealt: map_delta(&before.damage_dealt, &after.damage_dealt),
             library_delta: map_delta(&before.library_delta, &after.library_delta),
+            poison: map_delta(&before.poison, &after.poison),
             tokens_created: after.tokens_created - before.tokens_created,
             cards_drawn: after.cards_drawn - before.cards_drawn,
             casts_this_step: after.casts_this_step - before.casts_this_step,
@@ -354,6 +344,9 @@ impl ResourceVector {
         let life = self.life.values().map(|&n| (Component::Consumed, n));
         let library = self.library_delta.values().map(|&n| (Component::Gained, n));
         let damage = self.damage_dealt.values().map(|&n| (Component::Gained, n));
+        // CR 704.5c: poison is a Gained axis (monotone rising toward the 10-loss), so a
+        // poison-pumping loop stays net-progress.
+        let poison = self.poison.values().map(|&n| (Component::Gained, n));
         let counters = self.counters.values().map(|&n| (Component::Gained, n));
         let triggers = self
             .generic_triggers
@@ -377,6 +370,7 @@ impl ResourceVector {
             .chain(life)
             .chain(library)
             .chain(damage)
+            .chain(poison)
             .chain(counters)
             .chain(triggers)
             .chain(scalars)
@@ -452,6 +446,12 @@ impl ResourceVector {
         for (pid, &n) in &self.library_delta {
             if n != 0 {
                 out.push((ResourceAxis::LibraryDelta(*pid), n));
+            }
+        }
+        // CR 704.5c: rising poison on a victim is an unbounded loss axis.
+        for (pid, &n) in &self.poison {
+            if n > 0 {
+                out.push((ResourceAxis::Poison(*pid), n));
             }
         }
         for (&key, &n) in &self.counters {
@@ -566,6 +566,9 @@ pub enum ResourceAxis {
     EtbTriggers,
     LtbTriggers,
     SacTriggers,
+    /// CR 704.5c: poison counters on a player (10 ⇒ that player loses). Appended at
+    /// the END to keep the derived `Ord` discriminant of every earlier variant stable.
+    Poison(PlayerId),
 }
 
 /// CR 122.1: classify a counter-bearing object by its core types.

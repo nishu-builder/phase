@@ -711,15 +711,11 @@ fn build_cert(
 /// from two `snapshot`s, so `damage_dealt` is empty (state-fed) and life loss surfaces as
 /// a negative `life` delta.
 fn has_no_loss_axis(delta: &crate::analysis::resource::ResourceVector) -> bool {
-    use crate::analysis::resource::{CounterClass, ObjectClass};
+    // CR 704.5c: poison is now per-victim (`delta.poison`); a rising poison on ANY
+    // player is a loss axis that vetoes the CR 732.4 draw.
     delta.life.values().all(|&n| n >= 0)
         && delta.library_delta.values().all(|&n| n >= 0)
-        && delta
-            .counters
-            .get(&(CounterClass::Poison, ObjectClass::Player))
-            .copied()
-            .unwrap_or(0)
-            <= 0
+        && delta.poison.values().all(|&n| n <= 0)
 }
 
 /// CR 800.4a: the seat that should receive priority when a loop-shortcut resolution hands
