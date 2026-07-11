@@ -1590,6 +1590,7 @@ fn static_mode_references_growing_class(mode: &crate::types::statics::StaticMode
         | StaticMode::CantBeBlockedExceptBy { .. }
         | StaticMode::CantBeBlockedBy { .. }
         | StaticMode::CantBeBlockedByMoreThan { .. }
+        | StaticMode::CantBeBlockedUnlessAllBlock
         | StaticMode::AttachmentRestriction { .. }
         | StaticMode::Protection
         | StaticMode::Indestructible
