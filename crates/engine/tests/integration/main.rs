@@ -433,6 +433,7 @@ mod issue_4835_intimidation_tactics;
 mod issue_4836_mindskinner;
 mod issue_4921_skullscorch_unless_deal_damage;
 mod issue_4962_volo_guide_to_monsters;
+mod issue_4999_treasure_cruise_delve_tokens;
 mod issue_5145_violent_eruption_choose_target_distribution;
 mod issue_5159_attacks_alone_investigate;
 mod issue_5282_nissa_ultimate_emblem_search;
