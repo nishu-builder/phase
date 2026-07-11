@@ -10630,6 +10630,30 @@ fn _gamestate_partition_is_total(s: &GameState) {
         liminal_entries: _,
         pending_liminal_entry_resume: _,
         last_discover_value: _,
+        // Post-rebase upstream additions (rebased onto d1a1e995e), classified by ONE-SIDED-SAFETY
+        // (COMPARED is fail-safe; EXCLUSION is the fail-DANGEROUS direction — a field is excluded
+        // ONLY when COMPARING it would break legitimate loop detection):
+        //   - `pending_player_scope_sacrifice_choice`: COMPARED (upstream's `impl PartialEq`) — a
+        //     paused sacrifice-choice interaction state; a differing value is correctly not a
+        //     fixed-point repeat.
+        //   - `post_replacement_token_substitution_count` (CR 614.1a copy-token "that many" count):
+        //     COMPARED — upstream's PartialEq excludes it, but excluding a COUNT from the cover gate
+        //     is the fail-DANGEROUS direction, so `eq_except_growable` (resource.rs) compares it
+        //     explicitly. It is `None` at every sample beat (cleared whenever `waiting_for ==
+        //     Priority`, effects/mod.rs:759) or a constant direct-assigned count across a real
+        //     copy-token loop, so COMPARING never suppresses a legitimate loop's detection.
+        pending_player_scope_sacrifice_choice: _,
+        post_replacement_token_substitution_count: _,
+        //   - `resolution_source_relatch` (CR 400.7j self-move re-latch): EXCLUDED-REQUIRED (measured
+        //     by ordering trace, not doc-trust). The clear at stack.rs:194 fires at the START of the
+        //     NEXT resolution, while `record_loop_detect_sample` fires at the Priority window AFTER
+        //     this resolution's self-move SET it (zones.rs:610) — so at the sample beat it HOLDS this
+        //     iteration's `current_incarnation`, which bumps every iteration. COMPARING it would make
+        //     every self-moving loop compare UNEQUAL (a false-negative — it would make the 4d
+        //     Sprout-Swarm buyback loop undetectable). It is an incarnation/timestamp identity, and
+        //     object-growth lives in `objects` (stripped+compared by `eq_except_growable`), so
+        //     excluding this single-object identity field cannot hide growth.
+        resolution_source_relatch: _,
     } = s;
 }
 

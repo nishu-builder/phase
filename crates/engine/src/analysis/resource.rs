@@ -1058,7 +1058,21 @@ fn eq_except_growable(pa: &GameState, pb: &GameState, grown: &HashSet<ObjectId>)
     b.battlefield.clear();
     a.stack.clear();
     b.stack.clear();
+    // Rebase-adaptation (ONE-SIDED-SAFETY): compare the new upstream scalar
+    // `post_replacement_token_substitution_count` here even though upstream's
+    // `impl PartialEq for GameState` excludes it. Excluding a COUNT from the cover gate
+    // is the fail-DANGEROUS direction (a growing count could let two cycles compare EQUAL
+    // → false CR 732.2a certification); COMPARING it is fail-safe. It is provably `None` at
+    // every loop sample beat (cleared in effects/mod.rs whenever `waiting_for == Priority`
+    // — the sample gate itself), and on the only path that could leave it `Some` it is a
+    // DIRECT assignment of a CopyTokenOf substitution's fixed count (constant across a real
+    // copy-token loop's iterations), so comparing it can never suppress a legitimate loop's
+    // detection. (The self-referential incarnation field `resolution_source_relatch` is the
+    // opposite case — it VARIES per iteration at the sample beat, so it MUST stay excluded,
+    // like a timestamp; see the `_gamestate_partition_is_total` note.)
     a == b
+        && a.post_replacement_token_substitution_count
+            == b.post_replacement_token_substitution_count
 }
 
 /// §5.3a firewall (BLOCKER-S1 + S5 + MAJOR-A): does ANY live off-stack fire-time
