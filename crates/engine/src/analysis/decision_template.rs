@@ -203,6 +203,11 @@ pub struct ShortcutDecisionSchema {
     pub iteration_count: IterationCount,
     /// The open per-iteration decision-points needing pins. EMPTY for a choice-free drain.
     pub points: Vec<DecisionPoint>,
+    /// CR 702.51a: total untapped creatures the controller may tap for convoke across every
+    /// `ConvokeTaps` point — engine-owned so the frontend renders the count directly instead of
+    /// re-deriving it (display-layer purity). Sum of each `ConvokeTaps.tappable.len()`.
+    #[serde(default)]
+    pub convoke_tappable_count: usize,
 }
 
 // CR 732.2a: `IterationCount` carries no `Default` and its `Fixed(u32)` is a tuple variant
@@ -213,6 +218,7 @@ impl Default for ShortcutDecisionSchema {
         Self {
             iteration_count: IterationCount::Fixed(0),
             points: Vec::new(),
+            convoke_tappable_count: 0,
         }
     }
 }
@@ -742,6 +748,7 @@ mod tests {
                     ],
                 },
             }],
+            convoke_tappable_count: 2,
         };
         let json = serde_json::to_value(&schema).expect("serialize");
         let back: ShortcutDecisionSchema = serde_json::from_value(json).expect("deserialize");
@@ -751,6 +758,7 @@ mod tests {
             ShortcutDecisionSchema {
                 iteration_count: IterationCount::Fixed(0),
                 points: vec![],
+                convoke_tappable_count: 0,
             }
         );
     }

@@ -7,6 +7,7 @@
     "confirm": "Take the shortcut",
     "accept": "Accept",
     "shorten": "Break out",
+    "decline": "Decline the shortcut",
     "untilLethal": "Repeat until the game ends.",
     "fixedCount_one": "Repeat once.",
     "fixedCount_other": "Repeat {{count}} times.",

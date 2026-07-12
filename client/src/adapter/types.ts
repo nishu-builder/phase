@@ -1955,6 +1955,7 @@ export type GameAction =
   | { type: "RevokeDebugPermission"; data: { player_id: PlayerId } }
   | { type: "DeclareShortcut"; data: { count: IterationCount; template?: DecisionTemplate | null } }
   | { type: "RespondToShortcut"; data: { response: ShortcutResponse } }
+  | { type: "DeclineShortcut" }
   | { type: "Concede"; data: { player_id: PlayerId } };
 
 // CR 605.3b + CR 106.1a: Shape of the prompt surfaced by WaitingFor::ChooseManaColor.
@@ -2260,6 +2261,12 @@ export type IterationCount = "UntilLethal" | { Fixed: number };
 export interface ShortcutDecisionSchema {
   iteration_count: IterationCount;
   points: DecisionPoint[];
+  /**
+   * CR 702.51a: engine-computed total of untapped creatures the controller may tap for
+   * convoke across every ConvokeTaps point. Rendered directly by the modal (display-layer
+   * purity) instead of re-derived from `points`. `#[serde(default)]` ⇒ 0 when absent.
+   */
+  convoke_tappable_count: number;
 }
 
 /** Mirrors `engine::analysis::decision_template::DecisionPoint`. */

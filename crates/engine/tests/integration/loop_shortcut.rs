@@ -544,6 +544,74 @@ fn interactive_shorten_hands_priority_and_breaks_loop() {
     );
 }
 
+// ───────────────────── T-Q1-decline (Seam 1) ───────────────────────
+
+/// T-Q1-decline ⭐ (interactive bridge, Seam 1): CR 732.2a — suggesting a shortcut is
+/// OPTIONAL, so the proposer may DECLINE the auto-offered optional drain. The engine dismisses
+/// the offer and restores ordinary priority to the living seat (P0 here); an ordinary action
+/// then resolves and the declined loop is NOT immediately re-offered by the post-return
+/// reconcile.
+///
+/// Non-vacuous revert-probe (measured): the interactive Seam-1 re-offer is suppressed by the
+/// `apply_action` deliberate-action ring invalidation (fires for `DeclineShortcut` before the
+/// handler runs). The handler therefore does NOT clear the ring itself — a per-action re-clear
+/// would distrust that engine-wide invariant — so there is no handler ring-clear to serve as a
+/// discriminator here. The load-bearing line for THIS test is the offer dismissal
+/// (`state.waiting_for = WaitingFor::Priority { .. }`): deleting it leaves `waiting_for ==
+/// LoopShortcut { P0 }` (the reconcile's Priority-gated seams skip a non-Priority state) ⇒ the
+/// `Priority { P0 }` assertion (a) flips to fail. Seam-2 independence is proven by the
+/// object-growth test: deleting `last_recast_context = None` fails THAT test while this one is
+/// unaffected (this fixture captures no recast context).
+#[test]
+fn interactive_optional_drain_decline_restores_priority_no_reoffer() {
+    let (mut runner, kickoff, _bolt, _cleric) =
+        setup_2p_optional_drain(LoopDetectionMode::Interactive);
+    let _ = runner.cast(kickoff).resolve();
+    let (_events, wf) = drive_collect(&mut runner, 500);
+
+    // F2 positive reach-guard: the offer was genuinely reached before we decline. Without this
+    // a fixture drift that never offers would let DeclineShortcut hit the apply wildcard and
+    // pass assertion (c) vacuously.
+    assert!(
+        matches!(wf, WaitingFor::LoopShortcut { controller, .. } if controller == P0),
+        "optional drain must OFFER a LoopShortcut to P0, got {wf:?}"
+    );
+
+    // CR 732.2a: the controller (P0) declines the offer.
+    let decline = runner
+        .act(GameAction::DeclineShortcut)
+        .expect("P0 declines the shortcut");
+
+    // (a): the offer is dismissed and ordinary priority is restored to the living seat. Deleting
+    // the handler's `state.waiting_for = Priority { .. }` dismissal leaves `waiting_for ==
+    // LoopShortcut { P0 }` (the reconcile's Priority-gated seams skip a non-Priority state) ⇒
+    // this assertion flips to fail — the load-bearing revert-probe for this interactive seam.
+    assert_eq!(
+        runner.state().waiting_for,
+        WaitingFor::Priority { player: P0 },
+        "decline dismisses the offer and restores ordinary priority to the living seat"
+    );
+    assert_eq!(decline.waiting_for, WaitingFor::Priority { player: P0 });
+    assert!(
+        runner.state().loop_detect_ring.is_empty(),
+        "the recurrence ring is empty after decline (invalidated by the deliberate-action clear)"
+    );
+
+    // (b) an ordinary action resolves from the restored priority window.
+    runner
+        .act(GameAction::PassPriority)
+        .expect("an ordinary PassPriority resolves after the decline handback");
+
+    // (c) the SAME loop is not instantly re-offered on the immediate next beat (the ring is
+    // empty, so it takes several samples to re-detect; a genuine later re-recurrence would then
+    // legitimately re-arm the offer — CR 732.2a event-driven re-arm).
+    assert!(
+        !matches!(runner.state().waiting_for, WaitingFor::LoopShortcut { .. }),
+        "the declined loop must not be re-offered on the immediate next beat, got {:?}",
+        runner.state().waiting_for
+    );
+}
+
 // ───────────────────── T-declare-roundtrip ─────────────────────────
 
 /// T-declare-roundtrip: each protocol action is accepted only from its authorized actor —
@@ -607,6 +675,43 @@ fn declare_and_respond_authorization() {
         },
     )
     .expect("the prompted opponent accepts");
+
+    // RIDER-2 — CR 732.2a decline authorization (fresh runner: the flow above consumed the
+    // offer). `DeclineShortcut` is a normal protocol action dispatched via the
+    // `(waiting_for, action)` match; `check_actor_authorization` (engine.rs:225) runs BEFORE
+    // `apply_action` and keys on `WaitingFor::LoopShortcut.acting_player` == the controller.
+    // Unlike `Concede`/`Debug`, `DeclineShortcut` is NOT on any pre-match early-return
+    // allowlist, so a wrong actor is rejected with the SPECIFIC `WrongPlayer` — proving the
+    // decline genuinely routes THROUGH the auth firewall (a vacuous "not accepted" would also
+    // pass on an allowlist bypass, which the concrete-variant assert rules out).
+    let (mut drunner, dkickoff) = setup_3p_optional_cascade(LoopDetectionMode::Interactive);
+    let _ = drunner.cast(dkickoff).resolve();
+    let (_de, dwf) = drive_collect(&mut drunner, 500);
+    assert!(
+        matches!(dwf, WaitingFor::LoopShortcut { controller, .. } if controller == P0),
+        "decline-auth precondition: the offer must be reached with controller P0, got {dwf:?}"
+    );
+
+    // Wrong actor for DeclineShortcut (an opponent) → the concrete WrongPlayer error.
+    let wrong_decline = apply(drunner.state_mut(), P1, GameAction::DeclineShortcut);
+    assert!(
+        matches!(wrong_decline, Err(EngineError::WrongPlayer)),
+        "an opponent may not decline the proposer's shortcut, got {wrong_decline:?}"
+    );
+    // The rejected action left the offer intact (no state mutation on an auth reject).
+    assert!(
+        matches!(drunner.state().waiting_for, WaitingFor::LoopShortcut { controller, .. } if controller == P0),
+        "a rejected wrong-actor decline must not disturb the offer, got {:?}",
+        drunner.state().waiting_for
+    );
+
+    // Correct actor (the controller P0) → accepted; ordinary priority handed back.
+    apply(drunner.state_mut(), P0, GameAction::DeclineShortcut).expect("P0 declines");
+    assert!(
+        matches!(drunner.state().waiting_for, WaitingFor::Priority { .. }),
+        "the controller's decline hands ordinary priority back, got {:?}",
+        drunner.state().waiting_for
+    );
 }
 
 // ─────────────────── T-variant-housekeeping ────────────────────────
@@ -1137,6 +1242,7 @@ fn declare_illegal_pin_falls_back_legal_ingests() {
                 legal_targets: vec![TargetRef::Player(P1)],
             },
         }],
+        convoke_tappable_count: 0,
     };
     let template_for = |pinned: PlayerId| DecisionTemplate {
         owner: P0,
@@ -2427,6 +2533,101 @@ fn object_growth_51st_materializes_five_saprolings_on_accept() {
     assert!(runner.state().loop_detect_ring.is_empty());
 }
 
+/// T-object-growth-decline ⭐ (Seam 2): CR 732.2a — the controller DECLINES the auto-offered
+/// object-growth (Sprout Swarm) shortcut. The engine restores ordinary priority, clears the
+/// object-growth routing context, an ordinary action resolves, and the loop is NOT re-offered.
+///
+/// Non-vacuous, two-seam-independent revert-probe: this offer is gated by
+/// `last_recast_context.is_some()` (engine.rs Seam 2), so `last_recast_context = None` in
+/// `handle_decline_shortcut` is the SOLE load-bearing suppression here (the ring is empty on
+/// this path, so deleting `loop_detect_ring.clear()` has no effect). Deleting
+/// `last_recast_context = None` leaves the routing context set ⇒ the post-return reconcile
+/// re-fires `try_offer_object_growth_shortcut` within this same `apply()` ⇒ the `Priority`
+/// assertion flips back to `LoopShortcut`. (Distinct from the interactive test's probe line ⇒
+/// the two seams are covered independently.)
+#[test]
+fn object_growth_sprout_swarm_decline_restores_priority_no_reoffer() {
+    let (mut runner, sprout, fodder) = sprout_swarm_scenario(4);
+    let _ = runner
+        .cast(sprout)
+        .accept_optional() // pay buyback {3}
+        .convoke_with(&[fodder[0]]) // tap one green Saproling for the {G} pip
+        .commit()
+        .resolve();
+
+    // F2 positive reach-guard: the object-growth offer was genuinely reached, and its routing
+    // context is set (the Seam-2 gate the decline must clear).
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::LoopShortcut { controller, .. } if controller == P0),
+        "Sprout Swarm must OFFER a LoopShortcut to P0, got {:?}",
+        runner.state().waiting_for
+    );
+    assert!(
+        runner.state().last_recast_context.is_some(),
+        "the object-growth offer must have captured a recast context (the Seam-2 gate)"
+    );
+
+    // RIDER-3 (runtime, semantic identity): the engine-owned `convoke_tappable_count` published on
+    // the offer schema must equal the sum the DELETED React reduce computed over the same points
+    // (Sprout Swarm convokes ⇒ a real nonzero ConvokeTaps offer). Cross-checking the published
+    // count against the live ConvokeTaps `tappable` lengths proves the authority-move to the
+    // engine changed no displayed value — a wrong/defaulted engine count would fail here.
+    if let WaitingFor::LoopShortcut { schema, .. } = &runner.state().waiting_for {
+        let react_equivalent: usize = schema
+            .points
+            .iter()
+            .filter_map(|p| match &p.kind {
+                DecisionPointKind::ConvokeTaps { tappable } => Some(tappable.len()),
+                _ => None,
+            })
+            .sum();
+        assert!(
+            react_equivalent > 0,
+            "Sprout Swarm's object-growth offer must present a real nonzero ConvokeTaps schema"
+        );
+        assert_eq!(
+            schema.convoke_tappable_count, react_equivalent,
+            "engine-owned convoke_tappable_count must equal the old React reduce's sum over the same points (RIDER-3)"
+        );
+    }
+
+    // CR 732.2a: the controller (P0) declines the offer.
+    let decline = runner
+        .act(GameAction::DeclineShortcut)
+        .expect("P0 declines the object-growth shortcut");
+
+    // (a) + (c): ordinary priority restored AND the Seam-2 routing context cleared, so the
+    // post-return reconcile does not re-fire `try_offer_object_growth_shortcut`. With
+    // `last_recast_context = None` reverted, the intact context re-offers ⇒ this flips to
+    // `LoopShortcut`.
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::Priority { .. }),
+        "decline restores ordinary priority; the context-clear suppresses the immediate re-offer, got {:?}",
+        runner.state().waiting_for
+    );
+    assert!(
+        matches!(decline.waiting_for, WaitingFor::Priority { .. }),
+        "the decline result hands priority back"
+    );
+    assert!(
+        runner.state().last_recast_context.is_none(),
+        "the object-growth routing context was cleared on decline (Seam-2 revert-probe line)"
+    );
+    assert!(runner.state().loop_detect_ring.is_empty());
+
+    // (b) an ordinary action resolves from the restored priority window.
+    runner
+        .act(GameAction::PassPriority)
+        .expect("an ordinary PassPriority resolves after the decline handback");
+
+    // (c) the declined loop is not instantly re-offered on the immediate next beat.
+    assert!(
+        !matches!(runner.state().waiting_for, WaitingFor::LoopShortcut { .. }),
+        "the declined object-growth loop must not be re-offered, got {:?}",
+        runner.state().waiting_for
+    );
+}
+
 /// N1 — finite-mana REJECTS (B4). Same fixture WITHOUT Witherbloom's affinity granter: each
 /// recast must pay the real {1}{G}+buyback{3} = {4}{G}, which 4 untapped green creatures
 /// cannot cover by convoke alone (needs 5 taps) ⇒ the injector aborts (UnpayableConvoke) ⇒
@@ -2859,6 +3060,7 @@ fn loop_shortcut_schema_redacts_hidden_targets_for_non_controller() {
                 ],
             },
         }],
+        convoke_tappable_count: 0,
     };
     let cert = LoopCertificate {
         unbounded: vec![],

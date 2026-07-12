@@ -748,7 +748,7 @@ fn build_shortcut_schema(
     use crate::analysis::decision_template::{
         DecisionPoint, DecisionPointKind, PinnedDecision, ShortcutDecisionSchema,
     };
-    let points = pins
+    let points: Vec<DecisionPoint> = pins
         .iter()
         .filter_map(|pin| match pin {
             // CR 603.3b: trigger ordering is not a loop-declaration choice — no read-side peer.
@@ -784,9 +784,20 @@ fn build_shortcut_schema(
             }
         })
         .collect();
+    // CR 702.51a: engine-owned total of untapped convoke-eligible creatures across every
+    // ConvokeTaps point — the frontend renders this directly instead of re-deriving it from
+    // `points` (display-layer purity). Identical predicate/sum to the deleted React reduce.
+    let convoke_tappable_count = points
+        .iter()
+        .filter_map(|p| match &p.kind {
+            DecisionPointKind::ConvokeTaps { tappable } => Some(tappable.len()),
+            _ => None,
+        })
+        .sum();
     ShortcutDecisionSchema {
         iteration_count: shortcut_iteration_count(win_kind),
         points,
+        convoke_tappable_count,
     }
 }
 
@@ -1864,6 +1875,51 @@ fn handle_declare_shortcut(
         // CR 732.2c: nobody else to poll ⇒ take the shortcut.
         apply_confirmed_shortcut(state, &mut result, &proposal);
     }
+    Ok(result)
+}
+
+/// CR 732.2a: the priority holder MAY decline the auto-offered loop shortcut — "the player
+/// with priority may suggest a shortcut" makes suggesting optional, so forcing a proposal is
+/// wrong. Restore ordinary priority (the living seat, mirroring the `handle_declare_shortcut`
+/// pin-rejection handback) so the post-return reconcile hands the controller a normal window
+/// instead of re-nagging the SAME offer. This is the `until_lethal_fallback` tail minus the
+/// board rollback: decline is pre-drive, so no board mutation ever occurred.
+///
+/// Re-offer suppression, by seam:
+/// - Interactive bridge (Seam 1, `find_live_loop_winner` reads `loop_detect_ring`, gated by
+///   `!stack.is_empty()`): suppressed by the GENERAL deliberate-action invariant, not by this
+///   handler. `apply_action` (engine.rs:3006-3011) invalidates `loop_detect_ring` for every
+///   deliberate (non-`PassPriority`/`OrderTriggers`) action; `DeclineShortcut` is a deliberate
+///   break, so the ring is already empty before this handler runs. Seam-1 suppression is the
+///   shared invariant every cast/activate/play-land relies on — the handler does NOT re-clear
+///   the ring (re-clearing would special-case `DeclineShortcut` to distrust an engine-wide
+///   invariant). The interactive e2e's "no re-offer" assertion guards this end-to-end: a future
+///   regression excluding `DeclineShortcut` from that allowlist would fail it loudly.
+/// - Object-growth (Seam 2, gated by `last_recast_context.is_some()`): the deliberate-action
+///   clear does NOT touch `last_recast_context`, so `state.last_recast_context = None` here is
+///   the genuinely load-bearing suppressor — without it the post-return reconcile re-fires
+///   `try_offer_object_growth_shortcut` within this same `apply()`.
+///
+/// A genuine re-recurrence or a fresh re-cast re-arms the offer naturally. Controller-only
+/// authorization is enforced upstream by `check_actor_authorization`
+/// (`WaitingFor::acting_player` == `LoopShortcut.controller`), so `controller` is unused here.
+fn handle_decline_shortcut(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+) -> Result<ActionResult, EngineError> {
+    let mut result = ActionResult {
+        events: std::mem::take(events),
+        waiting_for: state.waiting_for.clone(),
+        log_entries: vec![],
+    };
+    // Seam 1 (loop_detect_ring) is already invalidated by apply_action's deliberate-action
+    // ring-clear (engine.rs:3006-3011) — see doc. Only Seam 2 is the handler's gap:
+    state.last_recast_context = None; // Seam 2: load-bearing object-growth offer-gate clear (CR 732.2a)
+    priority::reset_priority(state);
+    state.waiting_for = WaitingFor::Priority {
+        player: living_priority_seat(state),
+    };
+    result.waiting_for = state.waiting_for.clone();
     Ok(result)
 }
 
@@ -4235,6 +4291,12 @@ fn apply_action(
                 schema,
                 &mut events,
             );
+        }
+        // CR 732.2a: the proposer DECLINES the offered shortcut (suggesting is optional).
+        // Controller-only authorization is enforced upstream by `check_actor_authorization`, so
+        // `controller`/`certificate`/`schema` are unused here (`..`).
+        (WaitingFor::LoopShortcut { .. }, GameAction::DeclineShortcut) => {
+            return handle_decline_shortcut(state, &mut events);
         }
         // CR 732.2b/c: an opponent answers the loop-shortcut offer.
         (

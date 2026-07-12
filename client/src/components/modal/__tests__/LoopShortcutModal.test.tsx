@@ -93,16 +93,30 @@ describe("LoopShortcutModal", () => {
     expect(
       screen.getByText("Auto-taps up to 2 creatures for convoke each iteration."),
     ).toBeInTheDocument();
-    // The confirm button is the ONLY interactive control — no per-creature tap UI.
+    // The only interactive controls are confirm + decline — no per-creature tap UI.
     const buttons = screen.getAllByRole("button");
-    expect(buttons).toHaveLength(1);
-    expect(buttons[0]).toHaveTextContent("Take the shortcut");
+    expect(buttons).toHaveLength(2);
+    expect(buttons.map((b) => b.textContent)).toEqual([
+      "Take the shortcut",
+      "Decline the shortcut",
+    ]);
 
     fireEvent.click(buttons[0]);
     expect(dispatchMock).toHaveBeenCalledWith({
       type: "DeclareShortcut",
       data: { count: "UntilLethal", template: null },
     });
+  });
+
+  // T3b (CR 732.2a): the declare modal offers a Decline control that dispatches the
+  // payloadless DeclineShortcut — suggesting a shortcut is optional. Distinct from the
+  // opponent-side Shorten; this is the controller declining their own auto-offer.
+  it("dispatches DeclineShortcut on decline (T3b)", () => {
+    seed(buildLoopShortcutWaitingFor());
+    render(<DeclareShortcutModal />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Decline the shortcut" }));
+    expect(dispatchMock).toHaveBeenCalledWith({ type: "DeclineShortcut" });
   });
 
   // T4: the respond window renders the proposal and Accept dispatches Accept.

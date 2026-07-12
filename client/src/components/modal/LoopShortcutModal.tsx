@@ -50,9 +50,11 @@ function FamilyBadges({ axes }: { axes: ResourceAxis[] }) {
 }
 
 /**
- * CR 732.2a: the loop's determinate winner (the controller) declares the
- * shortcut. Confirm-only — the engine offers no decline for `LoopShortcut`; the
- * escape hatch lives on the opponent side (`RespondToShortcutModal` → break out).
+ * CR 732.2a: the loop's determinate winner (the controller) may declare the
+ * shortcut OR decline it — "the player with priority may suggest a shortcut" is
+ * optional. Declining dispatches `DeclineShortcut`, which restores ordinary
+ * priority engine-side; the opponent-side escape hatch (accept/shorten) lives in
+ * `RespondToShortcutModal`.
  */
 export function DeclareShortcutModal() {
   const { t } = useTranslation("game");
@@ -70,27 +72,31 @@ export function DeclareShortcutModal() {
     });
   }, [waitingFor, dispatch]);
 
+  const handleDecline = useCallback(() => {
+    // CR 732.2a: decline the auto-offer; the engine restores ordinary priority.
+    dispatch({ type: "DeclineShortcut" });
+  }, [dispatch]);
+
   if (waitingFor?.type !== "LoopShortcut" || !canAct) return null;
 
   const { certificate, schema } = waitingFor.data;
-  // CR 702.51a: read-only count of untapped creatures the engine will auto-tap
-  // for convoke (`select_convoke_taps` re-binds the concrete taps each iteration).
-  // `.length` over an engine-provided array is formatting, not game logic.
-  const convokeTappable = schema.points.reduce(
-    (total, point) =>
-      typeof point.kind === "object" && "ConvokeTaps" in point.kind
-        ? total + point.kind.ConvokeTaps.tappable.length
-        : total,
-    0,
-  );
+  // CR 702.51a: engine-computed count of untapped creatures the engine will auto-tap
+  // for convoke — read directly from the schema (the engine owns the derivation).
+  const convokeTappable = schema.convoke_tappable_count;
 
   const footer = (
-    <div className="flex justify-end">
+    <div className="flex flex-col gap-3 sm:flex-row sm:justify-end">
       <button
         onClick={handleConfirm}
         className="min-h-11 rounded-[16px] bg-cyan-500 px-6 py-2 font-semibold text-slate-950 shadow-[0_14px_34px_rgba(6,182,212,0.28)] transition hover:bg-cyan-400"
       >
         {t("comboShortcut.confirm")}
+      </button>
+      <button
+        onClick={handleDecline}
+        className="min-h-11 rounded-[16px] border border-white/8 bg-white/5 px-6 py-2 font-semibold text-slate-200 transition hover:bg-white/8"
+      >
+        {t("comboShortcut.decline")}
       </button>
     </div>
   );

@@ -810,6 +810,11 @@ pub enum GameAction {
     RespondToShortcut {
         response: crate::analysis::loop_check::ShortcutResponse,
     },
+    /// CR 732.2a: the priority holder MAY decline the auto-offered loop shortcut
+    /// ("the player with priority may suggest a shortcut" — suggesting is optional).
+    /// Restores ordinary priority instead of forcing a proposal. Carries no payload
+    /// (no template/count/response — it is the absence of a proposal).
+    DeclineShortcut,
 }
 
 /// CR 117.3d: The mutation a `GameAction::SetPriorityYield` performs on the
@@ -1511,6 +1516,7 @@ impl GameAction {
             // single permanent.
             | GameAction::DeclareShortcut { .. }
             | GameAction::RespondToShortcut { .. }
+            | GameAction::DeclineShortcut
             | GameAction::ChooseActivationCostBranch { .. } => None,
         }
     }

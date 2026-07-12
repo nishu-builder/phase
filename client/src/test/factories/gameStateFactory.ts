@@ -313,6 +313,7 @@ export const loopShortcutWaitingForFactory = Factory.define<LoopShortcutWaitingF
     schema: {
       iteration_count: "UntilLethal",
       points: [],
+      convoke_tappable_count: 0,
     },
   },
 }));
@@ -327,13 +328,24 @@ export const buildLoopShortcutWaitingFor = ({
   schema?: Partial<ShortcutDecisionSchema>;
 } = {}): LoopShortcutWaitingFor => {
   const waitingFor = loopShortcutWaitingForFactory.build();
+  const mergedSchema = { ...waitingFor.data.schema, ...schema };
+  // The engine owns convoke_tappable_count (build_shortcut_schema sums the ConvokeTaps
+  // tappable lengths); mirror that here so overriding `points` keeps the count consistent
+  // and the modal — which reads the field directly — renders the matching value.
+  mergedSchema.convoke_tappable_count = mergedSchema.points.reduce(
+    (total, point) =>
+      typeof point.kind === "object" && "ConvokeTaps" in point.kind
+        ? total + point.kind.ConvokeTaps.tappable.length
+        : total,
+    0,
+  );
   return {
     ...waitingFor,
     data: {
       ...waitingFor.data,
       ...(controller === undefined ? {} : { controller }),
       certificate: { ...waitingFor.data.certificate, ...certificate },
-      schema: { ...waitingFor.data.schema, ...schema },
+      schema: mergedSchema,
     },
   };
 };

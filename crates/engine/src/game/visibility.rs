@@ -444,7 +444,7 @@ pub fn filter_state_for_viewer(state: &GameState, viewer: PlayerId) -> GameState
                         && !private_look_visible.contains(&id)
                 })
             };
-            let points = schema
+            let points: Vec<DecisionPoint> = schema
                 .points
                 .iter()
                 .map(|point| {
@@ -478,12 +478,24 @@ pub fn filter_state_for_viewer(state: &GameState, viewer: PlayerId) -> GameState
                     }
                 })
                 .collect();
+            // CR 702.51a: recompute the convoke count from the redacted points so the invariant
+            // "count == sum of this schema's tappable lengths" holds after visibility filtering
+            // (ConvokeTaps are public battlefield objects and are not redacted, so this equals
+            // the pre-filter count today; recomputing keeps it correct if that ever changes).
+            let convoke_tappable_count = points
+                .iter()
+                .filter_map(|p| match &p.kind {
+                    DecisionPointKind::ConvokeTaps { tappable } => Some(tappable.len()),
+                    _ => None,
+                })
+                .sum();
             filtered.waiting_for = WaitingFor::LoopShortcut {
                 controller,
                 certificate: certificate.clone(),
                 schema: ShortcutDecisionSchema {
                     iteration_count: schema.iteration_count.clone(),
                     points,
+                    convoke_tappable_count,
                 },
             };
         }
