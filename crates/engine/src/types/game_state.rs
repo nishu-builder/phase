@@ -4294,11 +4294,15 @@ pub enum WaitingFor {
     },
     /// CR 732.2a: the interactive loop-shortcut OFFER. Raised (only under
     /// `LoopDetectionMode::Interactive`) when the reconcile bridge confirms an OPTIONAL
-    /// determinate winning drain — the player with priority (`controller`, the loop's
-    /// determinate winner) may declare the shortcut. `acting_player()` routes to
-    /// `controller`. The `certificate` is the confirmed loop's public summary.
+    /// loop. The player with priority (`proposer`) may declare the shortcut; the measured
+    /// `predicted_winner`, when present, remains distinct because the priority holder need
+    /// not be the player expected to win. `acting_player()` routes to `proposer`. The
+    /// `certificate` is the confirmed loop's public summary.
     LoopShortcut {
-        controller: PlayerId,
+        proposer: PlayerId,
+        /// The winner measured by the offer-time loop detector. Object-growth offers that
+        /// establish unbounded advantage without a determinate winner carry `None`.
+        predicted_winner: Option<PlayerId>,
         certificate: crate::analysis::loop_check::LoopCertificate,
         /// CR 732.2a: the READ-side decision schema the frontend renders to declare the
         /// shortcut (open per-iteration choices + their legal option sets). Built against the
@@ -5478,10 +5482,9 @@ impl WaitingFor {
             // CR 702.132a: the assisting (chosen) player acts on the payment step,
             // not the caster — route authorization to them.
             WaitingFor::AssistPayment { chosen, .. } => Some(*chosen),
-            // CR 732.2a: the loop-shortcut proposer is the loop's determinate winner,
-            // carried in `controller` (not a `player` field) — dedicated arm like
-            // `AssistPayment`.
-            WaitingFor::LoopShortcut { controller, .. } => Some(*controller),
+            // CR 732.2a: the loop-shortcut proposer is the player with priority, carried
+            // in `proposer` (not a `player` field) — dedicated arm like `AssistPayment`.
+            WaitingFor::LoopShortcut { proposer, .. } => Some(*proposer),
             WaitingFor::GameOver { .. } => None,
         }
     }

@@ -361,10 +361,16 @@ fn interactive_3p_optional_cascade_apnap_accept_win() {
         runner.state().waiting_for.clone(),
         "drive stopped at a non-priority state"
     );
-    let WaitingFor::LoopShortcut { controller, .. } = wf else {
+    let WaitingFor::LoopShortcut {
+        proposer,
+        predicted_winner,
+        ..
+    } = wf
+    else {
         panic!("Interactive optional cascade must OFFER a LoopShortcut, got {wf:?}");
     };
-    assert_eq!(controller, P0, "the proposer is the determinate winner P0");
+    assert_eq!(proposer, P0, "P0 has priority and proposes the shortcut");
+    assert_eq!(predicted_winner, Some(P0), "the detector predicts P0 wins");
     // Fired early — both opponents alive at positive life (ω shortcut, not natural death).
     assert!(
         life(&runner, P1) > 0 && life(&runner, P2) > 0 && !is_eliminated(&runner, P1),
@@ -419,6 +425,85 @@ fn interactive_3p_optional_cascade_apnap_accept_win() {
     );
 }
 
+/// CR 732.2a: a shortcut belongs to the player with priority, not necessarily the player
+/// whose loop will win. P1 starts the proven P0-controlled drain on P1's turn, so the live
+/// bridge must offer P1 the choice while retaining P0 as the measured winner. This drives the
+/// full cast → detection → authorization → APNAP → crown pipeline; assigning the offer to the
+/// winner instead makes P0's intentionally unauthorized declaration succeed and this test fail.
+#[test]
+fn interactive_offer_separates_priority_proposer_from_predicted_winner() {
+    let mut scenario = GameScenario::new_n_player(2, 7);
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_life(P0, 20);
+    scenario.with_life(P1, 20);
+    scenario.add_creature_from_oracle(P0, "Test Drain Cleric", 2, 2, DRAIN_CLERIC);
+    scenario.add_creature_from_oracle(P0, "Test Blood Sipper", 2, 2, BLOOD_SIPPER);
+    scenario.add_basic_land(P1, ManaColor::Red);
+    scenario.add_bolt_to_hand(P1);
+    let kickoff = scenario
+        .add_spell_to_hand_from_oracle(P1, "P1 Lifegain Kickoff", false, KICKOFF)
+        .id();
+    let mut runner = scenario.build();
+    runner.state_mut().loop_detection = LoopDetectionMode::Interactive;
+    runner.state_mut().active_player = P1;
+    runner.state_mut().priority_player = P1;
+    runner.state_mut().waiting_for = WaitingFor::Priority { player: P1 };
+
+    let _ = runner.cast(kickoff).resolve();
+    let (_events, wf) = drive_collect(&mut runner, 500);
+    let WaitingFor::LoopShortcut {
+        proposer,
+        predicted_winner,
+        ..
+    } = wf
+    else {
+        panic!("P1's priority window must receive a LoopShortcut offer, got {wf:?}");
+    };
+    assert_eq!(
+        proposer, P1,
+        "CR 732.2a routes the offer to the priority holder"
+    );
+    assert_eq!(
+        predicted_winner,
+        Some(P0),
+        "the public outcome remains P0's win"
+    );
+
+    let wrong = apply(
+        runner.state_mut(),
+        P0,
+        GameAction::DeclareShortcut {
+            count: IterationCount::UntilLethal,
+            template: None,
+        },
+    );
+    assert!(
+        matches!(wrong, Err(EngineError::WrongPlayer)),
+        "the predicted winner cannot propose while P1 holds priority, got {wrong:?}"
+    );
+
+    runner
+        .act(GameAction::DeclareShortcut {
+            count: IterationCount::UntilLethal,
+            template: None,
+        })
+        .expect("P1 may propose the shortcut from its priority window");
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::RespondToShortcut { player, .. } if player == P0
+    ));
+    runner
+        .act(GameAction::RespondToShortcut {
+            response: ShortcutResponse::Accept,
+        })
+        .expect("P0 accepts the proposal that predicts its own win");
+    assert_eq!(
+        runner.state().waiting_for,
+        WaitingFor::GameOver { winner: Some(P0) },
+        "the measured winner, not the proposer, is crowned"
+    );
+}
+
 // ─────────────────────────── T-3p-draw ────────────────────────────
 
 /// T-3p-draw: a ≥3p MANDATORY, net-progress, no-loss, unstoppable loop draws under
@@ -463,10 +548,10 @@ fn interactive_shorten_hands_priority_and_breaks_loop() {
     let _ = runner.cast(kickoff).resolve();
     let (_events, wf) = drive_collect(&mut runner, 500);
 
-    let WaitingFor::LoopShortcut { controller, .. } = wf else {
+    let WaitingFor::LoopShortcut { proposer, .. } = wf else {
         panic!("optional drain must OFFER a LoopShortcut, got {wf:?}");
     };
-    assert_eq!(controller, P0);
+    assert_eq!(proposer, P0);
 
     runner
         .act(GameAction::DeclareShortcut {
@@ -573,11 +658,11 @@ fn interactive_optional_drain_decline_restores_priority_no_reoffer() {
     // a fixture drift that never offers would let DeclineShortcut hit the apply wildcard and
     // pass assertion (c) vacuously.
     assert!(
-        matches!(wf, WaitingFor::LoopShortcut { controller, .. } if controller == P0),
+        matches!(wf, WaitingFor::LoopShortcut { proposer, .. } if proposer == P0),
         "optional drain must OFFER a LoopShortcut to P0, got {wf:?}"
     );
 
-    // CR 732.2a: the controller (P0) declines the offer.
+    // CR 732.2a: the proposer (P0) declines the offer.
     let decline = runner
         .act(GameAction::DeclineShortcut)
         .expect("P0 declines the shortcut");
@@ -615,14 +700,14 @@ fn interactive_optional_drain_decline_restores_priority_no_reoffer() {
 // ───────────────────── T-declare-roundtrip ─────────────────────────
 
 /// T-declare-roundtrip: each protocol action is accepted only from its authorized actor —
-/// `DeclareShortcut` from the controller, `RespondToShortcut` from the current responder.
+/// `DeclareShortcut` from the proposer, `RespondToShortcut` from the current responder.
 /// A wrong actor is rejected with `WrongPlayer`.
 #[test]
 fn declare_and_respond_authorization() {
     let (mut runner, kickoff) = setup_3p_optional_cascade(LoopDetectionMode::Interactive);
     let _ = runner.cast(kickoff).resolve();
     let (_events, wf) = drive_collect(&mut runner, 500);
-    assert!(matches!(wf, WaitingFor::LoopShortcut { controller, .. } if controller == P0));
+    assert!(matches!(wf, WaitingFor::LoopShortcut { proposer, .. } if proposer == P0));
 
     // Wrong actor for DeclareShortcut (an opponent) → rejected.
     let wrong = apply(
@@ -653,7 +738,7 @@ fn declare_and_respond_authorization() {
         panic!("expected a RespondToShortcut prompt");
     };
 
-    // Wrong actor for RespondToShortcut (the controller) → rejected.
+    // Wrong actor for RespondToShortcut (the proposer) → rejected.
     let wrong2 = apply(
         runner.state_mut(),
         P0,
@@ -663,7 +748,7 @@ fn declare_and_respond_authorization() {
     );
     assert!(
         matches!(wrong2, Err(EngineError::WrongPlayer)),
-        "the controller may not answer their own shortcut offer, got {wrong2:?}"
+        "the proposer may not answer their own shortcut offer, got {wrong2:?}"
     );
 
     // Correct actor (the prompted opponent) → accepted.
@@ -679,7 +764,7 @@ fn declare_and_respond_authorization() {
     // RIDER-2 — CR 732.2a decline authorization (fresh runner: the flow above consumed the
     // offer). `DeclineShortcut` is a normal protocol action dispatched via the
     // `(waiting_for, action)` match; `check_actor_authorization` (engine.rs:225) runs BEFORE
-    // `apply_action` and keys on `WaitingFor::LoopShortcut.acting_player` == the controller.
+    // `apply_action` and keys on `WaitingFor::LoopShortcut.acting_player` == the proposer.
     // Unlike `Concede`/`Debug`, `DeclineShortcut` is NOT on any pre-match early-return
     // allowlist, so a wrong actor is rejected with the SPECIFIC `WrongPlayer` — proving the
     // decline genuinely routes THROUGH the auth firewall (a vacuous "not accepted" would also
@@ -688,8 +773,8 @@ fn declare_and_respond_authorization() {
     let _ = drunner.cast(dkickoff).resolve();
     let (_de, dwf) = drive_collect(&mut drunner, 500);
     assert!(
-        matches!(dwf, WaitingFor::LoopShortcut { controller, .. } if controller == P0),
-        "decline-auth precondition: the offer must be reached with controller P0, got {dwf:?}"
+        matches!(dwf, WaitingFor::LoopShortcut { proposer, .. } if proposer == P0),
+        "decline-auth precondition: the offer must be reached with proposer P0, got {dwf:?}"
     );
 
     // Wrong actor for DeclineShortcut (an opponent) → the concrete WrongPlayer error.
@@ -700,26 +785,26 @@ fn declare_and_respond_authorization() {
     );
     // The rejected action left the offer intact (no state mutation on an auth reject).
     assert!(
-        matches!(drunner.state().waiting_for, WaitingFor::LoopShortcut { controller, .. } if controller == P0),
+        matches!(drunner.state().waiting_for, WaitingFor::LoopShortcut { proposer, .. } if proposer == P0),
         "a rejected wrong-actor decline must not disturb the offer, got {:?}",
         drunner.state().waiting_for
     );
 
-    // Correct actor (the controller P0) → accepted; ordinary priority handed back.
+    // Correct actor (the proposer P0) → accepted; ordinary priority handed back.
     apply(drunner.state_mut(), P0, GameAction::DeclineShortcut).expect("P0 declines");
     assert!(
         matches!(drunner.state().waiting_for, WaitingFor::Priority { .. }),
-        "the controller's decline hands ordinary priority back, got {:?}",
+        "the proposer's decline hands ordinary priority back, got {:?}",
         drunner.state().waiting_for
     );
 }
 
 // ─────────────────── T-variant-housekeeping ────────────────────────
 
-/// T-variant-housekeeping: `WaitingFor::LoopShortcut{controller}.acting_player()` reads the
-/// `controller` field (routing authorization to the proposer), not a constant.
+/// T-variant-housekeeping: `WaitingFor::LoopShortcut{proposer}.acting_player()` reads the
+/// `proposer` field (routing authorization to the proposer), not a constant.
 #[test]
-fn loop_shortcut_acting_player_reads_controller() {
+fn loop_shortcut_acting_player_reads_proposer() {
     let cert = LoopCertificate {
         unbounded: vec![],
         win_kind: WinKind::LethalDamage,
@@ -727,13 +812,15 @@ fn loop_shortcut_acting_player_reads_controller() {
         residual_board_delta: BoardDelta::default(),
     };
     let wf_a = WaitingFor::LoopShortcut {
-        controller: P1,
+        proposer: P1,
+        predicted_winner: Some(P0),
         certificate: cert.clone(),
         schema: ShortcutDecisionSchema::default(),
     };
     let wf_b = WaitingFor::LoopShortcut {
-        controller: P2,
-        certificate: cert,
+        proposer: P2,
+        predicted_winner: None,
+        certificate: cert.clone(),
         schema: ShortcutDecisionSchema::default(),
     };
     assert_eq!(wf_a.acting_player(), Some(P1));
@@ -741,7 +828,8 @@ fn loop_shortcut_acting_player_reads_controller() {
 
     // And RespondToShortcut routes to its `player`.
     let proposal = ShortcutProposal {
-        controller: P0,
+        proposer: P0,
+        predicted_winner: Some(P0),
         count: IterationCount::UntilLethal,
         unbounded: vec![],
         win_kind: WinKind::LethalDamage,
@@ -753,28 +841,48 @@ fn loop_shortcut_acting_player_reads_controller() {
         proposal,
     };
     assert_eq!(wf_r.acting_player(), Some(P2));
+
+    // Turn-control sibling: P0 controls P1's turn, so it is the authorized transport
+    // submitter for P1's priority-held offer even though P0 is also the predicted winner.
+    // The proposal authority remains P1; only the player who submits P1's choice changes.
+    let mut delegated = GameState::new_two_player(42);
+    delegated.active_player = P1;
+    delegated.priority_player = P0;
+    delegated.turn_decision_controller = Some(P0);
+    delegated.waiting_for = WaitingFor::LoopShortcut {
+        proposer: P1,
+        predicted_winner: Some(P0),
+        certificate: cert.clone(),
+        schema: ShortcutDecisionSchema::default(),
+    };
+    apply(&mut delegated, P0, GameAction::DeclineShortcut)
+        .expect("the turn controller may submit the priority holder's decline");
+    assert!(
+        matches!(delegated.waiting_for, WaitingFor::Priority { player } if player == P1),
+        "declining under turn control returns the semantic priority holder P1 to ordinary play"
+    );
 }
 
-// ─────────────── T-concede-controller (F1 revert-guard) ────────────────
+// ─────────────── T-concede-proposer (F1 revert-guard) ────────────────
 
 /// The latched proposer P0 concedes DURING the open APNAP window. `Concede` bypasses the
-/// `WaitingFor` dispatch (engine.rs), so `proposal.controller` is never re-validated, and
+/// `WaitingFor` dispatch (engine.rs), so `proposal.proposer` is never re-validated, and
 /// because the acting player (P1) is still alive the elimination self-heal leaves the stale
-/// offer standing. When the last opponent accepts, the controller-liveness guard in
+/// offer standing. When the last opponent accepts, the proposer-liveness guard in
 /// `apply_confirmed_shortcut` (F1) must REFUSE to crown the departed proposer — CR 104.3a (a
 /// player who conceded has lost and cannot be crowned), CR 104.2a (the winner must still be
 /// in the game), CR 800.4a (the proposer's loop objects have already left the game) — and
 /// hand priority back instead. Reverting F1 makes P2's Accept crown
 /// `GameOver{winner: Some(P0)}`, a departed winner, which this test forbids.
 #[test]
-fn interactive_controller_concede_mid_apnap_does_not_crown_departed() {
+fn interactive_proposer_concede_mid_apnap_does_not_crown_departed() {
     let (mut runner, kickoff) = setup_3p_optional_cascade(LoopDetectionMode::Interactive);
     let _ = runner.cast(kickoff).resolve();
     let (_events, wf) = drive_collect(&mut runner, 500);
-    let WaitingFor::LoopShortcut { controller, .. } = wf else {
+    let WaitingFor::LoopShortcut { proposer, .. } = wf else {
         panic!("optional cascade must OFFER a LoopShortcut, got {wf:?}");
     };
-    assert_eq!(controller, P0, "the proposer is the determinate winner P0");
+    assert_eq!(proposer, P0, "P0 proposes while it has priority");
 
     // P0 declares → APNAP window opens on P1, with P2 queued behind.
     runner
@@ -799,7 +907,7 @@ fn interactive_controller_concede_mid_apnap_does_not_crown_departed() {
 
     // The latched proposer P0 concedes MID-window (CR 104.3a: leaves + loses immediately).
     // The acting player is P1 (alive), so the elimination self-heal does NOT prune the
-    // stale proposal — the window survives with a now-departed `proposal.controller`.
+    // stale proposal — the window survives with a now-departed `proposal.proposer`.
     runner
         .act(GameAction::Concede { player_id: P0 })
         .expect("P0 concedes");
@@ -835,7 +943,7 @@ fn interactive_controller_concede_mid_apnap_does_not_crown_departed() {
         })
         .expect("P2 accepts (last)");
 
-    // F1: the controller-liveness guard refuses to crown the departed P0 and hands
+    // F1: the proposer-liveness guard refuses to crown the departed P0 and hands
     // priority back for a later LIVE re-detect. Reverting F1 flips this to
     // GameOver{winner: Some(P0)}.
     assert_ne!(
@@ -880,10 +988,10 @@ fn interactive_queued_opponent_concede_no_deadlock() {
     let (mut runner, kickoff) = setup_3p_optional_cascade(LoopDetectionMode::Interactive);
     let _ = runner.cast(kickoff).resolve();
     let (_events, wf) = drive_collect(&mut runner, 500);
-    let WaitingFor::LoopShortcut { controller, .. } = wf else {
+    let WaitingFor::LoopShortcut { proposer, .. } = wf else {
         panic!("optional cascade must OFFER a LoopShortcut, got {wf:?}");
     };
-    assert_eq!(controller, P0, "the proposer is the determinate winner P0");
+    assert_eq!(proposer, P0, "P0 proposes while it has priority");
 
     runner
         .act(GameAction::DeclareShortcut {
@@ -1083,10 +1191,10 @@ fn vito_2p_optional_offer_declare_crowns() {
     let _ = runner.cast(kickoff).resolve();
     let (_events, wf) = drive_collect(&mut runner, 2000);
 
-    let WaitingFor::LoopShortcut { controller, .. } = wf else {
+    let WaitingFor::LoopShortcut { proposer, .. } = wf else {
         panic!("optional 2p Vito drain must OFFER a LoopShortcut, got {wf:?}");
     };
-    assert_eq!(controller, P0, "the proposer is the determinate winner P0");
+    assert_eq!(proposer, P0, "P0 has priority and proposes the shortcut");
     // Reach-guard: the offer fired EARLY (P1 alive-positive), not at a natural death.
     assert!(
         life(&runner, P1) > 0 && !is_eliminated(&runner, P1),
@@ -1132,7 +1240,8 @@ fn injected_3p_one_faller_no_crown() {
 
     // Inject the offer this subset-lethal loop never raises naturally, then confirm it.
     runner.state_mut().waiting_for = WaitingFor::LoopShortcut {
-        controller: P0,
+        proposer: P0,
+        predicted_winner: Some(P0),
         certificate: synthetic_lethal_cert(),
         schema: ShortcutDecisionSchema::default(),
     };
@@ -1181,7 +1290,7 @@ fn object_growth_advantage_untillethal_no_crown() {
         .resolve();
 
     assert!(
-        matches!(runner.state().waiting_for, WaitingFor::LoopShortcut { controller, .. } if controller == P0),
+        matches!(runner.state().waiting_for, WaitingFor::LoopShortcut { proposer, predicted_winner, .. } if proposer == P0 && predicted_winner.is_none()),
         "the object-growth cast must OFFER a LoopShortcut to P0, got {:?}",
         runner.state().waiting_for
     );
@@ -1262,7 +1371,8 @@ fn declare_illegal_pin_falls_back_legal_ingests() {
     // ILLEGAL half: pin Player(P2), not in the offered legal set ⇒ rejected to Priority.
     let (mut runner, _kickoff) = setup_3p_draw(LoopDetectionMode::Interactive);
     runner.state_mut().waiting_for = WaitingFor::LoopShortcut {
-        controller: P0,
+        proposer: P0,
+        predicted_winner: Some(P0),
         certificate: synthetic_lethal_cert(),
         schema: schema.clone(),
     };
@@ -1281,7 +1391,8 @@ fn declare_illegal_pin_falls_back_legal_ingests() {
     // LEGAL half (reach-guard, not always-reject): pin Player(P1) ⇒ RespondToShortcut opens.
     let (mut runner2, _kickoff2) = setup_3p_draw(LoopDetectionMode::Interactive);
     runner2.state_mut().waiting_for = WaitingFor::LoopShortcut {
-        controller: P0,
+        proposer: P0,
+        predicted_winner: Some(P0),
         certificate: synthetic_lethal_cert(),
         schema,
     };
@@ -1328,7 +1439,8 @@ fn injected_3p_unequal_life_pin_all_no_crown() {
             "equal per-cycle deltas preserve the pairwise life gap"
         );
         runner.state_mut().waiting_for = WaitingFor::LoopShortcut {
-            controller: P0,
+            proposer: P0,
+            predicted_winner: Some(P0),
             certificate: synthetic_lethal_cert(),
             schema: ShortcutDecisionSchema::default(),
         };
@@ -1372,10 +1484,10 @@ fn reach_2p_optional_drain_offer() -> (GameRunner, i32, ObjectId) {
         setup_2p_optional_drain(LoopDetectionMode::Interactive);
     let _ = runner.cast(kickoff).resolve();
     let (_events, wf) = drive_collect(&mut runner, 500);
-    let WaitingFor::LoopShortcut { controller, .. } = wf else {
+    let WaitingFor::LoopShortcut { proposer, .. } = wf else {
         panic!("optional drain must OFFER a LoopShortcut, got {wf:?}");
     };
-    assert_eq!(controller, P0, "the proposer is the determinate winner P0");
+    assert_eq!(proposer, P0, "P0 has priority and proposes the shortcut");
     let l0 = life(&runner, P1);
     (runner, l0, cleric)
 }
@@ -1920,16 +2032,18 @@ fn interactive_poison_axis_surfaces_in_offer_certificate() {
     let _ = runner.cast(kickoff).resolve();
     let (_events, wf) = drive_collect(&mut runner, 500);
 
-    // (1) Path A OFFERED (not an auto-win): the proposer is the determinate winner P0.
+    // (1) Path A OFFERED (not an auto-win): P0 has priority and is the predicted winner.
     let WaitingFor::LoopShortcut {
-        controller,
+        proposer,
+        predicted_winner,
         certificate,
         ..
     } = wf.clone()
     else {
         panic!("optional drain-poison loop must OFFER a LoopShortcut, got {wf:?}");
     };
-    assert_eq!(controller, P0, "the proposer is the determinate winner P0");
+    assert_eq!(proposer, P0, "P0 has priority and proposes the shortcut");
+    assert_eq!(predicted_winner, Some(P0), "the detector predicts P0 wins");
 
     // (2) Positive reach-guard (non-vacuity): the offer fired EARLY (not the natural CR 704.5c
     // 10-poison SBA), and the poison axis genuinely MOVED — P1 bears >=1 poison but <10 and is
@@ -2210,10 +2324,10 @@ fn low2_smart_shortcut_self_preservation() {
     let (mut runner, kickoff) = setup_3p_optional_cascade(LoopDetectionMode::Interactive);
     let _ = runner.cast(kickoff).resolve();
     let (_events, wf) = drive_collect(&mut runner, 500);
-    let WaitingFor::LoopShortcut { controller, .. } = wf else {
+    let WaitingFor::LoopShortcut { proposer, .. } = wf else {
         panic!("optional cascade must OFFER a LoopShortcut, got {wf:?}");
     };
-    assert_eq!(controller, P0);
+    assert_eq!(proposer, P0);
     runner
         .act(GameAction::DeclareShortcut {
             count: IterationCount::UntilLethal,
@@ -2387,7 +2501,8 @@ fn object_growth_51st_sprout_swarm_covers_and_offers() {
     assert!(
         matches!(
             outcome.final_waiting_for(),
-            WaitingFor::LoopShortcut { controller, .. } if *controller == P0
+            WaitingFor::LoopShortcut { proposer, predicted_winner, .. }
+                if *proposer == P0 && predicted_winner.is_none()
         ),
         "expected LoopShortcut offer to P0, got {:?}",
         outcome.final_waiting_for()
@@ -2495,7 +2610,7 @@ fn object_growth_51st_materializes_five_saprolings_on_accept() {
     );
     let at_offer = saproling_count(runner.state());
 
-    // P0 (LoopShortcut.controller — inferred submitter) declares a Fixed(5) shortcut; the
+    // P0 (LoopShortcut.proposer — inferred submitter) declares a Fixed(5) shortcut; the
     // template is rederived from `last_recast_context`.
     runner
         .act(GameAction::DeclareShortcut {
@@ -2558,7 +2673,7 @@ fn object_growth_sprout_swarm_decline_restores_priority_no_reoffer() {
     // F2 positive reach-guard: the object-growth offer was genuinely reached, and its routing
     // context is set (the Seam-2 gate the decline must clear).
     assert!(
-        matches!(runner.state().waiting_for, WaitingFor::LoopShortcut { controller, .. } if controller == P0),
+        matches!(runner.state().waiting_for, WaitingFor::LoopShortcut { proposer, predicted_winner, .. } if proposer == P0 && predicted_winner.is_none()),
         "Sprout Swarm must OFFER a LoopShortcut to P0, got {:?}",
         runner.state().waiting_for
     );
@@ -3069,7 +3184,8 @@ fn loop_shortcut_schema_redacts_hidden_targets_for_non_controller() {
         residual_board_delta: BoardDelta::default(),
     };
     runner.state_mut().waiting_for = WaitingFor::LoopShortcut {
-        controller: P0,
+        proposer: P0,
+        predicted_winner: Some(P0),
         certificate: cert,
         schema,
     };

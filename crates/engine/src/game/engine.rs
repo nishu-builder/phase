@@ -450,11 +450,12 @@ fn reconcile_terminal_result(state: &mut GameState, result: &mut ActionResult) {
         && state.last_recast_context.is_some()
     {
         if let Some((certificate, schema)) = try_offer_object_growth_shortcut(state) {
-            let WaitingFor::Priority { player: controller } = state.waiting_for else {
+            let WaitingFor::Priority { player: proposer } = state.waiting_for else {
                 unreachable!("guarded by matches!(Priority) above")
             };
             state.waiting_for = WaitingFor::LoopShortcut {
-                controller,
+                proposer,
+                predicted_winner: None,
                 certificate,
                 schema,
             };
@@ -508,15 +509,19 @@ fn interactive_loop_bridge(state: &mut GameState, result: &mut ActionResult) {
             result.waiting_for = state.waiting_for.clone();
             match_flow::handle_game_over_transition(state);
         } else {
-            // CR 732.2a: OPTIONAL winning drain — OFFER the shortcut to the proposer (the
-            // determinate winner / priority holder). The certificate's residual is filled
-            // via the single `board_delta` population seam (non-empty on the ω path).
+            // CR 732.2a: OPTIONAL winning drain — only the player with priority may propose
+            // the shortcut. Keep that proposer distinct from the already-measured winner; a
+            // loop can be detected during a different player's priority window.
             let certificate = build_cert(prior.as_ref(), state, &delta, winner);
             // CR 732.2a: a non-targeted drain reifies no per-iteration player choice ⇒ carry an
             // empty pin list; only the `iteration_count` (from `win_kind`) is populated.
-            let schema = build_shortcut_schema(&[], certificate.win_kind, state, winner);
+            let WaitingFor::Priority { player: proposer } = state.waiting_for else {
+                unreachable!("interactive bridge only runs during priority")
+            };
+            let schema = build_shortcut_schema(&[], certificate.win_kind, state, proposer);
             state.waiting_for = WaitingFor::LoopShortcut {
-                controller: winner,
+                proposer,
+                predicted_winner: Some(winner),
                 certificate,
                 schema,
             };
@@ -829,10 +834,10 @@ fn living_priority_seat(state: &GameState) -> PlayerId {
 
 /// CR 732.2c + CR 704.5a: apply a confirmed loop shortcut. Reached ONLY on the Accept path
 /// (every living opponent accepted). CR 608.2b re-validation is satisfied BY CONSTRUCTION:
-/// the offer confirmed `proposal.controller` as the determinate winner over public board
+/// the offer confirmed `proposal.predicted_winner` as the determinate winner over public board
 /// state, and between the offer and the final Accept the dispatch admits ONLY the protocol
 /// actions (`DeclareShortcut`/`RespondToShortcut`), none of which touch the board — so the
-/// loop is provably still intact and `controller` is still the winner. (A live ring re-scan
+/// loop is provably still intact and the predicted winner remains valid. (A live ring re-scan
 /// here is unsound: intervening finalize/SBA/layer steps drift the paused state away from the
 /// sampled ring frames. The Shorten path — where a real board action CAN break the loop —
 /// deliberately hands priority instead of reaching here, and re-detection re-fires the bridge
@@ -841,8 +846,8 @@ fn living_priority_seat(state: &GameState) -> PlayerId {
 /// N whole cycles atomically, commits + stops early on a cross-lethal `GameOver` mid-drive, and
 /// falls back to manual play (priority to `living_priority_seat`) on any abort.
 ///
-/// The consumption-time controller-liveness guard below catches a `Concede` (CR 104.3a) or a
-/// `Debug` that ELIMINATES the proposer inside the still-open APNAP window. A `Debug` action
+/// The consumption-time proposer/winner-liveness guard below catches a `Concede` (CR 104.3a)
+/// or a `Debug` that ELIMINATES either authority inside the still-open APNAP window. A `Debug` action
 /// that drifts the board WITHOUT killing the proposer (e.g. debug-removing a loop permanent)
 /// is deliberately out of scope: `debug_mode` is sandbox god-mode that can already produce
 /// arbitrarily inconsistent states, so loop-shortcut soundness under arbitrary debug mutation
@@ -852,16 +857,15 @@ fn apply_confirmed_shortcut(
     result: &mut ActionResult,
     proposal: &crate::analysis::loop_check::ShortcutProposal,
 ) {
-    // CR 104.3a / CR 104.2a / CR 800.4a: re-validate the latched winner's liveness at
-    // consumption. The offer confirmed `proposal.controller` when it was built, but
-    // `GameAction::Concede` (and a board-mutating `Debug`) bypass the `WaitingFor`
-    // dispatch and can remove the proposer inside the still-open APNAP window without
-    // re-validating the latch. CR 104.3a: a player who conceded has lost the game and
-    // cannot be crowned; CR 104.2a: the winner must still be in the game; CR 800.4a: the
-    // departed proposer's loop objects have already left the game, so the loop has
-    // dissolved. Do NOT crown a departed proposer — hand priority back so a later reconcile
-    // beat re-detects a genuinely LIVE winner (or, correctly, none).
-    if !crate::game::players::is_alive(state, proposal.controller) {
+    // CR 104.3a / CR 104.2a / CR 800.4a: re-validate the proposer and any latched winner at
+    // consumption. `GameAction::Concede` (and a board-mutating `Debug`) bypass the WaitingFor
+    // dispatch, so either authority can leave during the APNAP window. A departed proposer
+    // invalidates the sequence they suggested; a departed predicted winner cannot be crowned.
+    if !crate::game::players::is_alive(state, proposal.proposer)
+        || proposal
+            .predicted_winner
+            .is_some_and(|winner| !crate::game::players::is_alive(state, winner))
+    {
         priority::reset_priority(state);
         // CR 800.4a: priority passes to the next player in turn order still in the game.
         // The departed proposer may have been the active player (elimination does not advance
@@ -959,13 +963,15 @@ fn apply_until_lethal_shortcut(
                     winner,
                     mut events,
                 } => {
-                    // Commit + stop ONLY when the mid-drive lethal crowns the proposer;
-                    // any other winner (or a draw) rolls back to manual play. `UntilLethal`
+                    // Commit + stop ONLY when the mid-drive lethal matches the winner measured
+                    // at offer time; any other winner (or a draw) rolls back to manual play. `UntilLethal`
                     // IS unbounded ⇒ mark the axes on the committed state (contrast the
                     // finite `Fixed(N)` cross-lethal, which does not).
-                    if winner == Some(proposal.controller) {
+                    if let Some(winner) =
+                        winner.filter(|winner| Some(*winner) == proposal.predicted_winner)
+                    {
                         let mut w = *s;
-                        w.mark_unbounded_loop(proposal.controller, &proposal.unbounded);
+                        w.mark_unbounded_loop(winner, &proposal.unbounded);
                         *state = w;
                         result.events.append(&mut events);
                         state.waiting_for = WaitingFor::GameOver { winner };
@@ -989,7 +995,7 @@ fn apply_until_lethal_shortcut(
         &crate::analysis::resource::ResourceVector::snapshot(&work),
     );
     match crate::analysis::loop_check::live_mandatory_loop_winner(&boundary, &work, &delta) {
-        Some(w) if w == proposal.controller => {
+        Some(winner) if Some(winner) == proposal.predicted_winner => {
             // F2 (CR 704.3 simultaneity): for ≥2 fallers, re-verify the offer's own pairwise
             // life-equality on the pre-drive faller lives. `live_mandatory_loop_winner`'s
             // ≥2-faller floor checks only per-cycle DELTAS, so a staggered-death unequal
@@ -1006,7 +1012,7 @@ fn apply_until_lethal_shortcut(
             {
                 until_lethal_fallback(state, result, committed);
             } else {
-                crown_until_lethal(state, result, proposal);
+                crown_until_lethal(state, result, proposal, winner);
             }
         }
         _ => until_lethal_fallback(state, result, committed),
@@ -1033,20 +1039,21 @@ fn fallers_of(
         .collect()
 }
 
-/// CR 732.2a + CR 704.5a: crown the proposer as the terminal winner of the confirmed
+/// CR 732.2a + CR 704.5a: crown the measured winner of the confirmed
 /// unbounded drain (the former UntilLethal-arm body). Persists the unbounded axes (the ∞ HUD
 /// producer) and declares the CR 704.5a win.
 fn crown_until_lethal(
     state: &mut GameState,
     result: &mut ActionResult,
     proposal: &crate::analysis::loop_check::ShortcutProposal,
+    winner: PlayerId,
 ) {
-    state.mark_unbounded_loop(proposal.controller, &proposal.unbounded);
+    state.mark_unbounded_loop(winner, &proposal.unbounded);
     result.events.push(GameEvent::GameOver {
-        winner: Some(proposal.controller),
+        winner: Some(winner),
     });
     state.waiting_for = WaitingFor::GameOver {
-        winner: Some(proposal.controller),
+        winner: Some(winner),
     };
     result.waiting_for = state.waiting_for.clone();
     match_flow::handle_game_over_transition(state);
@@ -1803,7 +1810,8 @@ fn materialize_object_growth_shortcut(
 /// opponents (solitaire / all eliminated) ⇒ take the shortcut immediately.
 fn handle_declare_shortcut(
     state: &mut GameState,
-    controller: PlayerId,
+    proposer: PlayerId,
+    predicted_winner: Option<PlayerId>,
     certificate: &crate::analysis::loop_check::LoopCertificate,
     count: crate::analysis::decision_template::IterationCount,
     template: Option<crate::analysis::decision_template::DecisionTemplate>,
@@ -1849,20 +1857,21 @@ fn handle_declare_shortcut(
         }
     }
     let proposal = crate::analysis::loop_check::ShortcutProposal {
-        controller,
+        proposer,
+        predicted_winner,
         count,
         unbounded: certificate.unbounded.clone(),
         win_kind: certificate.win_kind,
         template,
     };
-    // CR 732.2b: living opponents in APNAP turn order, starting after the controller.
+    // CR 732.2b: living opponents in APNAP turn order, starting after the proposer.
     let opps: Vec<PlayerId> = crate::game::players::apnap_order_from(
         state,
         Some(crate::types::ability::ControllerRef::You),
-        controller,
+        proposer,
     )
     .into_iter()
-    .filter(|&p| p != controller)
+    .filter(|&p| p != proposer)
     .collect();
     if let Some((&first, rest)) = opps.split_first() {
         state.waiting_for = WaitingFor::RespondToShortcut {
@@ -1900,9 +1909,9 @@ fn handle_declare_shortcut(
 ///   the genuinely load-bearing suppressor — without it the post-return reconcile re-fires
 ///   `try_offer_object_growth_shortcut` within this same `apply()`.
 ///
-/// A genuine re-recurrence or a fresh re-cast re-arms the offer naturally. Controller-only
+/// A genuine re-recurrence or a fresh re-cast re-arms the offer naturally. Proposer-only
 /// authorization is enforced upstream by `check_actor_authorization`
-/// (`WaitingFor::acting_player` == `LoopShortcut.controller`), so `controller` is unused here.
+/// (`WaitingFor::acting_player` == `LoopShortcut.proposer`), so offer fields are unused here.
 fn handle_decline_shortcut(
     state: &mut GameState,
     events: &mut Vec<GameEvent>,
@@ -4276,7 +4285,8 @@ fn apply_action(
         // threaded through — no longer dropped by `..`.
         (
             WaitingFor::LoopShortcut {
-                controller,
+                proposer,
+                predicted_winner,
                 certificate,
                 schema,
             },
@@ -4284,7 +4294,8 @@ fn apply_action(
         ) => {
             return handle_declare_shortcut(
                 state,
-                *controller,
+                *proposer,
+                *predicted_winner,
                 certificate,
                 count,
                 template,

@@ -60,11 +60,11 @@ export function waitingPlayer(waitingFor: WaitingFor | null): PlayerId | null {
     return waitingFor.data.chosen;
   }
   // CR 732.2a: LoopShortcut routes authorization to the proposer, whose data
-  // field is `controller` (not `player`); mirror engine `acting_player()`
+  // field is `proposer` (not `player`); mirror engine `acting_player()`
   // (game_state.rs). Without this the declare modal's actor gate returns false
   // and it never renders. `RespondToShortcut` carries `player` → default below.
   if (waitingFor.type === "LoopShortcut") {
-    return waitingFor.data.controller;
+    return waitingFor.data.proposer;
   }
   return "player" in waitingFor.data ? waitingFor.data.player : null;
 }

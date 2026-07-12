@@ -303,7 +303,8 @@ export const waitingForFactory = WaitingForFactory.define(
 export const loopShortcutWaitingForFactory = Factory.define<LoopShortcutWaitingFor>(() => ({
   type: "LoopShortcut",
   data: {
-    controller: 0,
+    proposer: 0,
+    predicted_winner: 0,
     certificate: {
       unbounded: [{ DamageDealt: 1 }],
       win_kind: "LethalDamage",
@@ -319,11 +320,13 @@ export const loopShortcutWaitingForFactory = Factory.define<LoopShortcutWaitingF
 }));
 
 export const buildLoopShortcutWaitingFor = ({
-  controller,
+  proposer,
+  predictedWinner,
   certificate,
   schema,
 }: {
-  controller?: PlayerId;
+  proposer?: PlayerId;
+  predictedWinner?: PlayerId | null;
   certificate?: Partial<LoopCertificate>;
   schema?: Partial<ShortcutDecisionSchema>;
 } = {}): LoopShortcutWaitingFor => {
@@ -343,7 +346,8 @@ export const buildLoopShortcutWaitingFor = ({
     ...waitingFor,
     data: {
       ...waitingFor.data,
-      ...(controller === undefined ? {} : { controller }),
+      ...(proposer === undefined ? {} : { proposer }),
+      ...(predictedWinner === undefined ? {} : { predicted_winner: predictedWinner }),
       certificate: { ...waitingFor.data.certificate, ...certificate },
       schema: mergedSchema,
     },
@@ -356,7 +360,8 @@ export const respondToShortcutWaitingForFactory =
     data: {
       player: 0,
       proposal: {
-        controller: 1,
+        proposer: 1,
+        predicted_winner: 1,
         count: "UntilLethal",
         unbounded: [{ DamageDealt: 1 }],
         win_kind: "LethalDamage",

@@ -212,7 +212,7 @@ export function aiActorFromWaitingFor(
   // multiplayer. This mirrors the `aiController.ts` fix for #2012. With no
   // turn-control effect, `priority_player === data.player` for every
   // single-acting state, so this is a no-op.
-  // CR 732.2a: LoopShortcut's data field is `controller`, not `player`; route to
+  // CR 732.2a: LoopShortcut's data field is `proposer`, not `player`; route to
   // the engine-derived authorized submitter (priority_player) exactly like the
   // `player in` states so an AI-owned controller seat drives the declare.
   return "player" in waitingFor.data || waitingFor.type === "LoopShortcut"

@@ -162,13 +162,13 @@ describe("LoopShortcutModal", () => {
   });
 
   // T7 (non-vacuity + MP-safety + site-1 revert-guard): a LoopShortcut whose
-  // controller is the opponent (seat 1) renders nothing for the local seat (0)
+  // proposer is the opponent (seat 1) renders nothing for the local seat (0)
   // and never dispatches. `turn_decision_controller: null` rules out the
   // delegated-turn branch, so the ONLY reason it null-renders is the seat gate.
-  // (If the usePlayerId site-1 fix were reverted, even a controller:0 offer would
+  // (If the usePlayerId site-1 fix were reverted, even a proposer:0 offer would
   // null-render → T1/T2 would fail — so those tests non-vacuously cover site-1.)
   it("renders nothing for a non-actor seat (T7)", () => {
-    seed(buildLoopShortcutWaitingFor({ controller: 1 }), {
+    seed(buildLoopShortcutWaitingFor({ proposer: 1 }), {
       turn_decision_controller: null,
       active_player: 0,
     });

@@ -163,7 +163,7 @@ export function createAIController(config: AIControllerConfig): AIController {
       if (
         !("data" in waitingFor) ||
         !waitingFor.data ||
-        // CR 732.2a: LoopShortcut carries `controller`, not `player`; still route
+        // CR 732.2a: LoopShortcut carries `proposer`, not `player`; still route
         // via the engine-derived `priority_player` like every `player in` state.
         (!("player" in waitingFor.data) && waitingFor.type !== "LoopShortcut")
       )

@@ -50,8 +50,8 @@ function FamilyBadges({ axes }: { axes: ResourceAxis[] }) {
 }
 
 /**
- * CR 732.2a: the loop's determinate winner (the controller) may declare the
- * shortcut OR decline it — "the player with priority may suggest a shortcut" is
+ * CR 732.2a: the priority holder (the proposer) may declare the shortcut OR decline it —
+ * "the player with priority may suggest a shortcut" is
  * optional. Declining dispatches `DeclineShortcut`, which restores ordinary
  * priority engine-side; the opponent-side escape hatch (accept/shorten) lives in
  * `RespondToShortcutModal`.

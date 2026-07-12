@@ -17,7 +17,7 @@ const seats: SeatKind[] = [
   { type: "Ai", data: { difficulty: "medium", deck: { type: "Random" } } },
 ];
 
-const loopShortcut = buildLoopShortcutWaitingFor({ controller: 1 });
+const loopShortcut = buildLoopShortcutWaitingFor({ proposer: 1 });
 
 // A data-carrying state that carries neither `player` nor is LoopShortcut
 // (AssistPayment routes on `caster`/`chosen`) — must return null. This is the
@@ -26,7 +26,7 @@ const loopShortcut = buildLoopShortcutWaitingFor({ controller: 1 });
 const assistPayment = buildAssistPaymentWaitingFor();
 
 describe("aiActorFromWaitingFor — LoopShortcut routing (T8)", () => {
-  it("routes a LoopShortcut offer to the authorized submitter (controller)", () => {
+  it("routes a LoopShortcut offer to the authorized submitter (proposer)", () => {
     // Revert-probe target: delete `|| waitingFor.type === "LoopShortcut"` in
     // aiActorFromWaitingFor and this returns null instead of 1 → this fails.
     expect(aiActorFromWaitingFor(loopShortcut, seats, 1)).toBe(1);

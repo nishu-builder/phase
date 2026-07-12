@@ -152,9 +152,13 @@ impl LoopCertificate {
 /// the proposer's declared count), so there is no hidden information to redact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShortcutProposal {
-    /// CR 732.2a: the player who proposed the shortcut (the loop's determinate winner /
-    /// priority holder). `WaitingFor::acting_player` on the offer routes to them.
-    pub controller: PlayerId,
+    /// CR 732.2a: the player with priority who proposed the shortcut. This is separate from
+    /// `predicted_winner`: a player may propose a shortcut whose deterministic outcome wins
+    /// the game for another player.
+    pub proposer: PlayerId,
+    /// The determinate winner measured when the offer was created. `None` represents an
+    /// advantage-only object-growth offer, which may be materialized but cannot be crowned.
+    pub predicted_winner: Option<PlayerId>,
     /// CR 732.1b: how many times to repeat before stopping. Phase 3 only ever proposes
     /// [`IterationCount::UntilLethal`] (a determinate CR 704.5a drain).
     pub count: IterationCount,

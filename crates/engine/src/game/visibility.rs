@@ -417,19 +417,20 @@ pub fn filter_state_for_viewer(state: &GameState, viewer: PlayerId) -> GameState
     }
 
     // CR 732.2a: redact hidden-info legal targets in a `LoopShortcut` OFFER for a viewer who is
-    // NOT the schema's controller. The schema is built against the controller's full view; this
+    // NOT the schema's proposer. The schema is built for the offer's public declaration; this
     // is the SOLE seam that removes a hidden-zone (hand/library) legal target from a viewer who
     // cannot legally see it. Public option sets (`ConvokeTaps` battlefield taps,
     // `TargetRef::Player`) are retained. The per-target drop reuses the EXACT hand-redaction
     // composite (`!is_visible_revealed_card && !private_look_visible`) keyed on each TARGET
     // object's owner + private zone — never the controller's visibility.
     if let WaitingFor::LoopShortcut {
-        controller,
+        proposer,
+        predicted_winner,
         ref certificate,
         ref schema,
     } = state.waiting_for
     {
-        if !can_view_private_for_player(controller) {
+        if !can_view_private_for_player(proposer) {
             use crate::analysis::decision_template::{
                 DecisionPoint, DecisionPointKind, ShortcutDecisionSchema,
             };
@@ -490,7 +491,8 @@ pub fn filter_state_for_viewer(state: &GameState, viewer: PlayerId) -> GameState
                 })
                 .sum();
             filtered.waiting_for = WaitingFor::LoopShortcut {
-                controller,
+                proposer,
+                predicted_winner,
                 certificate: certificate.clone(),
                 schema: ShortcutDecisionSchema {
                     iteration_count: schema.iteration_count.clone(),
