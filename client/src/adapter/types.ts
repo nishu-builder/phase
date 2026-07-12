@@ -710,6 +710,27 @@ export type MayTriggerAutoChoiceOp =
   | { type: "Remove"; data: { key: MayTriggerAutoChoiceKey } }
   | { type: "ClearAll" };
 
+// CR 603.3b: The mutation a `SetTriggerOrderTemplate` action performs on the
+// acting player's saved trigger-ordering templates. `Save` echoes the prompted
+// group's source object ids + the submitted permutation; `Remove` echoes a
+// stored key; `ClearAll` drops every saved template belonging to the acting
+// player. Mirrors engine `TriggerOrderTemplateOp` (types/actions.rs).
+export type TriggerOrderTemplateOp =
+  | { type: "Save"; data: { sources: ObjectId[]; order: number[] } }
+  | { type: "Remove"; data: { key: DecisionGroupKey } }
+  | { type: "ClearAll" };
+
+// CR 603.3b: Order-insensitive identity of a recurring decision group — the
+// canonical sorted (identity, multiplicity) source multiset plus its kind.
+// Mirrors engine `DecisionGroupKey` / `DecisionKind`
+// (analysis/decision_template.rs).
+export type DecisionKind = "TriggerOrdering" | "LoopChoice";
+
+export interface DecisionGroupKey {
+  sources: [DecisionSource, number][];
+  kind: DecisionKind;
+}
+
 // ── Casting Permission ───────────────────────────────────────────────────
 
 export type CastingPermission =
@@ -1900,6 +1921,8 @@ export type GameAction =
   | { type: "SetPhaseStops"; data: { stops: PhaseStop[] } }
   | { type: "SetPriorityYield"; data: { op: PriorityYieldOp } }
   | { type: "SetMayTriggerAutoChoice"; data: { op: MayTriggerAutoChoiceOp } }
+  // CR 603.3b: mirror engine GameAction::SetTriggerOrderTemplate (PR-7 phase-2 boundary sync).
+  | { type: "SetTriggerOrderTemplate"; data: { op: TriggerOrderTemplateOp } }
   | { type: "AssignCombatDamage"; data: { assignments: [ObjectId, number][]; trample_damage: number; controller_damage: number } }
   // CR 510.1d + CR 702.22k: blocker's combat-damage division among the attackers it blocks.
   | { type: "AssignBlockerDamage"; data: { assignments: [ObjectId, number][] } }
