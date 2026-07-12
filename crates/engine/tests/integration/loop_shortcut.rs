@@ -38,6 +38,7 @@ const P2: PlayerId = PlayerId(2);
 const DRAIN_CLERIC: &str = "Whenever you gain life, each opponent loses 1 life.";
 const BLOOD_SIPPER: &str = "Whenever an opponent loses life, you gain 1 life.";
 const KICKOFF: &str = "You gain 1 life.";
+const TARGETED_KICKOFF: &str = "Target player gains 1 life.";
 const SELF_LIFE_ENGINE: &str = "Whenever you gain life, you gain 1 life.";
 const LIFE_LOSS_IMMUNE: &str = "Your life total can't change.";
 
@@ -426,10 +427,11 @@ fn interactive_3p_optional_cascade_apnap_accept_win() {
 }
 
 /// CR 732.2a: a shortcut belongs to the player with priority, not necessarily the player
-/// whose loop will win. P1 starts the proven P0-controlled drain on P1's turn, so the live
-/// bridge must offer P1 the choice while retaining P0 as the measured winner. This drives the
-/// full cast → detection → authorization → APNAP → crown pipeline; assigning the offer to the
-/// winner instead makes P0's intentionally unauthorized declaration succeed and this test fail.
+/// whose loop will win. P1 starts the proven P0-controlled drain by making P0 gain life on
+/// P1's turn, so the live bridge must offer P1 the choice while retaining P0 as the measured
+/// winner. This drives the full cast → detection → authorization → APNAP → crown pipeline;
+/// assigning the offer to the winner instead makes P0's intentionally unauthorized declaration
+/// succeed and this test fail.
 #[test]
 fn interactive_offer_separates_priority_proposer_from_predicted_winner() {
     let mut scenario = GameScenario::new_n_player(2, 7);
@@ -441,7 +443,7 @@ fn interactive_offer_separates_priority_proposer_from_predicted_winner() {
     scenario.add_basic_land(P1, ManaColor::Red);
     scenario.add_bolt_to_hand(P1);
     let kickoff = scenario
-        .add_spell_to_hand_from_oracle(P1, "P1 Lifegain Kickoff", false, KICKOFF)
+        .add_spell_to_hand_from_oracle(P1, "P0 Lifegain Kickoff", false, TARGETED_KICKOFF)
         .id();
     let mut runner = scenario.build();
     runner.state_mut().loop_detection = LoopDetectionMode::Interactive;
@@ -449,7 +451,7 @@ fn interactive_offer_separates_priority_proposer_from_predicted_winner() {
     runner.state_mut().priority_player = P1;
     runner.state_mut().waiting_for = WaitingFor::Priority { player: P1 };
 
-    let _ = runner.cast(kickoff).resolve();
+    let _ = runner.cast(kickoff).target_player(P0).resolve();
     let (_events, wf) = drive_collect(&mut runner, 500);
     let WaitingFor::LoopShortcut {
         proposer,

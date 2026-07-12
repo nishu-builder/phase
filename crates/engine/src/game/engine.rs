@@ -974,7 +974,9 @@ fn apply_until_lethal_shortcut(
                         w.mark_unbounded_loop(winner, &proposal.unbounded);
                         *state = w;
                         result.events.append(&mut events);
-                        state.waiting_for = WaitingFor::GameOver { winner };
+                        state.waiting_for = WaitingFor::GameOver {
+                            winner: Some(winner),
+                        };
                         result.waiting_for = state.waiting_for.clone();
                     } else {
                         until_lethal_fallback(state, result, committed);
