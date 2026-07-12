@@ -416,6 +416,79 @@ pub fn filter_state_for_viewer(state: &GameState, viewer: PlayerId) -> GameState
         }
     }
 
+    // CR 732.2a: redact hidden-info legal targets in a `LoopShortcut` OFFER for a viewer who is
+    // NOT the schema's controller. The schema is built against the controller's full view; this
+    // is the SOLE seam that removes a hidden-zone (hand/library) legal target from a viewer who
+    // cannot legally see it. Public option sets (`ConvokeTaps` battlefield taps,
+    // `TargetRef::Player`) are retained. The per-target drop reuses the EXACT hand-redaction
+    // composite (`!is_visible_revealed_card && !private_look_visible`) keyed on each TARGET
+    // object's owner + private zone — never the controller's visibility.
+    if let WaitingFor::LoopShortcut {
+        controller,
+        ref certificate,
+        ref schema,
+    } = state.waiting_for
+    {
+        if !can_view_private_for_player(controller) {
+            use crate::analysis::decision_template::{
+                DecisionPoint, DecisionPointKind, ShortcutDecisionSchema,
+            };
+            use crate::types::ability::TargetRef;
+            // A target object is hidden from this viewer iff it sits in a private zone whose
+            // owner the viewer can't privately view AND it isn't otherwise revealed/peeked.
+            let target_hidden = |id: ObjectId| -> bool {
+                state.objects.get(&id).is_some_and(|obj| {
+                    matches!(obj.zone, Zone::Hand | Zone::Library)
+                        && !can_view_private_for_player(obj.owner)
+                        && !is_visible_revealed_card(state, id)
+                        && !private_look_visible.contains(&id)
+                })
+            };
+            let points = schema
+                .points
+                .iter()
+                .map(|point| {
+                    let kind = match &point.kind {
+                        DecisionPointKind::Targets { legal_targets } => {
+                            DecisionPointKind::Targets {
+                                legal_targets: legal_targets
+                                    .iter()
+                                    .filter(|t| match t {
+                                        TargetRef::Object(id) => !target_hidden(*id),
+                                        TargetRef::Player(_) => true,
+                                    })
+                                    .cloned()
+                                    .collect(),
+                            }
+                        }
+                        DecisionPointKind::ConvokeTaps { tappable } => {
+                            DecisionPointKind::ConvokeTaps {
+                                tappable: tappable.clone(),
+                            }
+                        }
+                        DecisionPointKind::Mode { available_modes } => DecisionPointKind::Mode {
+                            available_modes: available_modes.clone(),
+                        },
+                        DecisionPointKind::MayChoice => DecisionPointKind::MayChoice,
+                        DecisionPointKind::UnlessBreak => DecisionPointKind::UnlessBreak,
+                    };
+                    DecisionPoint {
+                        slot: point.slot.clone(),
+                        kind,
+                    }
+                })
+                .collect();
+            filtered.waiting_for = WaitingFor::LoopShortcut {
+                controller,
+                certificate: certificate.clone(),
+                schema: ShortcutDecisionSchema {
+                    iteration_count: schema.iteration_count.clone(),
+                    points,
+                },
+            };
+        }
+    }
+
     if let WaitingFor::DigChoice {
         player,
         library_owner,

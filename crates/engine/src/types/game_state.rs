@@ -4283,6 +4283,13 @@ pub enum WaitingFor {
     LoopShortcut {
         controller: PlayerId,
         certificate: crate::analysis::loop_check::LoopCertificate,
+        /// CR 732.2a: the READ-side decision schema the frontend renders to declare the
+        /// shortcut (open per-iteration choices + their legal option sets). Built against the
+        /// controller's full view at offer construction; hidden-info legal targets are redacted
+        /// per-viewer in `game::visibility::filter_state_for_viewer`. `#[serde(default)]` for
+        /// forward-compatible deserialization of pre-schema snapshots.
+        #[serde(default)]
+        schema: crate::analysis::decision_template::ShortcutDecisionSchema,
     },
     /// CR 732.2b/c: the APNAP accept-or-shorten window. After the proposer declares the
     /// shortcut, each other living player is prompted in turn order (drain-one-advance

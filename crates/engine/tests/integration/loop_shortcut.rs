@@ -14,14 +14,15 @@
 //! `match` perturbed even one event. Because the golden is pre-edit, this is not circular.
 
 use engine::analysis::decision_template::{
-    DecisionGroupKey, DecisionKind, DecisionSlot, DecisionTemplate, IterationCount, PinnedDecision,
-    ReplayMode, TargetPin, TargetSchedule,
+    DecisionGroupKey, DecisionKind, DecisionPoint, DecisionPointKind, DecisionSlot,
+    DecisionTemplate, IterationCount, PinnedDecision, ReplayMode, ShortcutDecisionSchema,
+    TargetPin, TargetSchedule,
 };
 use engine::analysis::loop_check::{LoopCertificate, ShortcutProposal, ShortcutResponse, WinKind};
 use engine::analysis::resource::{BoardDelta, ResourceAxis};
 use engine::game::engine::{apply, EngineError};
 use engine::game::scenario::{GameRunner, GameScenario};
-use engine::types::ability::Effect;
+use engine::types::ability::{Effect, TargetRef};
 use engine::types::actions::GameAction;
 use engine::types::events::GameEvent;
 use engine::types::game_state::{GameState, LoopDetectionMode, WaitingFor, YieldTarget};
@@ -623,10 +624,12 @@ fn loop_shortcut_acting_player_reads_controller() {
     let wf_a = WaitingFor::LoopShortcut {
         controller: P1,
         certificate: cert.clone(),
+        schema: ShortcutDecisionSchema::default(),
     };
     let wf_b = WaitingFor::LoopShortcut {
         controller: P2,
         certificate: cert,
+        schema: ShortcutDecisionSchema::default(),
     };
     assert_eq!(wf_a.acting_player(), Some(P1));
     assert_eq!(wf_b.acting_player(), Some(P2));
@@ -1443,6 +1446,7 @@ fn interactive_poison_axis_surfaces_in_offer_certificate() {
     let WaitingFor::LoopShortcut {
         controller,
         certificate,
+        ..
     } = wf.clone()
     else {
         panic!("optional drain-poison loop must OFFER a LoopShortcut, got {wf:?}");
@@ -2333,3 +2337,228 @@ fn object_growth_random_recast_body_does_not_offer() {
 // The branch-(a)/(b) sign-checks are fail-closed DEFENSIVE guards — live-unreachable in TODAY's
 // buyback-recast mechanism, NOT dead code; they fire the moment a future recast mechanism or a
 // per-recast energy/player-counter-drain card makes them reachable. Add a live fixture then.
+
+// ---------------------------------------------------------------------------
+// Stage 1 — ShortcutDecisionSchema on the LoopShortcut offer (T1/T2/T4/T6).
+// ---------------------------------------------------------------------------
+
+/// T1 ⭐: the object-growth (convoke-recast) offer carries exactly ONE `ConvokeTaps`
+/// decision-point whose `tappable` is the LIVE offer-time `is_convoke_eligible(P0)` set, and an
+/// optional-loop `Fixed(1)` iteration seed. Board-derivation (hostile): the creature TAPPED to
+/// pay convoke during the real cast is EXCLUDED; an untapped controlled creature is INCLUDED — a
+/// constant/hard-coded set could not track which creature was spent. Revert-probe: a builder
+/// that dropped the ConvokeTaps pin (empty points) or hard-coded the set fails these.
+#[test]
+fn object_growth_offer_schema_has_live_convoke_taps() {
+    let (mut runner, sprout, fodder) = sprout_swarm_scenario(4);
+    let outcome = runner
+        .cast(sprout)
+        .accept_optional() // pay buyback {3}
+        .convoke_with(&[fodder[0]]) // tap one green Saproling for the {G} pip
+        .commit()
+        .resolve();
+
+    let WaitingFor::LoopShortcut { schema, .. } = outcome.final_waiting_for() else {
+        panic!(
+            "expected a LoopShortcut offer, got {:?}",
+            outcome.final_waiting_for()
+        );
+    };
+
+    // Exactly one open decision-point, and it is the convoke tap set (Sprout Swarm has Convoke).
+    assert_eq!(
+        schema.points.len(),
+        1,
+        "one open decision-point (convoke), got {:?}",
+        schema.points
+    );
+    let DecisionPointKind::ConvokeTaps { tappable } = &schema.points[0].kind else {
+        panic!(
+            "expected a ConvokeTaps decision-point, got {:?}",
+            schema.points[0].kind
+        );
+    };
+    // Optional Advantage loop ⇒ Fixed(1) frontend count seed (not a determinate drain).
+    assert_eq!(schema.iteration_count, IterationCount::Fixed(1));
+
+    // The tappable set is LIVE-derived from the offer-time board: exactly the untapped creatures
+    // P0 controls (== is_convoke_eligible(P0)), compared as a set.
+    let expected: std::collections::BTreeSet<ObjectId> = outcome
+        .state()
+        .objects
+        .values()
+        .filter(|o| o.is_convoke_eligible(P0))
+        .map(|o| o.id)
+        .collect();
+    let got: std::collections::BTreeSet<ObjectId> = tappable.iter().copied().collect();
+    assert_eq!(
+        got, expected,
+        "tappable must equal the live is_convoke_eligible(P0) set"
+    );
+    assert!(
+        !expected.is_empty(),
+        "reach-guard: the convoke set is non-empty"
+    );
+
+    // Board-derivation (hostile): fodder[0] was TAPPED to pay convoke during the real cast, so it
+    // is EXCLUDED from the offer-time tap set, while an untapped controlled creature is INCLUDED.
+    assert!(
+        outcome.state().objects.get(&fodder[0]).unwrap().tapped,
+        "reach-guard: fodder[0] is tapped from paying convoke"
+    );
+    assert!(
+        !got.contains(&fodder[0]),
+        "the tapped convoke payer is excluded from the live tap set"
+    );
+    assert!(
+        got.contains(&fodder[1]),
+        "an untapped controlled creature is included"
+    );
+
+    // The point's slot binds the recast card's CR 400.7 AllCopies identity.
+    let ctx = outcome.state().last_recast_context.as_ref().unwrap();
+    assert_eq!(
+        schema.points[0].slot.source,
+        YieldTarget::AllCopies {
+            card_id: ctx.card_id,
+            trigger_description: None,
+        },
+        "the convoke slot binds the recast card identity"
+    );
+    let _ = sprout;
+}
+
+/// T2: a non-targeted drain offer reifies NO per-iteration decision-points (empty schema), and a
+/// determinate CR 704.5a lethal drain seeds `UntilLethal`. T1's non-empty ConvokeTaps set is the
+/// reach-guard against "the schema is always empty".
+#[test]
+fn drain_offer_schema_is_empty_until_lethal() {
+    let (runner, _l0, _cleric) = reach_2p_optional_drain_offer();
+    let WaitingFor::LoopShortcut { schema, .. } = &runner.state().waiting_for else {
+        panic!(
+            "expected a LoopShortcut offer, got {:?}",
+            runner.state().waiting_for
+        );
+    };
+    assert!(
+        schema.points.is_empty(),
+        "a non-targeted drain reifies no decision-points, got {:?}",
+        schema.points
+    );
+    assert_eq!(
+        schema.iteration_count,
+        IterationCount::UntilLethal,
+        "a determinate lethal drain repeats UntilLethal"
+    );
+}
+
+/// T4 ⭐ (SECURITY): a `LoopShortcut` schema's hidden-info legal targets are redacted per-viewer.
+/// The controller (P0) keeps every legal target; a non-controller (P2) loses ONLY the target
+/// that is a hidden card in an opponent's hand, retaining the public `Player` and battlefield
+/// object targets. Two-directional: the controller-retains half is the reach-guard against an
+/// unconditional drop. Revert-probe: deleting the `WaitingFor::LoopShortcut` block in
+/// `filter_state_for_viewer` makes P2's view retain the hidden hand card ⇒ this test fails (leak).
+#[test]
+fn loop_shortcut_schema_redacts_hidden_targets_for_non_controller() {
+    let mut scenario = GameScenario::new_n_player(3, 7);
+    scenario.at_phase(Phase::PreCombatMain);
+    let hidden_hand = scenario.add_bolt_to_hand(P1); // a hidden card in P1's hand
+    let battlefield = scenario.add_creature(P0, "Test Ogre", 3, 3).id(); // public battlefield object
+    let mut runner = scenario.build();
+
+    let slot = DecisionSlot {
+        source: YieldTarget::ThisObject {
+            source_id: ObjectId(999),
+            incarnation: None,
+            trigger_description: None,
+        },
+        index: 0,
+    };
+    let schema = ShortcutDecisionSchema {
+        iteration_count: IterationCount::UntilLethal,
+        points: vec![DecisionPoint {
+            slot,
+            kind: DecisionPointKind::Targets {
+                legal_targets: vec![
+                    TargetRef::Object(hidden_hand),
+                    TargetRef::Player(P1),
+                    TargetRef::Object(battlefield),
+                ],
+            },
+        }],
+    };
+    let cert = LoopCertificate {
+        unbounded: vec![],
+        win_kind: WinKind::LethalDamage,
+        mandatory: false,
+        residual_board_delta: BoardDelta::default(),
+    };
+    runner.state_mut().waiting_for = WaitingFor::LoopShortcut {
+        controller: P0,
+        certificate: cert,
+        schema,
+    };
+
+    let targets_of = |wf: &WaitingFor| -> Vec<TargetRef> {
+        let WaitingFor::LoopShortcut { schema, .. } = wf else {
+            panic!("expected LoopShortcut, got {wf:?}");
+        };
+        let DecisionPointKind::Targets { legal_targets } = &schema.points[0].kind else {
+            panic!("expected a Targets point, got {:?}", schema.points[0].kind);
+        };
+        legal_targets.clone()
+    };
+
+    // Controller P0 (reach-guard): keeps ALL three legal targets — the redaction is
+    // viewer-scoped, not an unconditional drop.
+    let p0_view = engine::game::visibility::filter_state_for_viewer(runner.state(), P0);
+    let p0_targets = targets_of(&p0_view.waiting_for);
+    assert_eq!(p0_targets.len(), 3, "controller keeps all legal targets");
+    assert!(p0_targets.contains(&TargetRef::Object(hidden_hand)));
+    assert!(p0_targets.contains(&TargetRef::Player(P1)));
+    assert!(p0_targets.contains(&TargetRef::Object(battlefield)));
+
+    // Non-controller P2: drops ONLY the hidden hand Object; retains the public Player + the
+    // public battlefield Object.
+    let p2_view = engine::game::visibility::filter_state_for_viewer(runner.state(), P2);
+    let p2_targets = targets_of(&p2_view.waiting_for);
+    assert!(
+        !p2_targets.contains(&TargetRef::Object(hidden_hand)),
+        "leak: a non-controller must NOT see the hidden hand card as a legal target: {p2_targets:?}"
+    );
+    assert!(
+        p2_targets.contains(&TargetRef::Player(P1)),
+        "the public Player target is retained: {p2_targets:?}"
+    );
+    assert!(
+        p2_targets.contains(&TargetRef::Object(battlefield)),
+        "the public battlefield object target is retained: {p2_targets:?}"
+    );
+    assert_eq!(
+        p2_targets.len(),
+        2,
+        "exactly the one hidden target is dropped"
+    );
+}
+
+/// T6 (serde): the schema rides the `WaitingFor::LoopShortcut` serialization as `data.schema`
+/// (tag/content) and round-trips equal — the FE contract that lets the frontend read the offer's
+/// decision schema off the wire without any engine-side special casing.
+#[test]
+fn loop_shortcut_serializes_schema_under_data() {
+    let (runner, _l0, _cleric) = reach_2p_optional_drain_offer();
+    let WaitingFor::LoopShortcut { schema, .. } = &runner.state().waiting_for else {
+        panic!(
+            "expected a LoopShortcut offer, got {:?}",
+            runner.state().waiting_for
+        );
+    };
+    let v = serde_json::to_value(&runner.state().waiting_for).expect("serialize WaitingFor");
+    assert!(
+        v["data"]["schema"].is_object(),
+        "WaitingFor::LoopShortcut must serialize data.schema, got {v}"
+    );
+    let schema_back: ShortcutDecisionSchema =
+        serde_json::from_value(v["data"]["schema"].clone()).expect("deserialize schema");
+    assert_eq!(&schema_back, schema, "the schema round-trips off the wire");
+}

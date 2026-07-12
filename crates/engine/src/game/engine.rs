@@ -449,13 +449,14 @@ fn reconcile_terminal_result(state: &mut GameState, result: &mut ActionResult) {
         && !in_simulation_probe()
         && state.last_recast_context.is_some()
     {
-        if let Some(certificate) = try_offer_object_growth_shortcut(state) {
+        if let Some((certificate, schema)) = try_offer_object_growth_shortcut(state) {
             let WaitingFor::Priority { player: controller } = state.waiting_for else {
                 unreachable!("guarded by matches!(Priority) above")
             };
             state.waiting_for = WaitingFor::LoopShortcut {
                 controller,
                 certificate,
+                schema,
             };
             result.waiting_for = state.waiting_for.clone();
         }
@@ -511,9 +512,13 @@ fn interactive_loop_bridge(state: &mut GameState, result: &mut ActionResult) {
             // determinate winner / priority holder). The certificate's residual is filled
             // via the single `board_delta` population seam (non-empty on the ω path).
             let certificate = build_cert(prior.as_ref(), state, &delta, winner);
+            // CR 732.2a: a non-targeted drain reifies no per-iteration player choice ⇒ carry an
+            // empty pin list; only the `iteration_count` (from `win_kind`) is populated.
+            let schema = build_shortcut_schema(&[], certificate.win_kind, state, winner);
             state.waiting_for = WaitingFor::LoopShortcut {
                 controller: winner,
                 certificate,
+                schema,
             };
             result.waiting_for = state.waiting_for.clone();
         }
@@ -710,6 +715,78 @@ fn build_cert(
         // The offer is only reached for an OPTIONAL loop.
         mandatory: false,
         residual_board_delta: crate::analysis::resource::board_delta(prior, state),
+    }
+}
+
+/// CR 704.5a / CR 704.5c: a determinate lethal drain (0-or-less life / 10-poison) repeats
+/// UntilLethal; every other CR 732.1b win seeds a `Fixed(1)` frontend count picker. Extracted
+/// as a pure classifier so the exhaustive `WinKind` mapping is unit-testable without a
+/// `GameState`.
+fn shortcut_iteration_count(
+    win_kind: crate::analysis::loop_check::WinKind,
+) -> crate::analysis::decision_template::IterationCount {
+    use crate::analysis::decision_template::IterationCount;
+    use crate::analysis::loop_check::WinKind;
+    match win_kind {
+        WinKind::LethalDamage | WinKind::PoisonLoss => IterationCount::UntilLethal,
+        WinKind::Decking | WinKind::ExtraTurns | WinKind::ImmediateWin | WinKind::Advantage => {
+            IterationCount::Fixed(1)
+        }
+    }
+}
+
+/// CR 732.2a: build the READ-side decision schema for a loop-shortcut offer. `pins` is the
+/// carried single-authority decision list (`build_recast_template` output for the object-growth
+/// path; `&[]` for a non-targeted drain) — never re-derived here. Legal sets come from live
+/// engine queries (`is_convoke_eligible`); the frontend computes nothing.
+fn build_shortcut_schema(
+    pins: &[crate::analysis::decision_template::PinnedDecision],
+    win_kind: crate::analysis::loop_check::WinKind,
+    state: &GameState,
+    controller: PlayerId,
+) -> crate::analysis::decision_template::ShortcutDecisionSchema {
+    use crate::analysis::decision_template::{
+        DecisionPoint, DecisionPointKind, PinnedDecision, ShortcutDecisionSchema,
+    };
+    let points = pins
+        .iter()
+        .filter_map(|pin| match pin {
+            // CR 603.3b: trigger ordering is not a loop-declaration choice — no read-side peer.
+            PinnedDecision::Order { .. } => None,
+            // CR 702.51a: the untapped creatures the controller may tap for convoke. Sorted by
+            // the public inner id: `im::HashMap::values()` order is nondeterministic and this Vec
+            // serializes to the wire (cf. `resolve_source`'s `min_by_key` for the same reason).
+            PinnedDecision::ConvokeTaps { slot } => {
+                let mut tappable: Vec<crate::types::identifiers::ObjectId> = state
+                    .objects
+                    .values()
+                    .filter(|o| o.is_convoke_eligible(controller))
+                    .map(|o| o.id)
+                    .collect();
+                tappable.sort_by_key(|id| id.0);
+                Some(DecisionPoint {
+                    slot: slot.clone(),
+                    kind: DecisionPointKind::ConvokeTaps { tappable },
+                })
+            }
+            // No Stage-1 offer path reifies a targeted / modal / may / unless decision (targeted
+            // loops reach the offer only after the Stage-2 gate-relax). Fail-loud in dev,
+            // fail-safe (drop) in prod — no producer emits one yet.
+            PinnedDecision::Targets { .. }
+            | PinnedDecision::Mode { .. }
+            | PinnedDecision::MayChoice { .. }
+            | PinnedDecision::UnlessBreak { .. } => {
+                debug_assert!(
+                    false,
+                    "Stage-1 schema builder: only ConvokeTaps is reified; Targets/Mode/MayChoice/UnlessBreak are Stage-2 producers"
+                );
+                None
+            }
+        })
+        .collect();
+    ShortcutDecisionSchema {
+        iteration_count: shortcut_iteration_count(win_kind),
+        points,
     }
 }
 
@@ -1185,7 +1262,10 @@ fn derived_fodder_class(
 /// this hook or any `!in_simulation_probe()`-gated shortcut logic.
 fn try_offer_object_growth_shortcut(
     state: &GameState,
-) -> Option<crate::analysis::loop_check::LoopCertificate> {
+) -> Option<(
+    crate::analysis::loop_check::LoopCertificate,
+    crate::analysis::decision_template::ShortcutDecisionSchema,
+)> {
     let ctx = state.last_recast_context.clone()?;
     let WaitingFor::Priority { player: caster } = state.waiting_for else {
         return None;
@@ -1293,7 +1373,12 @@ fn try_offer_object_growth_shortcut(
         return None;
     }
 
-    Some(build_cert(&s_n1, &s_n2, &delta, caster))
+    let certificate = build_cert(&s_n1, &s_n2, &delta, caster);
+    // CR 732.2a (CARRY, don't re-derive): the schema's decision list is the SAME
+    // `build_recast_template` output driven above — `[ConvokeTaps]` when the recast has convoke,
+    // else `[]`. Legal sets are derived against the live offer-time board.
+    let schema = build_shortcut_schema(&template.decisions, certificate.win_kind, state, caster);
+    Some((certificate, schema))
 }
 
 /// PR-7 Phase 4d-ii (CR 732.2a): materialize a confirmed `Fixed(N)` object-growth recast
@@ -3743,6 +3828,7 @@ fn apply_action(
             WaitingFor::LoopShortcut {
                 controller,
                 certificate,
+                ..
             },
             GameAction::DeclareShortcut { count, template },
         ) => {
@@ -8581,3 +8667,41 @@ mod keyword_action_stack_tests;
 #[cfg(test)]
 #[path = "engine_mdfc_land_tests.rs"]
 mod mdfc_land_tests;
+
+#[cfg(test)]
+mod shortcut_schema_tests {
+    use super::shortcut_iteration_count;
+    use crate::analysis::decision_template::IterationCount;
+    use crate::analysis::loop_check::WinKind;
+
+    /// T3: `iteration_count` is exhaustive over all six `WinKind`s — the two determinate-lethal
+    /// axes (CR 704.5a life / CR 704.5c poison) map to `UntilLethal`; every other win seeds
+    /// `Fixed(1)`. Revert-probe: swapping any arm flips the corresponding assertion.
+    #[test]
+    fn iteration_count_maps_every_win_kind() {
+        assert_eq!(
+            shortcut_iteration_count(WinKind::LethalDamage),
+            IterationCount::UntilLethal
+        );
+        assert_eq!(
+            shortcut_iteration_count(WinKind::PoisonLoss),
+            IterationCount::UntilLethal
+        );
+        assert_eq!(
+            shortcut_iteration_count(WinKind::Decking),
+            IterationCount::Fixed(1)
+        );
+        assert_eq!(
+            shortcut_iteration_count(WinKind::ExtraTurns),
+            IterationCount::Fixed(1)
+        );
+        assert_eq!(
+            shortcut_iteration_count(WinKind::ImmediateWin),
+            IterationCount::Fixed(1)
+        );
+        assert_eq!(
+            shortcut_iteration_count(WinKind::Advantage),
+            IterationCount::Fixed(1)
+        );
+    }
+}

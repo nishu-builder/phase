@@ -169,6 +169,62 @@ pub enum PinnedDecision {
     ConvokeTaps { slot: DecisionSlot },
 }
 
+/// CR 732.2a: the READ-side decision schema an interactive loop-shortcut OFFER exposes so the
+/// frontend can render the open choices + collect pins. 1:1 read-side dual of the write-side
+/// `Vec<PinnedDecision>` (the FE picks from each point's legal set → a pin). Every field is
+/// derived from board state the offer recipient may legally see; hidden-info legal targets are
+/// redacted for other viewers in `game::visibility::filter_state_for_viewer`. Snapshotted at
+/// offer construction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShortcutDecisionSchema {
+    /// CR 732.1b: the proposed repeat mode. `UntilLethal` for a determinate CR 704.5a /
+    /// CR 704.5c drain; `Fixed(n)` seeds the frontend count picker for an optional loop.
+    pub iteration_count: IterationCount,
+    /// The open per-iteration decision-points needing pins. EMPTY for a choice-free drain.
+    pub points: Vec<DecisionPoint>,
+}
+
+// CR 732.2a: `IterationCount` carries no `Default` and its `Fixed(u32)` is a tuple variant
+// (so a derived `#[default]` cannot apply) — hand-impl the forward-compat deser default the
+// `#[serde(default)]` on `WaitingFor::LoopShortcut.schema` needs.
+impl Default for ShortcutDecisionSchema {
+    fn default() -> Self {
+        Self {
+            iteration_count: IterationCount::Fixed(0),
+            points: Vec::new(),
+        }
+    }
+}
+
+/// One open decision-point. `slot` is the same [`DecisionSlot`] the frontend echoes on the
+/// [`PinnedDecision`] it produces; `kind` carries that decision's legal option set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionPoint {
+    pub slot: DecisionSlot,
+    pub kind: DecisionPointKind,
+}
+
+/// Legal option set for one decision-point. EXHAUSTIVE, wildcard-free 1:1 read-side peer of
+/// the loop-declaration [`PinnedDecision`] variants (`Order` is CR 603.3b trigger-ordering,
+/// not a loop-declaration choice — it has no read-side peer). Externally tagged → FE-consumable
+/// JSON (`{"ConvokeTaps":{"tappable":[..]}}`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DecisionPointKind {
+    /// CR 608.2b: the legal targets for the slot (native `find_legal_targets` output).
+    Targets {
+        legal_targets: Vec<crate::types::ability::TargetRef>,
+    },
+    /// CR 702.51a: untapped creatures the controller may tap for convoke (informational — the
+    /// concrete taps are re-bound live by `select_convoke_taps`).
+    ConvokeTaps { tappable: Vec<ObjectId> },
+    /// CR 700.2 modal: the selectable mode indices.
+    Mode { available_modes: Vec<usize> },
+    /// CR 603.5: a binary "may" — the slot alone identifies it (FE renders yes/no).
+    MayChoice,
+    /// CR 732.6: a binary "[A] unless [B]" break — pay or decline.
+    UnlessBreak,
+}
+
 /// A pinned target. `ByIdentity` re-resolves to a live legal ObjectId each iteration
 /// (CR 608.2b); `Scheduled` is an iteration-indexed pure function (CR 732.2a).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -531,6 +587,54 @@ mod tests {
             card_id: CardId(card_id),
             trigger_description: None,
         }
+    }
+
+    /// T6: `DecisionPointKind` serializes externally tagged (`{"ConvokeTaps":{...}}`) — the
+    /// FE-consumable JSON shape the WASM bridge passes through — and round-trips equal. Revert:
+    /// switching the enum to internal/adjacent tagging changes the top-level key and fails.
+    #[test]
+    fn decision_point_kind_convoke_taps_serde_shape() {
+        let kind = DecisionPointKind::ConvokeTaps {
+            tappable: vec![ObjectId(2), ObjectId(5)],
+        };
+        let json = serde_json::to_value(&kind).expect("serialize");
+        assert_eq!(
+            json,
+            serde_json::json!({ "ConvokeTaps": { "tappable": [2, 5] } })
+        );
+        let back: DecisionPointKind = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back, kind);
+    }
+
+    /// T6: a full `ShortcutDecisionSchema` carrying a `Targets` point round-trips equal, and the
+    /// hand-impl `Default` is the forward-compat deser seed the `#[serde(default)]` needs.
+    #[test]
+    fn shortcut_decision_schema_round_trips_and_defaults() {
+        let schema = ShortcutDecisionSchema {
+            iteration_count: IterationCount::UntilLethal,
+            points: vec![DecisionPoint {
+                slot: DecisionSlot {
+                    source: all_copies(7),
+                    index: 0,
+                },
+                kind: DecisionPointKind::Targets {
+                    legal_targets: vec![
+                        crate::types::ability::TargetRef::Object(ObjectId(3)),
+                        crate::types::ability::TargetRef::Player(PlayerId(1)),
+                    ],
+                },
+            }],
+        };
+        let json = serde_json::to_value(&schema).expect("serialize");
+        let back: ShortcutDecisionSchema = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back, schema);
+        assert_eq!(
+            ShortcutDecisionSchema::default(),
+            ShortcutDecisionSchema {
+                iteration_count: IterationCount::Fixed(0),
+                points: vec![],
+            }
+        );
     }
 
     /// Phase-1 `resolve`/gate tests don't consult `key`; give every template an empty
