@@ -460,6 +460,7 @@ mod issue_5332_gandalf_trigger_doubling;
 mod issue_5334_furious_rise_may_play;
 mod issue_5335_stonehoof_mass_attack;
 mod issue_5336_kodama_mana_value_filter;
+mod issue_5338_moon_circuit_hacker_ninjutsu_mana;
 mod issue_5339_armory_automaton;
 mod issue_536_six_grants_retrace;
 mod issue_541_endurance_graveyard_to_bottom;
