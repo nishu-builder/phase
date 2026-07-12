@@ -1413,7 +1413,7 @@ export type WaitingFor =
   | { type: "OptionalEffectChoice"; data: { player: PlayerId; source_id: ObjectId; description?: string; may_trigger_key?: MayTriggerAutoChoiceKey } }
   | { type: "PairChoice"; data: { player: PlayerId; source_id: ObjectId; choices: ObjectId[] } }
   | { type: "OpponentMayChoice"; data: { player: PlayerId; source_id: ObjectId; description?: string; remaining: PlayerId[] } }
-  | { type: "LoopShortcut"; data: { controller: PlayerId; certificate: LoopCertificate } }
+  | { type: "LoopShortcut"; data: { controller: PlayerId; certificate: LoopCertificate; schema: ShortcutDecisionSchema } }
   | { type: "RespondToShortcut"; data: { player: PlayerId; remaining_players?: PlayerId[]; proposal: ShortcutProposal } }
   | { type: "UnlessPayment"; data: { player: PlayerId; cost: UnlessCost; pending_effect: unknown; trigger_event?: unknown; effect_description?: string; remaining?: PlayerId[] } }
   // CR 118.12a: Disjunctive unless-cost — player picks **which** sub-cost
@@ -2226,6 +2226,50 @@ export interface LoopCertificate {
  * tagged: unit variant → bare string, data variant → single-key object).
  */
 export type IterationCount = "UntilLethal" | { Fixed: number };
+
+/**
+ * Mirrors `engine::analysis::decision_template::ShortcutDecisionSchema`
+ * (decision_template.rs). The READ-side offer the frontend renders to declare a
+ * loop shortcut. `points` is EMPTY for a choice-free drain — the only reachable
+ * shape today. Display-only: the modal reads these fields, never constructs them
+ * (constructing pins is deferred pin-capture).
+ */
+export interface ShortcutDecisionSchema {
+  iteration_count: IterationCount;
+  points: DecisionPoint[];
+}
+
+/** Mirrors `engine::analysis::decision_template::DecisionPoint`. */
+export interface DecisionPoint {
+  slot: DecisionSlot;
+  kind: DecisionPointKind;
+}
+
+/**
+ * Mirrors `engine::analysis::decision_template::DecisionPointKind` (serde
+ * externally tagged; mixed unit/struct variants).
+ */
+export type DecisionPointKind =
+  | { Targets: { legal_targets: TargetRef[] } }
+  | { ConvokeTaps: { tappable: ObjectId[] } }
+  | { Mode: { available_modes: number[] } }
+  | "MayChoice"
+  | "UnlessBreak";
+
+/** Mirrors `engine::analysis::decision_template::DecisionSlot` (`index` is Rust `u8`). */
+export interface DecisionSlot {
+  source: DecisionSource;
+  index: number;
+}
+
+/**
+ * Mirrors `engine::analysis::decision_template::DecisionSource` (= `YieldTarget`,
+ * game_state.rs; serde externally tagged). `trigger_description` is
+ * `skip_serializing_if none` on the wire; `incarnation` always serializes.
+ */
+export type DecisionSource =
+  | { ThisObject: { source_id: ObjectId; incarnation: number | null; trigger_description?: string } }
+  | { AllCopies: { card_id: CardId; trigger_description?: string } };
 
 /**
  * Opaque mirror of `engine::analysis::decision_template::DecisionTemplate`. Phase 3

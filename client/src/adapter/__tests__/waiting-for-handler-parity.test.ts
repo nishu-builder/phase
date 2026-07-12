@@ -40,7 +40,7 @@ const INTERNAL_NEVER_PLAYER_FACING: ReadonlySet<WaitingFor["type"]> =
  * `acting_player() == None`.
  */
 const PENDING_MODAL_PHASE5: ReadonlySet<WaitingFor["type"]> =
-  new Set<WaitingFor["type"]>(["LoopShortcut", "RespondToShortcut"]);
+  new Set<WaitingFor["type"]>([]);
 
 describe("WaitingFor handler parity", () => {
   it("every engine WaitingFor variant has a frontend UI handler", () => {
