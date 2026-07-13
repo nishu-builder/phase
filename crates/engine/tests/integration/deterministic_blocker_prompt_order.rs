@@ -1,6 +1,6 @@
 use engine::game::combat::AttackTarget;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
-use engine::types::actions::GameAction;
+use engine::types::actions::{DebugAction, GameAction};
 use engine::types::game_state::WaitingFor;
 use engine::types::identifiers::ObjectId;
 use engine::types::phase::Phase;
@@ -124,4 +124,44 @@ fn next_defender_sorts_blocker_ids_after_prior_defender_declares() {
         .expect("first defender should be able to decline blocks");
 
     assert_sorted_blockers(&runner.state().waiting_for, p2, &p2_blockers);
+}
+
+#[test]
+fn debug_refresh_sorts_blocker_ids_after_live_eligibility_change() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let attacker = scenario.add_creature(P0, "Attacker", 2, 2).id();
+    let blockers = (0..8)
+        .map(|index| {
+            scenario
+                .add_creature(P1, &format!("Blocker {index}"), 2, 2)
+                .id()
+        })
+        .collect::<Vec<_>>();
+    let mut runner = scenario.build();
+    runner.state_mut().debug_mode = true;
+
+    pass_until_declaration(&mut runner, false);
+    runner
+        .act(GameAction::DeclareAttackers {
+            attacks: vec![(attacker, AttackTarget::Player(P1))],
+            bands: vec![],
+        })
+        .expect("attacker declaration should succeed");
+    pass_until_declaration(&mut runner, true);
+
+    let tapped = blockers[3];
+    runner
+        .act(GameAction::Debug(DebugAction::SetTapped {
+            object_id: tapped,
+            tapped: true,
+        }))
+        .expect("debug SetTapped should refresh the live blocker prompt");
+
+    let expected = blockers
+        .iter()
+        .copied()
+        .filter(|id| *id != tapped)
+        .collect::<Vec<_>>();
+    assert_sorted_blockers(&runner.state().waiting_for, P1, &expected);
 }

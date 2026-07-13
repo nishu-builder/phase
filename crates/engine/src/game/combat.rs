@@ -3478,6 +3478,17 @@ pub fn blocker_constraints_for_player(
     constraints
 }
 
+/// Stable transport ordering for the blocker IDs derived from the authoritative
+/// `valid_block_targets` map. Hash-map iteration order is intentionally not part
+/// of combat legality; every `DeclareBlockers` payload uses numeric ObjectId order.
+pub(crate) fn sorted_valid_blocker_ids<T>(
+    valid_block_targets: &HashMap<ObjectId, T>,
+) -> Vec<ObjectId> {
+    let mut ids: Vec<_> = valid_block_targets.keys().copied().collect();
+    ids.sort_unstable_by_key(|id| id.0);
+    ids
+}
+
 /// CR 508.1a / CR 509.1a: Rebuild the eligibility snapshot carried by the
 /// `DeclareAttackers` / `DeclareBlockers` waiting states from the live game
 /// queries. The declare-step waiting payloads are computed exactly once by
@@ -3514,7 +3525,7 @@ pub fn refresh_combat_declaration_waiting_for(state: &mut GameState) {
             let player = *player;
             // CR 509.1a: Mirror turns.rs:1394-1396 — player-scoped block targets.
             let valid_block_targets = get_valid_block_targets_for_player(state, player);
-            let valid_blocker_ids: Vec<_> = valid_block_targets.keys().copied().collect();
+            let valid_blocker_ids = sorted_valid_blocker_ids(&valid_block_targets);
             let block_requirements = block_requirements_for_player(state, player);
             // CR 509.1b/c: recompute the display constraints from the same
             // recomputed `valid_block_targets` (self-heal parity).
@@ -4291,6 +4302,20 @@ mod tests {
         state.turn_number = 2;
         state.active_player = PlayerId(0);
         state
+    }
+
+    #[test]
+    fn sorted_valid_blocker_ids_uses_numeric_object_id_order() {
+        let targets = HashMap::from([
+            (ObjectId(91), vec![ObjectId(1)]),
+            (ObjectId(3), vec![ObjectId(1)]),
+            (ObjectId(47), vec![ObjectId(1)]),
+        ]);
+
+        assert_eq!(
+            sorted_valid_blocker_ids(&targets),
+            vec![ObjectId(3), ObjectId(47), ObjectId(91)]
+        );
     }
 
     fn create_creature(
