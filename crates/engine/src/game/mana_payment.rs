@@ -937,6 +937,63 @@ pub fn pay_cost_with_demand_and_choices(
     // which makes the spend byte-identical to the pre-feature ordering.
     pins: &[ManaPipId],
 ) -> Result<(Vec<ManaUnit>, Vec<LifePayment>), PaymentError> {
+    let Some(hand_demand) = hand_demand else {
+        return pay_cost_with_demand_and_choices_once(
+            pool,
+            cost,
+            None,
+            spell,
+            any_color,
+            phyrexian_choices,
+            life_colors,
+            pins,
+        );
+    };
+
+    // CR 601.2h: Partial payments are not allowed, and a payable cost must not
+    // become unpayable because the soft hand-demand preference chose a locally
+    // useful but globally invalid mana assignment. Preserve successful
+    // demand-aware choices; on insufficient mana, restore the pool and retry
+    // with the authoritative demand-free ordering used by affordability checks.
+    let original_pool = pool.clone();
+    match pay_cost_with_demand_and_choices_once(
+        pool,
+        cost,
+        Some(hand_demand),
+        spell,
+        any_color,
+        phyrexian_choices,
+        life_colors,
+        pins,
+    ) {
+        Err(PaymentError::InsufficientMana) => {
+            *pool = original_pool;
+            pay_cost_with_demand_and_choices_once(
+                pool,
+                cost,
+                None,
+                spell,
+                any_color,
+                phyrexian_choices,
+                life_colors,
+                pins,
+            )
+        }
+        result => result,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pay_cost_with_demand_and_choices_once(
+    pool: &mut ManaPool,
+    cost: &ManaCost,
+    hand_demand: Option<&ColorDemand>,
+    spell: Option<&PaymentContext<'_>>,
+    any_color: bool,
+    phyrexian_choices: Option<&[ShardChoice]>,
+    life_colors: crate::types::mana::LifePaymentColors,
+    pins: &[ManaPipId],
+) -> Result<(Vec<ManaUnit>, Vec<LifePayment>), PaymentError> {
     match cost {
         ManaCost::NoCost
         | ManaCost::SelfManaCost
@@ -3185,6 +3242,39 @@ mod tests {
         let (spent, _) =
             pay_cost_with_demand(&mut pool, &cost, Some(&demand), None, false).unwrap();
         assert_eq!(spent[0].color, ManaType::Blue);
+    }
+
+    #[test]
+    fn pay_cost_hybrid_hand_demand_cannot_strand_later_strict_shard() {
+        // CR 107.4e + CR 601.2h: The soft hand-demand preference would spend
+        // blue on {G/U}, stranding the final {U}, even though spending green on
+        // the hybrid makes the complete {G}{G/U}{U} payment legal.
+        let mut pool = pool_with(&[(ManaType::Green, 2), (ManaType::Blue, 1)]);
+        let cost = ManaCost::Cost {
+            shards: vec![
+                ManaCostShard::Green,
+                ManaCostShard::GreenBlue,
+                ManaCostShard::Blue,
+            ],
+            generic: 0,
+        };
+        let demand: ColorDemand = [0, 1, 1, 0, 3];
+
+        assert!(can_pay_for_spell(
+            &pool,
+            &cost,
+            None,
+            crate::types::mana::CostPermissionContext::default(),
+        ));
+        let (spent, life) =
+            pay_cost_with_demand(&mut pool, &cost, Some(&demand), None, false).unwrap();
+
+        assert!(life.is_empty());
+        assert_eq!(
+            spent.iter().map(|unit| unit.color).collect::<Vec<_>>(),
+            vec![ManaType::Green, ManaType::Green, ManaType::Blue]
+        );
+        assert_eq!(pool.total(), 0);
     }
 
     // --- land_subtype_to_mana_type tests ---

@@ -2477,7 +2477,9 @@ pub fn auto_advance(state: &mut GameState, events: &mut Vec<GameEvent>) -> Waiti
                         .unwrap_or_else(|| super::players::next_player(state, state.active_player));
                     let valid_block_targets =
                         super::combat::get_valid_block_targets_for_player(state, defending);
-                    let valid_blocker_ids: Vec<_> = valid_block_targets.keys().copied().collect();
+                    let mut valid_blocker_ids: Vec<_> =
+                        valid_block_targets.keys().copied().collect();
+                    valid_blocker_ids.sort_unstable_by_key(|id| id.0);
                     let block_requirements =
                         super::combat::block_requirements_for_player(state, defending);
                     let blocker_constraints = super::combat::blocker_constraints_for_player(

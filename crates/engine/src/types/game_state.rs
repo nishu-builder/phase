@@ -60,6 +60,98 @@ fn default_remaining_one() -> u32 {
     1
 }
 
+/// Deterministic serde for object ID sets stored in authoritative checkpoints.
+///
+/// `HashSet` iteration order depends on its per-instance random seed. Sorting only at
+/// serialization preserves the set's runtime behavior while making checkpoint bytes stable.
+mod object_id_set_serde {
+    use super::*;
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S>(set: &HashSet<ObjectId>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut object_ids = set.iter().copied().collect::<Vec<_>>();
+        object_ids.sort_unstable_by_key(|object_id| object_id.0);
+        object_ids.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<HashSet<ObjectId>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        HashSet::deserialize(deserializer)
+    }
+}
+
+/// Deterministic serde for persistent `(player, creature type)` checkpoint sets.
+mod player_creature_type_set_serde {
+    use super::*;
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S>(
+        set: &im::HashSet<(PlayerId, String)>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut entries = set.iter().collect::<Vec<_>>();
+        entries.sort_unstable_by(|left, right| {
+            left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
+        });
+        entries.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<im::HashSet<(PlayerId, String)>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        im::HashSet::deserialize(deserializer)
+    }
+}
+
+/// Deterministic serde for resolution-scoped player action checkpoint sets.
+mod player_action_set_serde {
+    use super::*;
+    use serde::{Deserializer, Serializer};
+
+    fn action_rank(action: PlayerActionKind) -> u8 {
+        match action {
+            PlayerActionKind::AcceptedOptionalEffect => 0,
+            PlayerActionKind::SearchedLibrary => 1,
+            PlayerActionKind::Scry => 2,
+            PlayerActionKind::Surveil => 3,
+            PlayerActionKind::CollectEvidence => 4,
+            PlayerActionKind::ShuffledLibrary => 5,
+            PlayerActionKind::Proliferate => 6,
+            PlayerActionKind::Investigate => 7,
+        }
+    }
+
+    pub fn serialize<S>(
+        set: &HashSet<(PlayerId, PlayerActionKind)>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut entries = set.iter().collect::<Vec<_>>();
+        entries.sort_unstable_by_key(|(player, action)| (player.0, action_rank(*action)));
+        entries.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<HashSet<(PlayerId, PlayerActionKind)>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        HashSet::deserialize(deserializer)
+    }
+}
+
 /// Serde module for `HashMap<(ObjectId, usize), u32>` — JSON requires string keys,
 /// so we serialize the tuple as `"objectId_index"` (e.g. `"42_0"`).
 mod tuple_key_map {
@@ -6820,7 +6912,11 @@ pub struct GameState {
     /// when a nonzero amount of damage is actually dealt (CR 120.3/120.6, not the
     /// would-deal amount of CR 120.1a); cleared when the object leaves the
     /// battlefield so a flickered object starts with a clean slate.
-    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "HashSet::is_empty",
+        with = "object_id_set_serde"
+    )]
     pub objects_that_dealt_damage: HashSet<ObjectId>,
 
     /// CR 500.7: Extra turns granted by effects, stored as a LIFO stack.
@@ -7322,7 +7418,7 @@ pub struct GameState {
     pub end_steps_started_this_turn: u32,
     /// CR 508.1a: Object IDs of creatures declared as attackers this turn.
     /// Persists after combat ends for post-combat filtering.
-    #[serde(default)]
+    #[serde(default, with = "object_id_set_serde")]
     pub creatures_attacked_this_turn: HashSet<ObjectId>,
     /// CR 508.1a + CR 608.2c: Declaration-time attacker snapshots for filtered
     /// post-combat queries ("attacked with a token/commander/Dinosaur this
@@ -7389,7 +7485,11 @@ pub struct GameState {
     /// Populated by the `DamageDealt` observer in `game::triggers` and cleared in
     /// `turns::start_next_turn` per CR 514. Read by `casting_variant_candidates`
     /// to gate the Prowl cast permission ("had any of this spell's creature types").
-    #[serde(default, skip_serializing_if = "im::HashSet::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "im::HashSet::is_empty",
+        with = "player_creature_type_set_serde"
+    )]
     pub creature_types_dealt_combat_damage_this_turn: im::HashSet<(PlayerId, String)>,
     /// CR 700.14: Cumulative mana spent on spells this turn per player (for Expend triggers).
     #[serde(default)]
@@ -7421,11 +7521,11 @@ pub struct GameState {
 
     /// Cards currently revealed to all players (e.g. during a RevealHand effect).
     /// `filter_state_for_player` skips hiding these cards.
-    #[serde(default)]
+    #[serde(default, with = "object_id_set_serde")]
     pub revealed_cards: HashSet<ObjectId>,
     /// Cards that have been publicly revealed at least once. Unlike
     /// `revealed_cards`, this is not cleared at the next action boundary.
-    #[serde(default)]
+    #[serde(default, with = "object_id_set_serde")]
     pub public_revealed_cards: HashSet<ObjectId>,
 
     // Pending ability continuation after a player choice (Scry/Dig/Surveil,
@@ -7811,7 +7911,11 @@ pub struct GameState {
     /// within one resolving chain so "for each opponent who searched their
     /// library this way" counts the opponents who accepted that offer, even
     /// across player-scope iterations and interactive continuations.
-    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "HashSet::is_empty",
+        with = "player_action_set_serde"
+    )]
     pub player_actions_this_way: HashSet<(PlayerId, PlayerActionKind)>,
 
     /// CR 609.3: Numeric result from the preceding effect in a sub_ability chain.
