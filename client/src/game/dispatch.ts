@@ -12,7 +12,12 @@ import { flashInGameRolls } from "./diceContest";
 import i18n from "../i18n";
 import { useAnimationStore } from "../stores/animationStore";
 import { useAppNotificationStore } from "../stores/appToastStore";
-import { isMultiplayerMode, useGameStore, saveGame, saveCheckpoints } from "../stores/gameStore";
+import {
+  isMultiplayerMode,
+  useGameStore,
+  saveAuthoritativeGame,
+  saveCheckpoints,
+} from "../stores/gameStore";
 import { getOpponentDisplayName } from "../stores/multiplayerStore";
 import { usePreferencesStore } from "../stores/preferencesStore";
 import { useUiStore } from "../stores/uiStore";
@@ -323,7 +328,7 @@ async function processAction(action: GameAction, actor: number): Promise<void> {
   }
   const newState = snapshotResult.state;
   const { gameId } = useGameStore.getState();
-  if (gameId) saveGame(gameId, newState);
+  if (gameId) void saveAuthoritativeGame(gameId, adapter, newState);
 
   // 3c. Feed the throughput tracker: count stack entries that left the stack
   //     this action (resolved, countered, or otherwise removed), id-diffed so a
@@ -707,7 +712,7 @@ export async function restoreGameState(
     },
   });
   if (gameId) {
-    await saveGame(gameId, snapshot.state);
+    await saveAuthoritativeGame(gameId, adapter, snapshot.state);
     await saveCheckpoints(gameId, preservedCheckpoints);
   }
 
@@ -829,9 +834,11 @@ export async function dispatchResolveAll(
       }
     }
 
-    const { gameId } = useGameStore.getState();
+    const { gameId, adapter } = useGameStore.getState();
     const newState = useGameStore.getState().gameState;
-    if (gameId && newState) saveGame(gameId, newState);
+    if (gameId && adapter && newState) {
+      await saveAuthoritativeGame(gameId, adapter, newState);
+    }
   } finally {
     batchResolveInProgress = false;
     setIsResolvingAll(false);

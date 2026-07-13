@@ -206,9 +206,11 @@ pub(crate) fn run_post_action_pipeline_from(
     if state.stack.len() > stack_before {
         return Ok(flush_pending_priority_intercepts(
             state,
-            WaitingFor::Priority {
-                player: state.active_player,
-            },
+            // The caller owns the semantic priority seat. In particular, a
+            // spell cast during another player's turn returns priority to its
+            // caster after cast triggers are placed; substituting active_player
+            // here loses that fact before the pre-cast shortcut interceptor.
+            default_wf.clone(),
         ));
     }
 
@@ -219,7 +221,8 @@ pub(crate) fn run_post_action_pipeline_from(
 
 fn flush_pending_priority_intercepts(state: &mut GameState, outgoing: WaitingFor) -> WaitingFor {
     let outgoing = super::effects::paradigm::flush_pending_remaining_offers(state, outgoing);
-    flush_pending_miracle_offer(state, outgoing)
+    let outgoing = flush_pending_miracle_offer(state, outgoing);
+    super::precast_copy_shortcut::maybe_offer(state, outgoing)
 }
 
 /// CR 702.94a + CR 603.11: Intercept a `WaitingFor::Priority` and replace it

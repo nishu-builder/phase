@@ -1436,6 +1436,8 @@ export type WaitingFor =
   | { type: "OpponentMayChoice"; data: { player: PlayerId; source_id: ObjectId; description?: string; remaining: PlayerId[] } }
   | { type: "LoopShortcut"; data: { proposer: PlayerId; predicted_winner: PlayerId | null; certificate: LoopCertificate; schema: ShortcutDecisionSchema } }
   | { type: "RespondToShortcut"; data: { player: PlayerId; remaining_players?: PlayerId[]; proposal: ShortcutProposal } }
+  | { type: "PrecastCopyShortcutOffer"; data: { proposer: PlayerId; epoch: number; route_count: number } }
+  | { type: "RespondToPrecastCopyShortcut"; data: { player: PlayerId; epoch: number; breakpoint_ids?: number[]; remaining_players?: PlayerId[] } }
   | { type: "UnlessPayment"; data: { player: PlayerId; cost: UnlessCost; pending_effect: unknown; trigger_event?: unknown; effect_description?: string; remaining?: PlayerId[] } }
   // CR 118.12a: Disjunctive unless-cost — player picks **which** sub-cost
   // to pay (or declines all). Drives Tergrid's Lantern and the broader
@@ -1956,7 +1958,14 @@ export type GameAction =
   | { type: "DeclareShortcut"; data: { count: IterationCount; template?: DecisionTemplate | null } }
   | { type: "RespondToShortcut"; data: { response: ShortcutResponse } }
   | { type: "DeclineShortcut" }
+  | { type: "PrecastCopyShortcut"; data: { epoch: number; response: PrecastCopyShortcutResponse } }
   | { type: "Concede"; data: { player_id: PlayerId } };
+
+export type PrecastCopyShortcutResponse =
+  | { type: "Propose"; data: { route_id: number } }
+  | { type: "Decline" }
+  | { type: "Accept" }
+  | { type: "Shorten"; data: { breakpoint_id: number } };
 
 // CR 605.3b + CR 106.1a: Shape of the prompt surfaced by WaitingFor::ChooseManaColor.
 export type ManaChoicePrompt =
@@ -2600,6 +2609,24 @@ export interface GameState {
   loop_detection?: LoopDetectionMode;
 }
 
+/**
+ * Engine-private data carried only by a trusted local persistence snapshot.
+ * The frontend treats the envelope as opaque: it may forward it back to the
+ * engine, but every rendered or wire-facing view uses `state` alone.
+ */
+export interface TrustedGameStateEnvelope {
+  state: GameState;
+  precast_shortcut_runtime?: unknown;
+}
+
+/** A legacy raw save or the trusted envelope emitted by the engine worker. */
+export type PersistedGameState = GameState | TrustedGameStateEnvelope;
+
+/** Extract the public game state without exposing trusted runtime internals. */
+export function persistedGameStateView(state: PersistedGameState): GameState {
+  return "state" in state ? state.state : state;
+}
+
 export type TurnBoundary = "EndOfCurrentTurn" | "MyNextTurnStart";
 
 export type AutoPassMode =
@@ -2960,7 +2987,9 @@ export interface EngineAdapter {
     aiSeats: { playerId: number; difficulty: string }[],
     maxResolutions?: number,
   ): Promise<BatchResolveResult>;
-  restoreState(state: GameState): void | Promise<void>;
+  restoreState(state: PersistedGameState): void | Promise<void>;
+  /** Trusted local persistence snapshot, when this adapter owns the engine. */
+  exportPersistenceState?(): Promise<string>;
   dispose(): void;
 
   /**
