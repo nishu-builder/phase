@@ -2959,17 +2959,28 @@ fn apply_action(
             // dropped mid-cast (e.g., a life-loss replacement fired), so `PayLife` choices
             // on shards that now show `LifeOnly`/`ManaOrLife` must still have life available.
             {
-                let pending_ref = state.pending_cast.as_ref().ok_or_else(|| {
-                    EngineError::InvalidAction("No pending cast for Phyrexian payment".to_string())
-                })?;
-                let cost = pending_ref.cost.clone();
+                let (cost, activation_ability_index, pins) = state
+                    .pending_cast
+                    .as_ref()
+                    .map(|pending| {
+                        (
+                            pending.cost.clone(),
+                            pending.activation_ability_index,
+                            pending.pinned_pool_units.clone(),
+                        )
+                    })
+                    .ok_or_else(|| {
+                        EngineError::InvalidAction(
+                            "No pending cast for Phyrexian payment".to_string(),
+                        )
+                    })?;
+                let demand = casting::payment_color_demand(state, player, spell_object, None);
                 let player_pool = state
                     .players
                     .iter()
                     .find(|p| p.id == player)
                     .map(|p| p.mana_pool.clone())
                     .ok_or_else(|| EngineError::InvalidAction("Player not found".to_string()))?;
-                let activation_ability_index = pending_ref.activation_ability_index;
                 let current_shards = if let Some(ability_index) = activation_ability_index {
                     let (source_types, source_subtypes) =
                         casting::activation_source_types(state, spell_object);
@@ -2996,6 +3007,8 @@ fn apply_action(
                         &cost,
                         Some(&activation_ctx),
                         permissions,
+                        Some(&demand),
+                        &pins,
                     )
                 } else {
                     let spell_meta = casting::build_spell_meta(state, player, spell_object);
@@ -3016,6 +3029,8 @@ fn apply_action(
                         &cost,
                         spell_ctx.as_ref(),
                         permissions,
+                        Some(&demand),
+                        &pins,
                     )
                 };
                 if current_shards.len() != expected_len {

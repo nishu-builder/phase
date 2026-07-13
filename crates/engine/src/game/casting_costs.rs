@@ -9075,6 +9075,13 @@ pub(super) fn maybe_pause_for_phyrexian_choice(
     // shards surface in the pause UI.
     let permissions =
         super::static_abilities::build_cost_permission_context(state, player, any_color);
+    let demand = super::casting::payment_color_demand(state, player, source_id, None);
+    let pins = state
+        .pending_cast
+        .as_ref()
+        .filter(|pending| pending.object_id == source_id)
+        .map(|pending| pending.pinned_pool_units.clone())
+        .unwrap_or_default();
 
     let (shards, payable) = {
         let player_data = state.players.iter().find(|p| p.id == player)?;
@@ -9083,6 +9090,8 @@ pub(super) fn maybe_pause_for_phyrexian_choice(
             cost,
             effective_payment_context,
             permissions,
+            Some(&demand),
+            &pins,
         );
         // CR 601.2h: Only pause when the cost is actually payable in aggregate.
         // Phyrexian shards may surface as `LifeOnly` even when the non-Phyrexian

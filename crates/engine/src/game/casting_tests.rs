@@ -20,6 +20,7 @@ use crate::types::actions::GameAction;
 use crate::types::card_type::{CoreType, Supertype};
 use crate::types::counter::CounterType;
 use crate::types::events::GameEvent;
+use crate::types::game_state::ShardChoice;
 use crate::types::keywords::{EscapeCost, FlashbackCost, Keyword, KeywordKind};
 use crate::types::mana::{
     ManaColor, ManaCost, ManaCostShard, ManaRestriction, ManaSpellGrant, ManaType, ManaUnit,
@@ -28494,6 +28495,8 @@ fn phyrexian_submit_rejects_stale_paylife_under_insufficient_life() {
         &state.objects.get(&spell).unwrap().mana_cost,
         spell_ctx.as_ref(),
         permissions,
+        None,
+        &[],
     );
     assert_eq!(current_shards.len(), 1);
     assert!(
@@ -41253,6 +41256,214 @@ fn phyrexian_shards_uncorrupted_by_pin() {
         pool_len_before,
         "pinning must not remove any unit — compute_phyrexian_shards must see the true pool"
     );
+}
+
+#[test]
+fn manual_hybrid_phyrexian_spell_binds_pin_and_convoke_through_submit() {
+    let mut state = setup_game_at_main_phase();
+    let spell = create_creature_spell_in_hand(&mut state, PlayerId(0));
+    {
+        let obj = state.objects.get_mut(&spell).unwrap();
+        obj.mana_cost = ManaCost::Cost {
+            shards: vec![ManaCostShard::WhiteBlue, ManaCostShard::PhyrexianWhite],
+            generic: 1,
+        };
+        obj.keywords.push(Keyword::Convoke);
+        obj.base_keywords.push(Keyword::Convoke);
+    }
+    let demand_card = create_object(
+        &mut state,
+        CardId(901),
+        PlayerId(0),
+        "White Demand".to_string(),
+        Zone::Hand,
+    );
+    state.objects.get_mut(&demand_card).unwrap().mana_cost = ManaCost::Cost {
+        shards: vec![ManaCostShard::White],
+        generic: 0,
+    };
+    let blue_helper = create_object(
+        &mut state,
+        CardId(902),
+        PlayerId(0),
+        "Blue Helper".to_string(),
+        Zone::Battlefield,
+    );
+    let unused_helper = create_object(
+        &mut state,
+        CardId(903),
+        PlayerId(0),
+        "Unused Helper".to_string(),
+        Zone::Battlefield,
+    );
+    for (id, color) in [
+        (blue_helper, ManaColor::Blue),
+        (unused_helper, ManaColor::Red),
+    ] {
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.card_types.core_types.push(CoreType::Creature);
+        obj.color.push(color);
+        obj.power = Some(1);
+        obj.toughness = Some(1);
+    }
+    seed_unit(
+        &mut state,
+        PlayerId(0),
+        plain_unit(ManaType::White, ObjectId(904)),
+    );
+    let pinned_colorless = seed_unit(
+        &mut state,
+        PlayerId(0),
+        plain_unit(ManaType::Colorless, ObjectId(905)),
+    );
+    let life_before = state.players[0].life;
+
+    let cast = apply_as_current(
+        &mut state,
+        GameAction::CastSpell {
+            object_id: spell,
+            card_id: CardId(22),
+            targets: vec![],
+            payment_mode: CastPaymentMode::Manual,
+        },
+    )
+    .expect("manual spell cast should enter payment");
+    assert!(matches!(cast.waiting_for, WaitingFor::ManaPayment { .. }));
+    apply_as_current(
+        &mut state,
+        GameAction::SpendPoolMana {
+            pip_id: pinned_colorless,
+        },
+    )
+    .expect("colorless pin pays the generic shard");
+    for (object_id, mana_type) in [
+        (blue_helper, ManaType::Blue),
+        (unused_helper, ManaType::Red),
+    ] {
+        apply_as_current(
+            &mut state,
+            GameAction::TapForConvoke {
+                object_id,
+                mana_type,
+            },
+        )
+        .expect("convoke selection should be accepted");
+    }
+    let pause = apply_as_current(&mut state, GameAction::PassPriority)
+        .expect("payment confirmation should reach Phyrexian choice");
+    assert!(matches!(
+        pause.waiting_for,
+        WaitingFor::PhyrexianPayment { .. }
+    ));
+    let finalized = apply_as_current(
+        &mut state,
+        GameAction::SubmitPhyrexianChoices {
+            choices: vec![ShardChoice::PayMana],
+        },
+    )
+    .expect("PayMana should finalize the spell");
+    assert!(matches!(finalized.waiting_for, WaitingFor::Priority { .. }));
+    assert!(matches!(
+        state.stack.last().map(|entry| &entry.kind),
+        Some(StackEntryKind::Spell { .. })
+    ));
+    assert_eq!(state.players[0].life, life_before);
+    assert!(!state.players[0]
+        .mana_pool
+        .mana
+        .iter()
+        .any(|unit| unit.pip_id == pinned_colorless));
+    assert!(!state.objects[&unused_helper].tapped);
+    assert!(!state.players[0]
+        .mana_pool
+        .mana
+        .iter()
+        .any(ManaUnit::is_convoke_payment));
+}
+
+#[test]
+fn x_phyrexian_activation_binds_pin_through_choose_x_and_submit() {
+    let mut state = setup_game_at_main_phase();
+    let source = create_object(
+        &mut state,
+        CardId(906),
+        PlayerId(0),
+        "X Phyrexian Source".to_string(),
+        Zone::Battlefield,
+    );
+    {
+        let obj = state.objects.get_mut(&source).unwrap();
+        obj.card_types.core_types.push(CoreType::Artifact);
+        Arc::make_mut(&mut obj.abilities).push(
+            AbilityDefinition::new(
+                AbilityKind::Activated,
+                Effect::Unimplemented {
+                    name: "X Phyrexian activation".to_string(),
+                    description: None,
+                },
+            )
+            .cost(AbilityCost::Mana {
+                cost: ManaCost::Cost {
+                    shards: vec![ManaCostShard::X, ManaCostShard::PhyrexianWhite],
+                    generic: 0,
+                },
+            }),
+        );
+    }
+    seed_unit(
+        &mut state,
+        PlayerId(0),
+        plain_unit(ManaType::White, ObjectId(907)),
+    );
+    let pinned = seed_unit(
+        &mut state,
+        PlayerId(0),
+        plain_unit(ManaType::Colorless, ObjectId(908)),
+    );
+    seed_unit(
+        &mut state,
+        PlayerId(0),
+        plain_unit(ManaType::Colorless, ObjectId(909)),
+    );
+    let life_before = state.players[0].life;
+
+    apply_as_current(
+        &mut state,
+        GameAction::ActivateAbility {
+            source_id: source,
+            ability_index: 0,
+        },
+    )
+    .expect("activation should request X");
+    assert!(matches!(state.waiting_for, WaitingFor::ChooseXValue { .. }));
+    apply_as_current(&mut state, GameAction::ChooseX { value: 1 })
+        .expect("choosing X should enter mana payment");
+    assert!(matches!(state.waiting_for, WaitingFor::ManaPayment { .. }));
+    apply_as_current(&mut state, GameAction::SpendPoolMana { pip_id: pinned })
+        .expect("pin should bind the chosen X generic payment");
+    apply_as_current(&mut state, GameAction::PassPriority)
+        .expect("payment should reach Phyrexian choice");
+    assert!(matches!(
+        state.waiting_for,
+        WaitingFor::PhyrexianPayment { .. }
+    ));
+    apply_as_current(
+        &mut state,
+        GameAction::SubmitPhyrexianChoices {
+            choices: vec![ShardChoice::PayMana],
+        },
+    )
+    .expect("PayMana should finalize activation");
+    assert!(matches!(
+        state.stack.last().map(|entry| &entry.kind),
+        Some(StackEntryKind::ActivatedAbility { .. })
+    ));
+    assert_eq!(state.players[0].life, life_before);
+    assert!(!state.players[0]
+        .mana_pool
+        .mana
+        .iter()
+        .any(|unit| unit.pip_id == pinned));
 }
 
 /// TEST 12 (CR 602 / CR 106.6): pinning for an ACTIVATED ability uses the

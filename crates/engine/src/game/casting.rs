@@ -13042,25 +13042,7 @@ fn auto_tap_and_pay_cost_excluding(
         }
     }
 
-    // CR 107.4b + CR 601.2f: The real spend is demand-aware. The hand demand
-    // (other cards in hand needing colors) is the existing soft hybrid-resolution
-    // signal; the incoming `sub_cost_demand` is the outer cost's reserved colored
-    // shards when this payment is a nested mana sub-cost (CR 118.10). Combine the
-    // two by element-wise max so a color reserved by EITHER is deprioritized when
-    // paying a generic pip — preventing the spend from consuming a floated color
-    // the outer cost still needs (Dimir/Gruul Signet bug). Computed BEFORE the
-    // mutable pool borrow below to avoid a borrow-checker conflict (WATCH-ITEM #2).
-    let hand_demand = mana_payment::compute_hand_color_demand(state, player, source_id);
-    let combined_demand: mana_payment::ColorDemand = match sub_cost_demand {
-        Some(outer) => {
-            let mut d = hand_demand;
-            for (slot, &reserved) in d.iter_mut().zip(outer.iter()) {
-                *slot = (*slot).max(reserved);
-            }
-            d
-        }
-        None => hand_demand,
-    };
+    let combined_demand = payment_color_demand(state, player, source_id, sub_cost_demand);
     // CR 118.3a: read the caster's player-directed pin hints for THIS spell.
     // `finalize_mana_payment` moves them onto the transient `active_payment_pins`
     // (it `take()`s `pending_cast` before the spend, so they can't be read from
@@ -13106,6 +13088,26 @@ fn auto_tap_and_pay_cost_excluding(
     }
 
     Ok(spent_units)
+}
+
+/// CR 107.4b + CR 118.10 + CR 601.2f: Derive the single color-demand signal
+/// shared by payment execution and every Phyrexian dry-run. Other cards in hand
+/// provide the normal hybrid preference; a nested outer cost contributes colors
+/// it still reserves. Element-wise max means either source can reserve a color
+/// without double-counting the same unit.
+pub(super) fn payment_color_demand(
+    state: &GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+    outer_demand: Option<&mana_payment::ColorDemand>,
+) -> mana_payment::ColorDemand {
+    let mut demand = mana_payment::compute_hand_color_demand(state, player, source_id);
+    if let Some(outer) = outer_demand {
+        for (slot, &reserved) in demand.iter_mut().zip(outer.iter()) {
+            *slot = (*slot).max(reserved);
+        }
+    }
+    demand
 }
 
 /// CR 106.6: Build (core-types, subtypes) slices for a `PaymentContext::Activation`
