@@ -845,6 +845,7 @@ fn walk_cost(cost: &AbilityCost, out: &mut Vec<String>) {
         | AbilityCost::PaySpeed { .. }
         | AbilityCost::ReturnToHand { .. }
         | AbilityCost::Unattach
+        | AbilityCost::UnattachFrom { .. }
         | AbilityCost::Mill { .. }
         | AbilityCost::Exert
         | AbilityCost::Blight { .. }
@@ -930,8 +931,15 @@ fn walk_effect(effect: &Effect, out: &mut Vec<String>) {
             }
         }
         Effect::SeparateIntoPiles {
-            chosen_pile_effect, ..
-        } => walk_ability_def(chosen_pile_effect, out),
+            chosen_pile_effect,
+            unchosen_pile_effect,
+            ..
+        } => {
+            walk_ability_def(chosen_pile_effect, out);
+            if let Some(unchosen) = unchosen_pile_effect {
+                walk_ability_def(unchosen, out);
+            }
+        }
         Effect::RevealFromHand { on_decline, .. } => {
             if let Some(sub) = on_decline {
                 walk_ability_def(sub, out);
@@ -985,7 +993,7 @@ fn walk_effect(effect: &Effect, out: &mut Vec<String>) {
         // (LosesAbilities) that grants an ability that conjures. The Destroy
         // rider carries no static.
         Effect::Counter { source_rider, .. } => {
-            if let Some(CounterSourceRider::LosesAbilities { static_def }) = source_rider {
+            if let Some(CounterSourceRider::LosesAbilities { static_def, .. }) = source_rider {
                 walk_static(static_def, out);
             }
         }
@@ -1153,7 +1161,7 @@ fn walk_effect(effect: &Effect, out: &mut Vec<String>) {
         | Effect::GrantCastingPermission { .. }
         | Effect::ChooseFromZone { .. }
         | Effect::RememberCard { .. }
-        | Effect::ForEachCategoryExile { .. }
+        | Effect::ForEachCategory { .. }
         | Effect::ChooseObjectsIntoTrackedSet { .. }
         | Effect::ChooseAndSacrificeRest { .. }
         | Effect::EachPlayerCopyChosen { .. }
@@ -2878,6 +2886,8 @@ mod tests {
             object_filter: TargetFilter::Any,
             chooser: PlayerScope::Controller,
             chosen_pile_effect: Box::new(conjure_ability("piles", Zone::Hand)),
+            pile_source: crate::types::ability::PileSource::Battlefield,
+            unchosen_pile_effect: None,
         };
         walk_effect(&piles, &mut names);
 
@@ -3004,6 +3014,7 @@ mod tests {
             target: TargetFilter::Any,
             source_rider: Some(CounterSourceRider::LosesAbilities {
                 static_def: Box::new(counter_static),
+                duration: Box::new(crate::types::ability::Duration::UntilHostLeavesPlay),
             }),
             countered_spell_zone: None,
         };

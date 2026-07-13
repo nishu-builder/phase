@@ -1080,6 +1080,28 @@ pub fn parse_single_cost(text: &str) -> AbilityCost {
         return AbilityCost::Unattach;
     }
 
+    // CR 701.3d + CR 608.2k: "Unattach a[n] <type> from ~" — unattach a matching
+    // attachment from the source host as a cost (Captain America's Throw). The
+    // detached object stays on the battlefield and becomes this ability's
+    // cost-referent. Kept AFTER the more-specific self-unattach branch above.
+    // The "from ~" recipient is normalized from the card name upstream
+    // (`normalize_card_name_refs`).
+    if let Some(((), after_article)) = nom_on_lower(text, &lower, |i| {
+        let (i, _) = tag("unattach ").parse(i)?;
+        value((), alt((tag("an "), tag("a ")))).parse(i)
+    }) {
+        let (filter, remainder) = parse_type_phrase(after_article);
+        let rem_lower = remainder.to_lowercase();
+        if let Some(((), tail)) = nom_on_lower(remainder, &rem_lower, |i| {
+            value((), preceded(tag(" from "), parse_cost_self_reference)).parse(i)
+        }) {
+            if tail.is_empty() {
+                // Only count == 1 has Oracle support today ("a[n] <type>").
+                return AbilityCost::UnattachFrom { filter, count: 1 };
+            }
+        }
+    }
+
     // "reveal your hand" — reveal the controller's entire hand.
     // CR 701.20a: Reveal means show to all players. Used as alternative cost
     // (Land Grant class). Modeled as EffectCost wrapping Effect::RevealHand.
@@ -2175,6 +2197,36 @@ mod tests {
     }
 
     #[test]
+    fn cost_unattach_a_type_from_self() {
+        // CR 701.3d + CR 608.2k: Captain America's Throw cost. The recipient
+        // "from Captain America, First Avenger" is normalized to "from ~"
+        // upstream by `normalize_card_name_refs`.
+        let (expected_filter, remainder) = super::parse_type_phrase("Equipment from ~");
+        assert_eq!(remainder, " from ~");
+        assert_eq!(
+            parse_oracle_cost("Unattach an Equipment from ~"),
+            AbilityCost::UnattachFrom {
+                filter: expected_filter,
+                count: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn cost_unattach_self_still_unit_variant() {
+        // Negative: the more-specific self-unattach branch must win; it must NOT
+        // be captured by the new "unattach a[n] <type> from ~" branch.
+        assert_eq!(
+            parse_oracle_cost("Unattach this Equipment"),
+            AbilityCost::Unattach
+        );
+        assert!(!matches!(
+            parse_oracle_cost("Unattach this Equipment"),
+            AbilityCost::UnattachFrom { .. }
+        ));
+    }
+
+    #[test]
     fn cost_mana() {
         assert_eq!(
             parse_oracle_cost("{2}{W}"),
@@ -2791,12 +2843,13 @@ mod tests {
     }
 
     /// CR 508.1a + CR 601.2f: the conditional flat form gated by "you attacked
-    /// with a <filter>" extracts a filtered `YouAttackedWithAtLeast { count: 1 }`.
-    /// The trailing "this turn" is stripped upstream as a duration before the
-    /// reparse, so the bare form is what reaches the reducer (Thaumaton Torpedo).
+    /// with a <filter>" extracts a filtered `AttackedThisTurn` quantity gate
+    /// (GE 1). The trailing "this turn" is stripped upstream as a duration
+    /// before the reparse, so the bare form is what reaches the reducer
+    /// (Thaumaton Torpedo).
     #[test]
     fn cost_reduction_if_attacked_with_filter_gate() {
-        use crate::types::ability::ParsedCondition;
+        use crate::types::ability::{Comparator, CountScope, ParsedCondition, QuantityRef};
         let r = try_parse_cost_reduction(
             "this ability costs {3} less to activate if you attacked with a spacecraft",
         )
@@ -2804,9 +2857,17 @@ mod tests {
         assert_eq!(r.amount_per, 3);
         assert_eq!(r.count, QuantityExpr::Fixed { value: 1 });
         match r.condition {
-            Some(ParsedCondition::YouAttackedWithAtLeast {
-                count: 1,
-                filter: Some(TargetFilter::Typed(tf)),
+            Some(ParsedCondition::QuantityComparison {
+                lhs:
+                    QuantityExpr::Ref {
+                        qty:
+                            QuantityRef::AttackedThisTurn {
+                                scope: CountScope::Controller,
+                                filter: Some(TargetFilter::Typed(tf)),
+                            },
+                    },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 1 },
             }) => assert!(
                 tf.type_filters
                     .iter()

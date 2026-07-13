@@ -731,6 +731,7 @@ fn filterprop_reads_only_candidate_fp(p: &FilterProp) -> bool {
         | FilterProp::Historic
         | FilterProp::NotHistoric
         | FilterProp::FaceDown
+        | FilterProp::Transformed
         | FilterProp::HasXInManaCost
         | FilterProp::HasManaAbility
         | FilterProp::HasNoAbilities
@@ -754,7 +755,10 @@ fn filterprop_reads_only_candidate_fp(p: &FilterProp) -> bool {
 
         // POISON — read another object / side-table / combat / history / identity.
         // ControllerChoseLabel reads the controller's per-player anchor state.
+        // ControllerMatches reads live per-turn history (damage ledger, life
+        // tallies) via the controller's inner PlayerFilter predicate.
         FilterProp::ControllerChoseLabel { .. }
+        | FilterProp::ControllerMatches { .. }
         | FilterProp::Attacking { .. }
         | FilterProp::Blocking
         | FilterProp::BlockingSource
@@ -794,6 +798,7 @@ fn filterprop_reads_only_candidate_fp(p: &FilterProp) -> bool {
         | FilterProp::SameNameAsParentTarget
         | FilterProp::NameMatchesAnyPermanent { .. }
         | FilterProp::DifferentNameFrom { .. }
+        | FilterProp::DistinctFrom { .. }
         | FilterProp::SharesQuality { .. }
         | FilterProp::CanEnchant { .. }
         | FilterProp::IsChosenCreatureType
@@ -804,10 +809,19 @@ fn filterprop_reads_only_candidate_fp(p: &FilterProp) -> bool {
         | FilterProp::ProtectorMatches { .. }
         | FilterProp::HasHasteOrControlledSinceTurnBegan
         | FilterProp::Unpaired
+        // CR 205.3m + CR 903.3: POISON, and deliberately NOT grouped with
+        // `IsCommander` above. `IsCommander` reads `obj.is_commander` — a field ON
+        // the candidate. This one reads the CONTROLLER'S COMMANDER (the deck-pool
+        // registration, falling back to an is_commander object scan) and compares it
+        // against the candidate, so its answer depends on state outside the
+        // candidate's fingerprint entirely. Memoizing on the candidate alone would
+        // cache a verdict that a commander change invalidates.
+        | FilterProp::SharesCreatureTypeWithCommander
         // CR 608.2c: Reads the resolution-chain tracked-set side-table
         // (`tracked_object_sets` / `chain_tracked_set_id`), not the candidate's
         // own fingerprint — POISON for memoization.
         | FilterProp::InTrackedSet { .. }
+        | FilterProp::CouldBeTargetedByTriggeringSpell
         | FilterProp::Other { .. } => false,
     }
 }

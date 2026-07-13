@@ -4,6 +4,9 @@
 use super::prelude::*;
 #[allow(unused_imports)]
 use super::support::*;
+use nom::character::complete::anychar;
+use nom::combinator::not;
+use nom::multi::many1;
 
 /// CR 702.11e + CR 609.4 + CR 702.21a: Parse the "[subject] can be the targets
 /// of spells and abilities[ you control] as though they didn't have hexproof[.
@@ -924,8 +927,34 @@ fn parse_multi_sentence_statics(text: &str) -> Option<Vec<StaticDefinition>> {
         return None;
     }
     let mut defs = Vec::new();
+    let mut attached_scope: Option<TargetFilter> = None;
     for segment in &segments {
-        let segment_defs = parse_static_line_multi_inner(segment);
+        let mut segment_defs = parse_static_line_multi_inner(segment);
+        // CR 608.2c: In an Aura/Equipment, a continuation sentence whose subject is
+        // the pronoun "It" refers to the enchanted/equipped creature, not the
+        // Aura/Equipment object itself. Its static parses with `SelfRef` (the
+        // pronoun resolves to self at the line level, with no attachment context);
+        // rebind it to the attached scope the first sentence established (Spider-Man
+        // No More: "Enchanted creature is a Citizen ... It has defender and loses all
+        // other abilities." — the second sentence applies to the enchanted creature).
+        if let Some(scope) = &attached_scope {
+            if segment_subject_is_pronoun_it(segment) {
+                for def in &mut segment_defs {
+                    if def.affected.as_ref() == Some(&TargetFilter::SelfRef) {
+                        def.affected = Some(scope.clone());
+                    }
+                }
+            }
+        } else {
+            attached_scope = segment_defs
+                .iter()
+                .find_map(|def| {
+                    def.affected
+                        .as_ref()
+                        .filter(|f| affected_is_attached_scope(f))
+                })
+                .cloned();
+        }
         if segment_defs.is_empty() {
             // CR 602.5b + CR 602.5c: An "activate ... only once each turn" rider
             // carries no standalone static — it folds a once-per-turn use-restriction
@@ -945,6 +974,29 @@ fn parse_multi_sentence_statics(text: &str) -> Option<Vec<StaticDefinition>> {
         defs.extend(segment_defs);
     }
     Some(defs)
+}
+
+/// CR 608.2c: True iff the sentence's subject is the bare pronoun "It" — an
+/// Aura/Equipment continuation referring to the enchanted/equipped creature,
+/// distinct from a self-name (`~`) or a typed subject.
+fn segment_subject_is_pronoun_it(segment: &str) -> bool {
+    // `trim_start` normalizes leading whitespace on the pre-split sentence chunk
+    // and `to_lowercase` builds the TextPair lower half — both structural, not
+    // dispatch. The "it " subject test itself runs through nom's `tag()` via the
+    // `nom_tag_tp` bridge so the pronoun match stays on the combinator path.
+    let trimmed = segment.trim_start();
+    let lower = trimmed.to_lowercase();
+    nom_tag_tp(&TextPair::new(trimmed, &lower), "it ").is_some()
+}
+
+/// True iff a filter is scoped to an attached object — the enchanted (Aura,
+/// `EnchantedBy`) or equipped (Equipment, `EquippedBy`) creature.
+fn affected_is_attached_scope(filter: &TargetFilter) -> bool {
+    matches!(
+        filter,
+        TargetFilter::Typed(tf)
+            if tf.properties.iter().any(|p| matches!(p, FilterProp::EnchantedBy | FilterProp::EquippedBy))
+    )
 }
 
 /// CR 611.3a: Recognize a sentence whose leading connector binds it to the
@@ -1173,6 +1225,80 @@ pub(crate) fn parse_static_line_multi_inner(text: &str) -> Vec<StaticDefinition>
     defs
 }
 
+/// CR 611.3a + CR 702 (#5257 Rayami, First of the Fallen): "As long as an exiled
+/// <type> card [with a <counter> counter on it] has <K0>, ~ has <K0>. The same is
+/// true for <K1>, …, and <Kn>." Each listed keyword is an INDEPENDENT conditional
+/// grant — the source has keyword K as long as an exiled matching card that HAS K
+/// is present — so this emits one Continuous SelfRef static per keyword, gated on
+/// `IsPresent { filter + WithKeyword(K) }`. The shared runtime already evaluates
+/// this: `IsPresent` scans every object and `WithKeyword` reads the exiled card's
+/// keywords. Modeling it as one static with a shared condition (the prior fallback
+/// left the condition `Unrecognized`) made every keyword apply unconditionally.
+fn parse_keyword_grant_from_exiled_object_static(text: &str) -> Option<Vec<StaticDefinition>> {
+    // "As long as a[n] exiled " → the object phrase (original case for parse_type_phrase).
+    let lower = text.to_lowercase();
+    let (_, obj) = nom_on_lower(text, &lower, |i| {
+        let (i, _) = tag::<_, _, OracleError<'_>>("as long as ").parse(i)?;
+        let (i, _) = alt((tag("an "), tag("a "))).parse(i)?;
+        let (i, _) = tag("exiled ").parse(i)?;
+        Ok((i, ()))
+    })?;
+
+    // The object type phrase; the remainder begins at " has <keyword>".
+    let (base_filter, remainder) = parse_type_phrase(obj);
+    let TargetFilter::Typed(mut typed) = base_filter else {
+        return None;
+    };
+    // CR 400.1: "exiled" scopes the presence check to the exile zone.
+    typed
+        .properties
+        .push(FilterProp::InZone { zone: Zone::Exile });
+    let base = typed;
+
+    // remainder (lowercased for keyword matching): "has <K0>, ~ has <K0>. The same
+    // is true for <list>." The condition keyword and the granted keyword must match.
+    let rem = remainder.trim_start().to_lowercase();
+    let (i, _) = tag::<_, _, OracleError<'_>>("has ")
+        .parse(rem.as_str())
+        .ok()?;
+    let (i, k0_name) = crate::parser::oracle_nom::primitives::parse_keyword_name(i).ok()?;
+    let (i, _) = tag::<_, _, OracleError<'_>>(", ").parse(i).ok()?;
+    let (i, _) = alt((tag::<_, _, OracleError<'_>>("~ has "), tag("it has ")))
+        .parse(i)
+        .ok()?;
+    let (tail, k0b_name) = crate::parser::oracle_nom::primitives::parse_keyword_name(i).ok()?;
+    if k0_name != k0b_name {
+        return None;
+    }
+    let k0: Keyword = k0_name.parse().ok()?;
+
+    // tail: ". the same is true for <list>." (or "." / "" for a single keyword).
+    let tail = tail.trim_start_matches('.').trim_start();
+    let mut keywords = vec![k0];
+    if !tail.is_empty() {
+        keywords.extend(
+            super::super::oracle_effect::sequence::try_parse_same_is_true_continuation(tail)?,
+        );
+    }
+
+    let defs = keywords
+        .into_iter()
+        .map(|ki| {
+            let mut tf = base.clone();
+            tf.properties
+                .push(FilterProp::WithKeyword { value: ki.clone() });
+            StaticDefinition::continuous()
+                .affected(TargetFilter::SelfRef)
+                .modifications(vec![ContinuousModification::AddKeyword { keyword: ki }])
+                .condition(StaticCondition::IsPresent {
+                    filter: Some(TargetFilter::Typed(tf)),
+                })
+                .description(text.to_string())
+        })
+        .collect();
+    Some(defs)
+}
+
 fn parse_static_line_multi_dispatch(text: &str) -> Vec<StaticDefinition> {
     let stripped = strip_reminder_text(text);
     let lower = stripped.to_lowercase();
@@ -1209,6 +1335,16 @@ fn parse_static_line_multi_dispatch(text: &str) -> Vec<StaticDefinition> {
     // there are 2+ segments and EVERY segment yields at least one static, which
     // restricts the path to genuine sibling-static lines and leaves trailing
     // non-static prose to the single-sentence fallback below.
+    // CR 611.3a + CR 702 (#5257 Rayami): "As long as an exiled <type> card
+    // [with a <counter> counter on it] has <K0>, ~ has <K0>. The same is true
+    // for <K1>, …" — one independent conditional keyword grant per listed
+    // keyword. Must precede generic multi-sentence splitting, which would strand
+    // the shared condition on the first keyword only (the observed bug: the grant
+    // applies unconditionally to every keyword).
+    if let Some(defs) = parse_keyword_grant_from_exiled_object_static(&stripped) {
+        return defs;
+    }
+
     if let Some(defs) = parse_multi_sentence_statics(&stripped) {
         return defs;
     }
@@ -2795,6 +2931,91 @@ pub(crate) fn parse_qualified_creatures_you_control_suffix<'a>(
     Some((filter, predicate_text))
 }
 
+/// CR 611.3a: Split an Oxford-comma / "and" / "or" / "and/or" subject list into
+/// its item text slices — "Skeletons, Vampires, and Zombies" →
+/// `["Skeletons", "Vampires", "Zombies"]`; "Plants and Treefolk" →
+/// `["Plants", "Treefolk"]`; a single subject → one item.
+///
+/// Uses `separated_list1(separator, item)` — the same idiom as
+/// [`parse_subtype_or_list_prefix_with_word_parser`] — where each item is the
+/// maximal run of characters that does not begin a list separator. Unlike a
+/// word-boundary scan (which only ever tries a match at the start of a word and
+/// so can never match a separator that begins with a comma or a leading space),
+/// this consumes a separator wherever it actually starts, so a shared-suffix
+/// Oxford list splits into *every* item rather than collapsing to one.
+///
+/// A bare comma is only a list separator inside a *coordinated* enumeration:
+/// English writes a genuine subject union as "A, B, and C" / "A and B" /
+/// "A or B" — always with a coordinating conjunction before the final item. A
+/// bare-comma sequence with no coordinator is instead a stack of pre-nominal
+/// adjectives modifying one shared head noun ("Noncreature, non-Equipment
+/// artifacts" — Dan Lewis: artifacts that are noncreature AND non-Equipment),
+/// which is a *single* subject, not a union. A pure `", "` split cannot tell the
+/// two apart — both "Noncreature" and "non-Equipment artifacts" anchor as valid
+/// standalone subjects — so this gates bare-comma splitting on the presence of a
+/// coordinator ([`list_has_coordinator`]). Without one, the whole descriptor is
+/// returned as a single item and the caller defers to the single-subject path.
+///
+/// Bare " or " is also excluded from the separator grammar (it would split an
+/// intra-subject qualifier like "with power 3 or greater"); only the
+/// comma-anchored ", or " is a separator. As a final backstop, the caller
+/// re-parses every item as a controller-anchored subject and rejects the whole
+/// compound (`None`) unless each one anchors, so an over-split can never emit a
+/// wrong `Or`.
+fn split_subject_list(text: &str) -> Vec<&str> {
+    // Not a coordinated enumeration → one subject (do not split bare commas).
+    if !list_has_coordinator(text) {
+        return vec![text.trim()];
+    }
+
+    // One list item: one or more characters, none of which begins a separator.
+    fn subject_list_item(input: &str) -> OracleResult<'_, &str> {
+        recognize(many1(preceded(not(subject_list_separator), anychar))).parse(input)
+    }
+
+    match separated_list1(subject_list_separator, subject_list_item).parse(text) {
+        // Require the split to consume the whole list (a trailing/dangling
+        // separator leaves `rest` non-empty) — otherwise treat it as one item.
+        Ok((rest, items)) if rest.trim().is_empty() => items.into_iter().map(str::trim).collect(),
+        _ => vec![text.trim()],
+    }
+}
+
+/// True when `text` carries a coordinating conjunction ("and" / "or" / "and/or")
+/// at a word boundary — the syntactic marker of a genuine enumeration. Matched
+/// without the leading space because [`nom_primitives::scan_at_word_boundaries`]
+/// lands on each word start; the trailing space keeps "or"/"and" from matching
+/// inside a word ("Warriors", "Orcs"). Oracle text writes these coordinators
+/// lowercase mid-subject, so the original-case `text` matches directly.
+fn list_has_coordinator(text: &str) -> bool {
+    nom_primitives::scan_at_word_boundaries(text, |i: &str| {
+        alt((
+            tag::<_, _, OracleError<'_>>("and/or "),
+            tag("and "),
+            tag("or "),
+        ))
+        .parse(i)
+    })
+    .is_some()
+}
+
+/// One subject-list connector token. Ordered longest/most-specific first so that
+/// at a comma position ", and " wins over ", " (no dangling comma on the item).
+fn subject_list_separator(input: &str) -> OracleResult<'_, ()> {
+    value(
+        (),
+        alt((
+            tag::<_, _, OracleError<'_>>(", and/or "),
+            tag(", and "),
+            tag(", or "),
+            tag(" and/or "),
+            tag(" and "),
+            tag(", "),
+        )),
+    )
+    .parse(input)
+}
+
 fn parse_shared_controller_compound_subject_filter(subject: &TextPair<'_>) -> Option<TargetFilter> {
     let (descriptor, suffix) = parse_subject_suffix(subject, " you control")
         .map(|descriptor| (descriptor, " you control"))
@@ -2803,53 +3024,55 @@ fn parse_shared_controller_compound_subject_filter(subject: &TextPair<'_>) -> Op
                 .map(|descriptor| (descriptor, " your opponents control"))
         })?;
 
-    let (left_lower, _, right_lower) = nom_primitives::scan_preceded(descriptor.lower, |input| {
-        value((), tag::<_, _, OracleError<'_>>("and ")).parse(input)
-    })?;
-    let right_start = descriptor.lower.len() - right_lower.len();
-    let left_original = descriptor.original[..left_lower.len()].trim();
-    let right_original = descriptor.original[right_start..].trim();
-    if left_original.is_empty() || right_original.is_empty() {
+    // A leading distribution word ("Other <list>", "Each other <list>", "Each
+    // <list>") applies across EVERY list item, so strip it here and re-attach
+    // "other " to each item's subject. A mid-list "other" (Grimlock: "…, and
+    // other Transformers creatures") stays on its own item and is handled by
+    // `parse_continuous_subject_filter` when that item is parsed.
+    let descriptor_original = descriptor.original.trim();
+    let descriptor_lower_owned = descriptor_original.to_lowercase();
+    let descriptor_tp = TextPair::new(descriptor_original, &descriptor_lower_owned);
+    let (list_text, distribute_other) =
+        if let Some(rest) = nom_tag_tp(&descriptor_tp, "each other ") {
+            (rest.original.trim(), true)
+        } else if let Some(rest) = nom_tag_tp(&descriptor_tp, "other ") {
+            (rest.original.trim(), true)
+        } else if let Some(rest) = nom_tag_tp(&descriptor_tp, "each ") {
+            (rest.original.trim(), false)
+        } else {
+            (descriptor_original, false)
+        };
+    if list_text.is_empty() {
         return None;
     }
 
-    let left_lower_owned = left_original.to_lowercase();
-    let left_tp = TextPair::new(left_original, &left_lower_owned);
-    let (left_core, distribute_other) = if let Some(rest) = nom_tag_tp(&left_tp, "each other ") {
-        (rest.original.trim(), true)
-    } else if let Some(rest) = nom_tag_tp(&left_tp, "other ") {
-        (rest.original.trim(), true)
-    } else if let Some(rest) = nom_tag_tp(&left_tp, "each ") {
-        (rest.original.trim(), false)
-    } else {
-        (left_original, false)
-    };
-    if left_core.is_empty() {
-        return None;
-    }
-
-    let left_subject = if distribute_other {
-        format!("other {left_core}{suffix}")
-    } else {
-        format!("{left_core}{suffix}")
-    };
-    let right_subject = if distribute_other {
-        format!("other {right_original}{suffix}")
-    } else {
-        format!("{right_original}{suffix}")
-    };
-
-    let left_filter = parse_continuous_subject_filter(&left_subject)?;
-    let right_filter = parse_continuous_subject_filter(&right_subject)?;
-    if !filter_has_source_or_controller_anchor(&left_filter)
-        || !filter_has_source_or_controller_anchor(&right_filter)
-    {
+    // Split the full Oxford-comma / and / or subject list into its items. A
+    // single item is not a compound subject — defer to the single-subject path.
+    let items = split_subject_list(list_text);
+    if items.len() < 2 {
         return None;
     }
 
     let mut filters = Vec::new();
-    push_or_filter_branch(&mut filters, left_filter);
-    push_or_filter_branch(&mut filters, right_filter);
+    for item in items {
+        if item.is_empty() {
+            return None;
+        }
+        let item_subject = if distribute_other {
+            format!("other {item}{suffix}")
+        } else {
+            format!("{item}{suffix}")
+        };
+        let item_filter = parse_continuous_subject_filter(&item_subject)?;
+        // Fail-safe: an intra-subject mis-split (e.g. a qualifier containing
+        // "and") yields an item that isn't a controller-anchored subject, so we
+        // bail to `None` and let the caller's other handlers try — never emit a
+        // wrong Or.
+        if !filter_has_source_or_controller_anchor(&item_filter) {
+            return None;
+        }
+        push_or_filter_branch(&mut filters, item_filter);
+    }
     Some(TargetFilter::Or { filters })
 }
 
@@ -3028,6 +3251,65 @@ pub(crate) fn parse_continuous_subject_filter(subject: &str) -> Option<TargetFil
         return parse_continuous_subject_filter(rest_tp.original.trim());
     }
 
+    // CR 605.1 / CR 113.1: strip a trailing "with a mana ability" / "with no
+    // abilities" object qualifier, parse the base subject recursively, and
+    // attach the runtime-evaluated `FilterProp`. Covers Raggadragga, Goregutter
+    // ("Each creature you control with a mana ability gets +2/+2"), Muraganda
+    // Petroglyphs ("Creatures with no abilities get +2/+2"), and Ruxa, Patient
+    // Professor ("Creatures you control with no abilities get +1/+1"). Both
+    // props are matched authoritatively by `game::filter`
+    // (`HasManaAbility` via the mana-ability classifier, `HasNoAbilities` via
+    // `object_has_no_abilities`), so this is a grammar-only seam. The qualifier
+    // must sit at the very end of the subject phrase (`after` empty) so a
+    // mid-phrase "with ..." clause is not misclaimed.
+    for (needle, prop) in [
+        (" with a mana ability", FilterProp::HasManaAbility),
+        (" with no abilities", FilterProp::HasNoAbilities),
+    ] {
+        let mut parse_trailing_qualifier = all_consuming(terminated(
+            take_until::<_, _, OracleError<'_>>(needle),
+            tag::<_, _, OracleError<'_>>(needle),
+        ));
+        if let Ok((_, base_lower)) = parse_trailing_qualifier.parse(tp.lower) {
+            if !base_lower.trim().is_empty() {
+                let base = lower_subslice_to_original(&tp, base_lower)?.trim();
+                return parse_continuous_subject_filter(base).map(|f| add_property(f, prop));
+            }
+        }
+    }
+
+    // CR 509.1g / CR 509.1h: strip a trailing "blocking or blocked by ~" /
+    // "blocking or blocked by this creature" combat-relationship qualifier and
+    // attach a source-anchored `FilterProp::CombatRelation` (Alms Beast,
+    // "Creatures blocking or blocked by ~ have lifelink"). The self-reference is
+    // normalized to "~"; "this creature" is accepted for the literal phrasing.
+    // Mirrors the already-parsed target-relative form in `oracle_target`;
+    // `game::filter` evaluates `CombatRelationSubject::Source` authoritatively,
+    // so this is a grammar-only seam.
+    for needle in [
+        " blocking or blocked by ~",
+        " blocking or blocked by this creature",
+    ] {
+        let mut parse_trailing_qualifier = all_consuming(terminated(
+            take_until::<_, _, OracleError<'_>>(needle),
+            tag::<_, _, OracleError<'_>>(needle),
+        ));
+        if let Ok((_, base_lower)) = parse_trailing_qualifier.parse(tp.lower) {
+            if !base_lower.trim().is_empty() {
+                let base = lower_subslice_to_original(&tp, base_lower)?.trim();
+                return parse_continuous_subject_filter(base).map(|f| {
+                    add_property(
+                        f,
+                        FilterProp::CombatRelation {
+                            relation: CombatRelation::BlockingOrBlockedBy,
+                            subject: CombatRelationSubject::Source,
+                        },
+                    )
+                });
+            }
+        }
+    }
+
     if let Some(filter) = parse_shared_controller_compound_subject_filter(&tp) {
         return Some(filter);
     }
@@ -3108,7 +3390,15 @@ pub(crate) fn parse_continuous_subject_filter(subject: &str) -> Option<TargetFil
 
     let (filter, rest) = parse_type_phrase(trimmed);
     if rest.trim().is_empty() {
-        return Some(filter);
+        // CR 109.2: a bare "spell(s)" head noun in a static-ability subject
+        // ("permanent spells you control", Secret Arcade) means the affected
+        // objects sit on the stack, not the battlefield — the same rule
+        // `parse_target_with_ctx` already applies to targeting noun phrases.
+        // `parse_type_phrase` has no notion of this (it's a bare type-phrase
+        // grammar shared by many non-targeting callers), so without this the
+        // "spell(s)" word is silently swallowed and the filter collapses to a
+        // battlefield-permanent filter that never reaches the stack.
+        return Some(scope_target_spell_phrase(filter, &lower));
     }
 
     parse_rule_static_subject_filter(trimmed)
@@ -3679,6 +3969,101 @@ fn strip_subject_controller_suffix<'a>(
     (original, None)
 }
 
+/// CR 205.2a + CR 110.1: A bulk card-type / permanent noun — "creature(s)" (the
+/// creature card type) or "permanent(s)" (any permanent on the battlefield) —
+/// names a type, NOT a creature subtype. Returns the base `TypedFilter` for the
+/// noun so the subject parser never fabricates a `Subtype("Permanent")` (which
+/// matches no real card) or `Subtype("Creature")`.
+pub(crate) fn bulk_type_subject_base(word: &str) -> Option<TypedFilter> {
+    if word.eq_ignore_ascii_case("creature") || word.eq_ignore_ascii_case("creatures") {
+        Some(TypedFilter::creature())
+    } else if word.eq_ignore_ascii_case("permanent") || word.eq_ignore_ascii_case("permanents") {
+        Some(TypedFilter::permanent())
+    } else {
+        None
+    }
+}
+
+/// Apply the shared subject scope to a base subject filter: the controller
+/// suffix ("you control" → `ControllerRef`, CR 109.5) and the leading "Other "
+/// exclusion (`FilterProp::Another`).
+fn scoped_subject_filter(
+    mut typed: TypedFilter,
+    controller: Option<ControllerRef>,
+    has_other: bool,
+) -> TargetFilter {
+    if let Some(controller) = controller {
+        typed = typed.controller(controller);
+    }
+    if has_other {
+        typed = typed.properties(vec![FilterProp::Another]);
+    }
+    TargetFilter::Typed(typed)
+}
+
+/// Parse one capitalized subtype word (alphabetic characters and hyphens,
+/// starting uppercase) — the atom of an Oxford-comma subtype list.
+fn parse_capitalized_subtype_word(input: &str) -> OracleResult<'_, &str> {
+    use nom::bytes::complete::take_while1;
+    use nom::combinator::verify;
+    verify(
+        take_while1(|c: char| c.is_alphabetic() || c == '-'),
+        |w: &str| w.chars().next().is_some_and(|c| c.is_uppercase()),
+    )
+    .parse(input)
+}
+
+/// CR 205.3m + CR 611.3a: Parse an Oxford-comma / conjunction subtype LIST
+/// subject — "<Subtype>, <Subtype>, ..., [and|or] <Subtype>" (Raphael, Fiendish
+/// Savior "Other Demons, Devils, Imps, and Tieflings you control"; Tiefling
+/// Outcasts) — into an `Or` of per-subtype creature filters. Generalizes the
+/// two-member compound to any arity: a `split_once(" and ")` split captured only
+/// the first and last member, silently dropping every middle comma-separated
+/// subtype. Requires two or more members and full consumption, so a non-list
+/// subject declines and falls through to the other subject parsers.
+pub(crate) fn parse_subtype_list_filter(
+    descriptor: &str,
+    extra_props: &[FilterProp],
+    is_other: bool,
+) -> Option<TargetFilter> {
+    use nom::multi::separated_list1;
+    // Separators longest-first so ", and "/", or " win over ", " and " and ".
+    let separator = alt((
+        tag::<_, _, OracleError<'_>>(", and "),
+        tag(", or "),
+        tag(", "),
+        tag(" and "),
+        tag(" or "),
+    ));
+    let (rest, words) = separated_list1(separator, parse_capitalized_subtype_word)
+        .parse(descriptor.trim())
+        .ok()?;
+    if !rest.trim().is_empty() || words.len() < 2 {
+        return None;
+    }
+    let mut all_props = extra_props.to_vec();
+    if is_other {
+        all_props.push(FilterProp::Another);
+    }
+    // CR 205.3m: normalize each plural member to its canonical singular subtype
+    // (Demons→Demon); an unrecognized capitalized word passes through unchanged,
+    // matching the prior two-member behavior.
+    let filters = words
+        .iter()
+        .map(|word| {
+            let subtype = parse_subtype(word)
+                .map(|(canonical, _)| canonical)
+                .unwrap_or_else(|| word.to_string());
+            TargetFilter::Typed(
+                typed_filter_for_subtype(&subtype)
+                    .controller(ControllerRef::You)
+                    .properties(all_props.clone()),
+            )
+        })
+        .collect();
+    Some(TargetFilter::Or { filters })
+}
+
 pub(crate) fn parse_creature_subject_filter(subject: &str) -> Option<TargetFilter> {
     let trimmed = subject.trim();
     let lower = trimmed.to_lowercase();
@@ -3710,43 +4095,29 @@ pub(crate) fn parse_creature_subject_filter(subject: &str) -> Option<TargetFilte
         // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
         prefix.trim()
     } else if !descriptor_text.contains(' ') && descriptor_text.to_lowercase().ends_with('s') {
-        if descriptor_text.eq_ignore_ascii_case("creatures") {
-            // CR 205.2a: "creatures" names the creature card type, not a creature subtype.
-            let mut typed = TypedFilter::creature();
-            if let Some(controller) = controller {
-                typed = typed.controller(controller);
-            }
-            if has_other {
-                typed = typed.properties(vec![FilterProp::Another]);
-            }
-            return Some(TargetFilter::Typed(typed));
+        // CR 205.2a + CR 110.1: a bulk card-type / permanent noun ("creatures",
+        // "permanents") names a type, not a creature subtype — checked BEFORE the
+        // subtype fallback so "Permanents you control" spans every permanent
+        // rather than fabricating a zero-match Subtype("Permanent").
+        if let Some(base) = bulk_type_subject_base(descriptor_text) {
+            return Some(scoped_subject_filter(base, controller, has_other));
         }
         // CR 205.3m: Use parse_subtype for irregular plurals (Elves→Elf, Dwarves→Dwarf)
         if let Some((canonical, _)) = parse_subtype(descriptor_text) {
-            let mut typed = TypedFilter::creature().subtype(canonical);
-            if let Some(controller) = controller {
-                typed = typed.controller(controller);
-            }
-            if has_other {
-                typed = typed.properties(vec![FilterProp::Another]);
-            }
-            return Some(TargetFilter::Typed(typed));
+            return Some(scoped_subject_filter(
+                TypedFilter::creature().subtype(canonical),
+                controller,
+                has_other,
+            ));
         }
         descriptor_text.trim_end_matches('s').trim()
     } else {
         return None;
     };
 
-    if descriptor.eq_ignore_ascii_case("creature") {
-        // CR 205.2a: "creature" names the creature card type, not a creature subtype.
-        let mut typed = TypedFilter::creature();
-        if let Some(controller) = controller {
-            typed = typed.controller(controller);
-        }
-        if has_other {
-            typed = typed.properties(vec![FilterProp::Another]);
-        }
-        return Some(TargetFilter::Typed(typed));
+    // CR 205.2a + CR 110.1: bare "creature" / "permanent" name a type, not a subtype.
+    if let Some(base) = bulk_type_subject_base(descriptor) {
+        return Some(scoped_subject_filter(base, controller, has_other));
     }
 
     if descriptor.is_empty() {

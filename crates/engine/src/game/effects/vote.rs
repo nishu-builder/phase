@@ -127,6 +127,7 @@ pub fn resolve(
                     events.push(GameEvent::EffectResolved {
                         kind: EffectKind::Vote,
                         source_id: ability.source_id,
+                        subject: None,
                     });
                     return Ok(());
                 }
@@ -164,7 +165,7 @@ pub fn resolve(
         .into_iter()
         .filter(|pid| match scope {
             VoterScope::AllPlayers => true,
-            VoterScope::EachOpponent => *pid != controller,
+            VoterScope::EachOpponent | VoterScope::AnOpponent => *pid != controller,
             // CR 101.4: `ControllerLabels` cycles the SUBJECT (labeled player)
             // through every non-eliminated player in APNAP order from the
             // controller. The ACTOR is always the controller; that gets pinned
@@ -179,6 +180,7 @@ pub fn resolve(
         events.push(GameEvent::EffectResolved {
             kind: EffectKind::Vote,
             source_id: ability.source_id,
+            subject: None,
         });
         return Ok(());
     }
@@ -208,7 +210,9 @@ pub fn resolve(
     // iteration without recomputation.
     let actor = match scope {
         VoterScope::ControllerLabels => VoteActor::Delegated(controller),
-        VoterScope::AllPlayers | VoterScope::EachOpponent => VoteActor::SubjectActs,
+        VoterScope::AllPlayers | VoterScope::EachOpponent | VoterScope::AnOpponent => {
+            VoteActor::SubjectActs
+        }
     };
 
     state.waiting_for = WaitingFor::VoteChoice {
@@ -501,6 +505,7 @@ pub fn resolve_tally(
     events.push(GameEvent::EffectResolved {
         kind: EffectKind::Vote,
         source_id,
+        subject: None,
     });
     Ok(())
 }
@@ -624,6 +629,7 @@ fn resolve_top_votes_tally(
     events.push(GameEvent::EffectResolved {
         kind: EffectKind::Vote,
         source_id,
+        subject: None,
     });
     Ok(())
 }
@@ -832,6 +838,7 @@ pub(crate) fn drain_pending_vote_ballot_iteration(
     events.push(GameEvent::EffectResolved {
         kind: EffectKind::Vote,
         source_id,
+        subject: None,
     });
 }
 

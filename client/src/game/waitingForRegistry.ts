@@ -80,6 +80,10 @@ export const HANDLED_WAITING_FOR_TYPES: ReadonlySet<WaitingFor["type"]> =
     "CombatTaxPayment",
     // Triggers / resolution-time choices
     "OrderTriggers",
+    // CR 732.2a/b/c: interactive loop-shortcut declare + accept-or-shorten
+    // (DeclareShortcutModal / RespondToShortcutModal).
+    "LoopShortcut",
+    "RespondToShortcut",
     "ReplacementChoice",
     "CopyTargetChoice",
     "CopyRetarget",
@@ -150,6 +154,7 @@ export const HANDLED_WAITING_FOR_TYPES: ReadonlySet<WaitingFor["type"]> =
     "RevealUntilKeptChoice",
     "RepeatDecision",
     "VoteChoice",
+    "SeparatePilesChooseOpponent",
     "SeparatePilesPartition",
     "SeparatePilesChoice",
     "ChooseRingBearer",

@@ -25,10 +25,10 @@ use crate::parser::oracle_ir::ast::ContinuationAst;
 use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
 use crate::types::ability::{
     AbilityCondition, AbilityDefinition, AbilityKind, AdditionalCostOrigin, CastManaObjectScope,
-    CastManaSpentMetric, CastVariantPaid, Comparator, ControllerRef, CountScope, DamageChannel,
-    DigSource, Duration, Effect, EffectOutcomeSignal, FilterProp, GuessOutcome, ObjectScope,
-    ParsedCondition, PlayerScope, PtStat, PtValueScope, QuantityExpr, QuantityRef, StaticCondition,
-    TargetFilter, TypeFilter, TypedFilter,
+    CastManaSpentMetric, CastVariantPaid, CoinFlipResult, Comparator, ControllerRef, CountScope,
+    DamageChannel, DigSource, Duration, Effect, EffectOutcomeSignal, FilterProp, GuessOutcome,
+    ObjectScope, ParsedCondition, PlayerScope, PtStat, PtValueScope, QuantityExpr, QuantityRef,
+    StaticCondition, TargetFilter, TypeFilter, TypedFilter,
 };
 use crate::types::card_type::{CoreType, Supertype};
 use crate::types::counter::{CounterMatch, CounterType};
@@ -870,6 +870,7 @@ pub(super) fn strip_if_you_do_conditional(text: &str) -> (Option<AbilityConditio
         if let Ok((after_clause, condition)) =
             nom_cond::parse_you_control_or_returned_this_way_condition(rest)
                 .or_else(|_| nom_cond::parse_you_put_into_hand_this_way_condition(rest))
+                .or_else(|_| nom_cond::parse_you_put_counters_on_type_this_way_condition(rest))
                 .or_else(|_| nom_cond::parse_you_draw_this_way_condition(rest))
         {
             let body_lower = strip_reflexive_conditional_body_separator(after_clause);
@@ -1018,9 +1019,17 @@ fn try_nom_condition_as_unless(
 
 pub(super) fn strip_cast_from_zone_conditional(text: &str) -> (Option<AbilityCondition>, String) {
     let lower = text.to_lowercase();
-    // CR 603.4 + CR 601.2: Negated form — "if you didn't cast it from your
-    // hand/graveyard/exile" (Epochrasite, Phage the Untouchable on effect-level
-    // paths). MUST precede the positive form to avoid partial prefix matching.
+    // CR 603.4 + CR 601.2: Negated effect-level form — "if you didn't cast it
+    // from your hand/graveyard/exile" → ¬(cast ∧ origin=X). This is the OPPOSITE
+    // presupposition from the "anywhere other than X" arm below: a copy or a
+    // reanimated object (`cast_from_zone == None`) correctly evaluates TRUE here,
+    // so this arm stays a BARE `Not` with NO `∃cast` conjunct (do NOT add the
+    // BB-FU4 And-wrap). The canonical "didn't cast it" cards (Phage the
+    // Untouchable, Epochrasite) actually reach the engine via
+    // `TriggerCondition::WasCast` (trigger intervening-if) and
+    // `ReplacementCondition` (enters-with) respectively — not this effect-level
+    // `AbilityCondition` arm, which remains for any genuine effect-level rider of
+    // this shape. MUST precede the positive form to avoid partial prefix matching.
     if let Some((zone, rest)) = nom_on_lower(text, &lower, |input| {
         // Decompose into prefix + zone: the prefix accepts both the ASCII
         // (`didn't`) and curly (`didn’t`, U+2019) apostrophe used by Scryfall
@@ -1040,7 +1049,7 @@ pub(super) fn strip_cast_from_zone_conditional(text: &str) -> (Option<AbilityCon
         let rest = remainder_after_optional_comma(rest);
         return (
             Some(AbilityCondition::Not {
-                condition: Box::new(AbilityCondition::CastFromZone { zone }),
+                condition: Box::new(AbilityCondition::WasCast { zone: Some(zone) }),
             }),
             rest.to_string(),
         );
@@ -1056,9 +1065,56 @@ pub(super) fn strip_cast_from_zone_conditional(text: &str) -> (Option<AbilityCon
     }) {
         let rest = remainder_after_optional_comma(rest);
         return (
-            Some(AbilityCondition::CastFromZone { zone }),
+            Some(AbilityCondition::WasCast { zone: Some(zone) }),
             rest.to_string(),
         );
+    }
+    // CR 603.4 + CR 601.2a + CR 400.7: Passive-voice resolve-time cast-origin
+    // rider — "[then ]if this spell was cast from [anywhere other than] {your
+    // hand|your graveyard|exile}" (Antiquities on the Loose, Otterball Antics
+    // flashback tokens). Subject is the RESOLVING SPELL (SELF_REF_PARSE_ONLY, not
+    // ~-normalized). The leading "if " is retained in the text reaching this
+    // stripper (existing arms embed it, :1029/:1051), so it is consumed here.
+    // opt("then ") guards the SequentialSibling splitter leaving "Then" behind.
+    // The negated "anywhere other than <zone>" branch MUST precede the bare
+    // <zone> branch (prefix nesting).
+    if let Some((condition, rest)) = nom_on_lower(text, &lower, |input| {
+        let (input, _) = opt(tag("then ")).parse(input)?;
+        let (input, _) = tag("if this spell was cast from ").parse(input)?;
+        let zone = || {
+            alt((
+                value(Zone::Hand, tag("your hand")),
+                value(Zone::Graveyard, tag("your graveyard")),
+                value(Zone::Exile, tag("exile")),
+            ))
+        };
+        alt((
+            // CR 601.2a + CR 707.10 (resolved in BB-FU4): "was cast from anywhere
+            // other than X" is a positive-cast presupposition — it asserts
+            // (∃cast ∧ origin≠X), NOT merely origin≠X. Encode both conjuncts as
+            // `And[WasCast{None}, Not(WasCast{Some(X)})]` so a spell COPY (which has
+            // `cast_from_zone == None` per CR 707.10 — a copy isn't cast — and per
+            // CR 400.7 has no cast provenance) short-circuits the `WasCast{None}`
+            // conjunct to false instead of over-firing via the old `Not(false)=true`.
+            // The `∃cast` conjunct is applied ONLY to this "anywhere other than"
+            // producer; the "you didn't cast it from X" arm (:1049) is the opposite
+            // presupposition and deliberately stays a bare `Not` (see its comment).
+            map(preceded(tag("anywhere other than "), zone()), |z| {
+                AbilityCondition::And {
+                    conditions: vec![
+                        AbilityCondition::WasCast { zone: None },
+                        AbilityCondition::Not {
+                            condition: Box::new(AbilityCondition::WasCast { zone: Some(z) }),
+                        },
+                    ],
+                }
+            }),
+            map(zone(), |z| AbilityCondition::WasCast { zone: Some(z) }),
+        ))
+        .parse(input)
+    }) {
+        let rest = remainder_after_optional_comma(rest);
+        return (Some(condition), rest.to_string());
     }
     (None, text.to_string())
 }
@@ -1332,6 +1388,100 @@ fn parse_its_a_card_type_gate_body<'a>(
         ),
         after_type,
     ))
+}
+
+/// CR 608.2c + CR 301.5b + CR 701.3a: "If it's a[n] &lt;subtype&gt;, [you may] attach
+/// it to ~" follow-up on a just-put permanent (The Invincible Iron Man: "put an
+/// artifact card from your hand onto the battlefield. If it's an Equipment,
+/// attach it to ~"). The bare-"it" anaphor (CR 608.2c) binds to the moved card,
+/// and "~" (CR 201.5) is the ability's own source. Recognized as a UNIT so the
+/// generic "it's a [subtype]" condition arm can't mis-key the type gate to the
+/// ability's injected parent target (the source, not the moved card) or emit a
+/// self-attach `ParentTarget`/`ParentTarget` (an Equipment can't equip itself,
+/// CR 301.5c).
+///
+/// Emits the supported `ZoneChangedThisWay` + `Attach` forward_result idiom: the
+/// condition gates on the moved card's type (read from `last_zone_changed_ids`,
+/// independent of the target slot); the attach makes the moved card (`SelfRef`,
+/// rebound to the forwarded object at resolution) the attachment and the source
+/// (`ParentTarget`, the injected original source) the host. Only the
+/// source-as-host recipient ("~") is in scope; typed hosts remain an honest gap.
+/// Returns `(condition, attach_effect, attach_is_optional)`.
+pub(super) fn try_parse_moved_card_subtype_attach_followup(
+    text: &str,
+) -> Option<(AbilityCondition, Effect, bool)> {
+    let lower = text.to_lowercase();
+    let trimmed = lower.trim();
+    // Leading anaphoric gate: "if it's a "/"if it's an ".
+    let (after_gate, _) = alt((
+        tag::<_, _, OracleError<'_>>("if it's a "),
+        tag("if it's an "),
+    ))
+    .parse(trimmed)
+    .ok()?;
+    // Split the subtype phrase from the "attach ..." body on the first comma.
+    let (_, (subtype_phrase, body)) = nom_primitives::split_once_on(after_gate, ", ").ok()?;
+    // Require a pure subtype gate (Equipment/Aura/Fortification, ...): the type
+    // phrase must consume fully and reference at least one CR 205.3 subtype.
+    let (filter, leftover) = parse_type_phrase(subtype_phrase);
+    if !leftover.trim().is_empty() {
+        return None;
+    }
+    let TargetFilter::Typed(typed) = &filter else {
+        return None;
+    };
+    if !typed
+        .type_filters
+        .iter()
+        .any(type_filter_references_subtype)
+    {
+        return None;
+    }
+    // Body: "[you may ]attach it to ~[.]" — only the source host ("~") is in scope.
+    let (after_may, is_optional) = opt(tag::<_, _, OracleError<'_>>("you may "))
+        .parse(body)
+        .map(|(rest, matched)| (rest, matched.is_some()))
+        .unwrap_or((body, false));
+    let (after_attach, _) = tag::<_, _, OracleError<'_>>("attach it to ")
+        .parse(after_may)
+        .ok()?;
+    let (after_source, _) = tag::<_, _, OracleError<'_>>("~").parse(after_attach).ok()?;
+    let (after_dot, _) = opt(tag::<_, _, OracleError<'_>>("."))
+        .parse(after_source)
+        .ok()?;
+    if !after_dot.trim().is_empty() {
+        return None;
+    }
+    let condition = AbilityCondition::ZoneChangedThisWay { filter };
+    let attach = Effect::Attach {
+        attachment: TargetFilter::SelfRef,
+        target: TargetFilter::ParentTarget,
+    };
+    Some((condition, attach, is_optional))
+}
+
+/// CR 705.2 + CR 608.2c: Strip a resolution-scoped "if you {win|lose} the flip,"
+/// gate that precedes a "repeat this process" directive, mapping it to
+/// `AbilityCondition::CoinFlipOutcome`. Scoped to the repeat-directive context
+/// (called first inside `try_parse_repeat_process_directive`) so inline
+/// Krark-style "if you win the flip, <effect>" branches — whose body is NOT
+/// "repeat this process" — still fall through to the coin-flip fold. Returns the
+/// original text unchanged when no flip gate is present.
+pub(super) fn strip_coin_flip_conditional(text: &str) -> (Option<AbilityCondition>, String) {
+    let lower = text.to_lowercase();
+    match nom_on_lower(text, &lower, |i| {
+        let (i, _) = tag::<_, _, OracleError<'_>>("if you ").parse(i)?;
+        let (i, result) = alt((
+            value(CoinFlipResult::Won, tag("win the flip")),
+            value(CoinFlipResult::Lost, tag("lose the flip")),
+        ))
+        .parse(i)?;
+        let (i, _) = tag(", ").parse(i)?;
+        Ok((i, AbilityCondition::CoinFlipOutcome { result }))
+    }) {
+        Some((condition, remainder)) => (Some(condition), remainder.to_string()),
+        None => (None, text.to_string()),
+    }
 }
 
 pub(super) fn strip_card_type_conditional(text: &str) -> (Option<AbilityCondition>, String) {
@@ -2253,7 +2403,7 @@ pub(super) fn strip_player_property_superlative_conditional(
     )
 }
 
-/// CR 608.2e + CR 122.1b: Parse "if that creature has <keyword>[ and ~ doesn't], <effect>".
+/// CR 608.2c + CR 122.1b: Parse "if that creature has <keyword>[ and ~ doesn't], <effect>".
 ///
 /// The optional " and ~ doesn't" conjunct (Super-Adaptoid: "If that creature
 /// has haste and Super-Adaptoid doesn't, put a haste counter on
@@ -3615,11 +3765,34 @@ fn parse_paid_x_condition_text(text: &str) -> Option<AbilityCondition> {
     })
 }
 
+/// CR 614.1a + CR 614.6: the outcome of lowering an "instead" override clause.
+///
+/// The three-way split is load-bearing, and the middle arm is why this is not an
+/// `Option`. CR 614.6 ("If an event is replaced, it never happens") makes an
+/// "instead" override a **branch**, never a sequel: the engine does the override
+/// or the printed effect, never both. When the override grammar matches but its
+/// condition has no typed representation, returning a bare `None` let the caller
+/// fall through and re-emit the override BODY as an ordinary unconditional chain
+/// clause — so the engine ran the replaced effect AND its replacement, with the
+/// condition dropped (Anax, Hardened in the Forge: a 2/2 dying produced three
+/// Satyrs instead of one). `ConditionUnlowerable` forces the caller to fail
+/// honestly instead.
+pub(super) enum InsteadLowering {
+    /// The override lowered to a conditional branch (`AbilityCondition::ConditionInstead`).
+    Branch(Box<AbilityDefinition>),
+    /// The text IS an "instead" override, but its condition has no typed variant
+    /// yet. The caller MUST emit `Effect::unimplemented` — never the body.
+    ConditionUnlowerable,
+    /// Not the generic "instead" grammar, or deliberately owned by a more
+    /// specific lowering (see the additional-cost deferral in `build_instead_def`).
+    NotOwned,
+}
+
 pub(super) fn try_parse_generic_instead_clause(
     text: &str,
     kind: AbilityKind,
     ctx: &mut ParseContext,
-) -> Option<AbilityDefinition> {
+) -> InsteadLowering {
     // Forward form: "If <cond>, [body] instead." — split on the leading "If, "
     // and strip a trailing/leading "instead" from the body.
     if let Some((cond_text, effect_text)) = split_forward_instead_clause(text) {
@@ -3635,7 +3808,7 @@ pub(super) fn try_parse_generic_instead_clause(
         return build_instead_def(cond_text, effect_text, kind, ctx);
     }
 
-    None
+    InsteadLowering::NotOwned
 }
 
 /// Forward instead form: "If <cond>, [body] instead." Returns the trimmed
@@ -3683,6 +3856,32 @@ fn split_inverted_instead_clause(text: &str) -> Option<(String, String)> {
     Some((cond_text.to_string(), effect_text.to_string()))
 }
 
+/// CR 614.1: replacement effects "watch for a particular event that **would**
+/// happen and completely or partially replace that event." The modal "would" is
+/// the Comprehensive Rules' own marker for the EVENT reading of an "instead"
+/// clause, and it splits the grammar in two:
+///
+/// - **CR 614.1a EVENT replacement** — "If that spell *would* be put into your
+///   graveyard, exile it instead" (Torrential Gearhulk, Goblin Dark-Dwellers,
+///   Mission Briefing; ~68 faces). The clause names an event, not a game state.
+///   These are owned elsewhere — by a `ReplacementDefinition`, by the line-level
+///   replacement parser, or by the structural cast-then-exile rider chain that
+///   `swallow_check::any_ability_has_exile_parent_rider` recognizes as the "exile
+///   it instead" encoding. An unlowerable EVENT condition must therefore fall
+///   through UNCHANGED: reporting it as `ConditionUnlowerable` would make the
+///   caller replace a *working* rider encoding with `Effect::unimplemented`.
+///
+/// - **CR 608.2c STATE override** — "If the creature had power 4 or greater,
+///   create two of those tokens instead" (Anax, Hardened in the Forge). The
+///   clause is a game-state predicate evaluated as the ability resolves. These,
+///   and only these, are `ConditionUnlowerable` when they fail to lower.
+///
+/// The scan is word-boundary anchored (`scan_contains`), so "would" is matched
+/// as a word and never as a fragment of a longer token.
+fn condition_names_an_event(cond_text: &str) -> bool {
+    nom_primitives::scan_contains(&cond_text.to_lowercase(), "would")
+}
+
 /// Shared assembly: build an `AbilityDefinition` for an instead override.
 /// Tries the three condition parsers in priority order; bails if none match
 /// (so the chunk can fall through to other dispatch paths). Wraps the result
@@ -3693,20 +3892,35 @@ fn build_instead_def(
     effect_text: String,
     kind: AbilityKind,
     ctx: &mut ParseContext,
-) -> Option<AbilityDefinition> {
-    // CR 608.2e: An additional-cost-paid "instead" fold ("if it/this spell was
+) -> InsteadLowering {
+    // CR 608.2c: An additional-cost-paid "instead" fold ("if it/this spell was
     // kicked, ... instead") is owned by `strip_additional_cost_conditional`,
     // which folds it to the dedicated `AdditionalCostPaidInstead`. Defer here so
     // the generic `parse_condition_text` recognizer (which now classifies "was
     // kicked" as the bare `AdditionalCostPaid`) does not pre-empt that fold by
     // producing a `ConditionInstead { inner: AdditionalCostPaid }` wrapper.
+    // This deferral is `NotOwned`, NOT `ConditionUnlowerable`: the clause has a
+    // typed home, just not this one, so the caller must fall through to it.
     if parse_additional_cost_instead_condition_fragment(&cond_text).is_some() {
-        return None;
+        return InsteadLowering::NotOwned;
     }
 
-    let condition = try_nom_condition_as_ability_condition(&cond_text, ctx)
+    // CR 614.6: a replaced event never happens. If the override's condition has
+    // no typed representation, the branch cannot be built — and emitting the
+    // override body anyway would run BOTH the replaced effect and its
+    // replacement. Everything that lowers today still lowers; only the failure
+    // path is split, by `condition_names_an_event`, into "defer" vs "fail
+    // honestly".
+    let Some(condition) = try_nom_condition_as_ability_condition(&cond_text, ctx)
         .or_else(|| parse_condition_text(&cond_text))
-        .or_else(|| parse_control_count_as_ability_condition(&cond_text))?;
+        .or_else(|| parse_control_count_as_ability_condition(&cond_text))
+    else {
+        return if condition_names_an_event(&cond_text) {
+            InsteadLowering::NotOwned
+        } else {
+            InsteadLowering::ConditionUnlowerable
+        };
+    };
 
     let instead_def = parse_effect_chain(&effect_text, kind);
     let mut result = instead_def;
@@ -3720,7 +3934,7 @@ fn build_instead_def(
     {
         super::rewrite_cost_paid_object_quantities_in_definition(&mut result);
     }
-    Some(result)
+    InsteadLowering::Branch(Box::new(result))
 }
 
 /// CR 608.2c: "If <cond>, you may instead <reveal-N-from-among-body>" — conditional
@@ -3979,9 +4193,11 @@ fn counter_threshold_to_condition(
     }
 }
 
-/// CR 609.3: Compose a `QuantityExpr::Difference` from a two-operand quantity
+/// CR 608.2c: Compose a `QuantityExpr::Difference` from a two-operand quantity
 /// comparison condition — the unsigned magnitude gap between the operands, as
 /// referenced by "a number of times equal to the difference" repeat suffixes.
+/// "The difference" is an anaphoric back-reference to the operands the earlier
+/// condition text established (read the whole text, apply the rules of English).
 ///
 /// Class-general: any `AbilityCondition::QuantityCheck` yields the difference
 /// of its operands. Both `lhs` and `rhs` are already `QuantityExpr`, so they
@@ -4271,6 +4487,24 @@ pub(crate) fn static_condition_to_ability_condition(
                 ..Default::default()
             }),
         }),
+        // CR 309.7 ("A player completes a dungeon as that dungeon card is removed from the
+        // game") + CR 608.2c: "if you've completed a dungeon" is a plain game-state
+        // predicate about the CONTROLLER, evaluated as the ability resolves — it is not
+        // source-bound, layer-bound, or cost-bound like the unbridgeable statics below.
+        // `AbilityCondition::CompletedDungeon { specific }` is its exact effect-resolution
+        // equivalent and has existed all along; listing `CompletedADungeon` among the
+        // "no equivalent -> None" arms was a vocabulary asymmetry, not a real gap.
+        //
+        // It went unnoticed while an unlowerable condition merely fell through silently.
+        // Once the CR 614 branch guard started reporting such conditions honestly, the
+        // asymmetry surfaced as a regression: Tomb of Horrors Adventurer's "If you've
+        // completed a dungeon, copy that spell twice instead" lost its branch to
+        // `Unimplemented`. The `specific: None` form matches the bare "a dungeon" reading;
+        // a specific-dungeon static has no `StaticCondition` spelling today, so there is
+        // nothing else to map here.
+        StaticCondition::CompletedADungeon => {
+            Some(AbilityCondition::CompletedDungeon { specific: None })
+        }
         StaticCondition::DevotionGE { .. }
         // CR 702.176a + CR 611.3a: Persistent alternative-cost markers are
         // source-bound static predicates with no effect-resolution
@@ -4303,9 +4537,12 @@ pub(crate) fn static_condition_to_ability_condition(
         | StaticCondition::UnlessPay { .. }
         | StaticCondition::Unrecognized { .. }
         | StaticCondition::RingLevelAtLeast { .. }
-        | StaticCondition::CompletedADungeon
         | StaticCondition::ControlsCommander { .. }
         | StaticCondition::EnchantedIsFaceDown
+        // CR 311.2 / CR 901.7: plane face-up status is a duration-only continuous-
+        // effect condition (evaluated in the layer system), never an
+        // effect-resolution-time `AbilityCondition` — lowering returns `None`.
+        | StaticCondition::SourceIsFaceUp
         | StaticCondition::SourceControllerEquals { .. }
         // CR 702.166a: Bargain payment is a cost-determination predicate with no
         // effect-resolution (`AbilityCondition`) equivalent.
@@ -4323,6 +4560,10 @@ pub(crate) fn static_condition_to_ability_condition(
         // an effect-resolution gate — no `AbilityCondition` equivalent.
         | StaticCondition::IsTapped { .. }
         | StaticCondition::CastingAsVariant { .. }
+        // CR 401.1 + CR 401.5: the top-of-library gate is a continuous-static-only
+        // predicate (Layer 6 / duration `ForAsLongAs`); no effect-resolution
+        // (`AbilityCondition`) equivalent — lowering returns `None`.
+        | StaticCondition::TopOfLibraryMatches { .. }
         | StaticCondition::None => None,
     }
 }
@@ -4349,6 +4590,13 @@ pub(crate) fn ability_condition_to_static_condition(
 ) -> Option<StaticCondition> {
     match ac {
         AbilityCondition::IsYourTurn => Some(StaticCondition::DuringYourTurn),
+        // CR 309.7: round-trips the bridge in `static_condition_to_ability_condition`.
+        // Only the "any dungeon" reading round-trips — `StaticCondition` has no
+        // specific-dungeon spelling, so a specific one has no static form to bridge to.
+        AbilityCondition::CompletedDungeon { specific: None } => {
+            Some(StaticCondition::CompletedADungeon)
+        }
+        AbilityCondition::CompletedDungeon { specific: Some(_) } => None,
         // CR 301.5 + CR 303.4: round-trips the bidirectional bridge in
         // `static_condition_to_ability_condition` (a continuous "attached to a
         // creature" gate can ride per-`StaticDefinition`).
@@ -4389,7 +4637,7 @@ pub(crate) fn ability_condition_to_static_condition(
         AbilityCondition::AdditionalCostPaid { .. }
         | AbilityCondition::AdditionalCostPaidInstead
         | AbilityCondition::AlternativeManaCostPaid
-        | AbilityCondition::CastFromZone { .. }
+        | AbilityCondition::WasCast { .. }
         | AbilityCondition::CastDuringPhase { .. }
         | AbilityCondition::CastTimingPermission { .. }
         | AbilityCondition::ManaColorSpent { .. }
@@ -4403,6 +4651,7 @@ pub(crate) fn ability_condition_to_static_condition(
         // a continuous-effect gate.
         AbilityCondition::EffectOutcome { .. }
         | AbilityCondition::EventOutcomeWon
+        | AbilityCondition::CoinFlipOutcome { .. }
         | AbilityCondition::WhenYouDo
         | AbilityCondition::RevealedHasCardType { .. }
         | AbilityCondition::ObjectsShareQuality { .. }
@@ -4644,11 +4893,12 @@ fn parse_anaphoric_status_predicate(
     Ok((rest, (subject, negated, prop)))
 }
 
-/// CR 702.119a-c: Recognize "[possessive subject] emerge cost was paid" as an
-/// `AbilityCondition::CastVariantPaid { Emerge }`. Only Emerge routes through the
-/// generic instead path (`ConditionInstead`, token-reproduction body); the
-/// pre-existing sneak / ninjutsu / surge / spectacle / prowl "instead" cards keep
-/// their established `strip_additional_cost_conditional` (Route-2 →
+/// CR 702.119a-c + CR 702.187b: Recognize "[possessive subject] <emerge|mayhem>
+/// cost was paid" as an `AbilityCondition::CastVariantPaid { variant }`. Only
+/// Emerge (Adipose Offspring) and Mayhem (Sandman's Quicksand) route through the
+/// generic trailing-"instead" path (`ConditionInstead`, via `build_instead_def`);
+/// the pre-existing sneak / ninjutsu / surge / spectacle / prowl "instead" cards
+/// keep their established `strip_additional_cost_conditional` (Route-2 →
 /// `CastVariantPaidInstead`) path, so the membership filter prevents any
 /// regression. Dispatch is nom `tag()`, never contains/find. `lower` is the
 /// already-lowercased condition fragment with any leading "if " stripped.
@@ -4668,7 +4918,9 @@ fn parse_cast_variant_cost_paid_condition(lower: &str) -> Option<AbilityConditio
     .ok()?;
     CAST_VARIANT_COST_PAID_PHRASES
         .iter()
-        .filter(|&&(_, variant)| variant == CastVariantPaid::Emerge)
+        .filter(|&&(_, variant)| {
+            matches!(variant, CastVariantPaid::Emerge | CastVariantPaid::Mayhem)
+        })
         .find_map(|&(phrase, variant)| {
             let (rest, _) = tag::<_, _, OracleError<'_>>(phrase).parse(input).ok()?;
             // CR 603.4: allow an optional "this turn" tail, then require the
@@ -5093,7 +5345,7 @@ pub(super) fn try_nom_condition_as_ability_condition(
         if let Ok((after_zone, zone)) = zone_match {
             let trimmed = after_zone.trim_start();
             if trimmed.is_empty() {
-                return Some(AbilityCondition::CastFromZone { zone });
+                return Some(AbilityCondition::WasCast { zone: Some(zone) });
             }
             // CR 117.1 + CR 201.2 + CR 608.2c: "and [second condition]" suffix
             // for compound intervening-ifs like Approach of the Second Sun's
@@ -5108,7 +5360,7 @@ pub(super) fn try_nom_condition_as_ability_condition(
                     parse_youve_cast_another_named_this_game_condition(second_text)
                 {
                     return Some(AbilityCondition::And {
-                        conditions: vec![AbilityCondition::CastFromZone { zone }, second],
+                        conditions: vec![AbilityCondition::WasCast { zone: Some(zone) }, second],
                     });
                 }
             }
@@ -5124,7 +5376,7 @@ pub(super) fn try_nom_condition_as_ability_condition(
             .parse(trimmed)
             .is_ok()
             {
-                return Some(AbilityCondition::CastFromZone { zone });
+                return Some(AbilityCondition::WasCast { zone: Some(zone) });
             }
         }
     }
@@ -6104,7 +6356,7 @@ fn entered_or_cast_from_zone_condition(zone: Zone) -> AbilityCondition {
                 destination: Zone::Battlefield,
                 filter: TargetFilter::Any,
             },
-            AbilityCondition::CastFromZone { zone },
+            AbilityCondition::WasCast { zone: Some(zone) },
         ],
     }
 }
@@ -6560,6 +6812,26 @@ mod tests {
     }
 
     #[test]
+    fn s07_if_put_counters_on_type_this_way() {
+        // Call the Spirit Dragons: "if you put +1/+1 counters on five Dragons this way".
+        let (cond, body) = strip_if_you_do_conditional(
+            "if you put +1/+1 counters on five Dragons this way, you win the game",
+        );
+        assert_eq!(body, "you win the game");
+        assert!(
+            matches!(
+                cond,
+                Some(AbilityCondition::QuantityCheck {
+                    comparator: Comparator::GE,
+                    rhs: QuantityExpr::Fixed { value: 5 },
+                    ..
+                })
+            ),
+            "got {cond:?}"
+        );
+    }
+
+    #[test]
     fn s07_if_put_no_cards_into_hand_this_way_is_count_zero() {
         // Nashi: "if you put no cards into your hand this way" → TrackedSetSize == 0.
         let (cond, body) = strip_if_you_do_conditional(
@@ -6647,7 +6919,7 @@ mod tests {
                 cond,
                 Some(AbilityCondition::QuantityCheck {
                     lhs: QuantityExpr::Ref {
-                        qty: QuantityRef::PreviousEffectAmount
+                        qty: QuantityRef::PreviousEffectAmount { .. }
                     },
                     comparator: Comparator::GE,
                     rhs: QuantityExpr::Fixed { value: 1 },
@@ -6887,30 +7159,46 @@ mod tests {
         .is_none());
     }
 
-    /// CR 702.119a-c: "[possessive] emerge cost was paid" lowers to
-    /// `CastVariantPaid { Emerge }` across the possessive-subject variants, and
-    /// the membership filter rejects the other cast-variant phrases so their
-    /// established Route-2 (`CastVariantPaidInstead`) handling is untouched.
+    /// CR 702.119a-c + CR 702.187b: "[possessive] <emerge|mayhem> cost was paid"
+    /// lowers to `CastVariantPaid { variant }` across the possessive-subject
+    /// variants, and the membership filter rejects the other cast-variant phrases
+    /// so their established Route-2 (`CastVariantPaidInstead`) handling is
+    /// untouched.
     #[test]
-    fn parse_cast_variant_cost_paid_condition_recognizes_emerge_only() {
-        for subject in [
-            "emerge cost was paid",
-            "this creature's emerge cost was paid",
-            "its emerge cost was paid",
-            "this spell's emerge cost was paid",
-            "this creature's emerge cost was paid this turn",
+    fn parse_cast_variant_cost_paid_condition_recognizes_emerge_and_mayhem() {
+        for (subject, expected) in [
+            ("emerge cost was paid", CastVariantPaid::Emerge),
+            (
+                "this creature's emerge cost was paid",
+                CastVariantPaid::Emerge,
+            ),
+            ("its emerge cost was paid", CastVariantPaid::Emerge),
+            ("this spell's emerge cost was paid", CastVariantPaid::Emerge),
+            (
+                "this creature's emerge cost was paid this turn",
+                CastVariantPaid::Emerge,
+            ),
+            // Mayhem joins the generic-instead route (Sandman's Quicksand).
+            ("mayhem cost was paid", CastVariantPaid::Mayhem),
+            ("this spell's mayhem cost was paid", CastVariantPaid::Mayhem),
+            ("its mayhem cost was paid", CastVariantPaid::Mayhem),
+            (
+                "this spell's mayhem cost was paid this turn",
+                CastVariantPaid::Mayhem,
+            ),
         ] {
             assert_eq!(
                 parse_cast_variant_cost_paid_condition(subject),
                 Some(AbilityCondition::CastVariantPaid {
-                    variant: CastVariantPaid::Emerge,
+                    variant: expected,
                     subject: ObjectScope::Source,
                 }),
-                "{subject:?} must lower to CastVariantPaid {{ Emerge }}"
+                "{subject:?} must lower to CastVariantPaid {{ {expected:?} }}"
             );
         }
-        // Membership filter: non-emerge cast-variant phrases keep their Route-2
-        // (`strip_additional_cost_conditional` → `CastVariantPaidInstead`) path.
+        // Membership filter: the other cast-variant phrases keep their Route-2
+        // (`strip_additional_cost_conditional` → `CastVariantPaidInstead`) path,
+        // and "reduced" (not "paid") stays a clean gap.
         for other in [
             "this creature's spectacle cost was paid",
             "its surge cost was paid",
@@ -6920,7 +7208,7 @@ mod tests {
             assert_eq!(
                 parse_cast_variant_cost_paid_condition(other),
                 None,
-                "{other:?} must not be claimed by the emerge instead recognizer"
+                "{other:?} must not be claimed by the emerge/mayhem instead recognizer"
             );
         }
     }
@@ -7347,8 +7635,8 @@ mod tests {
 
     #[test]
     fn difference_expr_composes_unsigned_gap_from_quantity_check() {
-        // CR 609.3: a two-operand comparison yields the difference of its
-        // operands — class-general over any QuantityCheck.
+        // CR 608.2c: "the difference" back-references the two operands the earlier
+        // condition established — class-general over any QuantityCheck.
         let cond = AbilityCondition::QuantityCheck {
             lhs: QuantityExpr::Ref {
                 qty: QuantityRef::TrackedSetSize,
@@ -8520,6 +8808,65 @@ mod tests {
         assert!(use_lki, "past-tense look-back must use LKI per CR 400.7");
     }
 
+    /// Issue #4796 (CR 608.2c + CR 301.5b): "if it's a[n] <subtype>, attach it
+    /// to ~" recognizer — The Invincible Iron Man's Equipment self-attach
+    /// follow-up. Emits `ZoneChangedThisWay{Equipment}` + `Attach{SelfRef,
+    /// ParentTarget}` (moved card is the attachment, source is the host), not a
+    /// self-attach and not a wrong-subject `TargetMatchesFilter`.
+    #[test]
+    fn moved_card_subtype_attach_followup_equipment_to_source() {
+        let (cond, effect, is_optional) =
+            try_parse_moved_card_subtype_attach_followup("if it's an equipment, attach it to ~.")
+                .expect("Iron Man Equipment attach follow-up must be recognized");
+        assert!(!is_optional, "the attach itself is mandatory once gated");
+        match cond {
+            AbilityCondition::ZoneChangedThisWay { filter } => match filter {
+                TargetFilter::Typed(t) => assert!(
+                    t.type_filters.iter().any(|f| matches!(
+                        f,
+                        TypeFilter::Subtype(s) if s.eq_ignore_ascii_case("Equipment")
+                    )),
+                    "expected Equipment subtype gate, got {:?}",
+                    t.type_filters
+                ),
+                other => panic!("expected Typed Equipment filter, got {other:?}"),
+            },
+            other => panic!("expected ZoneChangedThisWay condition, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                effect,
+                Effect::Attach {
+                    attachment: TargetFilter::SelfRef,
+                    target: TargetFilter::ParentTarget,
+                }
+            ),
+            "moved card must be the attachment (SelfRef) and the source the host (ParentTarget), got {effect:?}"
+        );
+    }
+
+    /// The recognizer is scoped to the "attach it to ~" self-host body and to
+    /// CR 205.3 subtype gates: it declines non-attach bodies, core-type gates,
+    /// and typed (non-source) hosts so those fall through to the generic path.
+    #[test]
+    fn moved_card_subtype_attach_followup_declines_out_of_scope() {
+        // No "attach it to ~" body (reveal/scry-style follow-up).
+        assert!(try_parse_moved_card_subtype_attach_followup(
+            "if it's an equipment, you draw a card."
+        )
+        .is_none());
+        // Core type, not a CR 205.3 subtype.
+        assert!(try_parse_moved_card_subtype_attach_followup(
+            "if it's a creature, attach it to ~."
+        )
+        .is_none());
+        // Typed host (not the source "~") is an honest gap.
+        assert!(try_parse_moved_card_subtype_attach_followup(
+            "if it's an equipment, attach it to a creature you control."
+        )
+        .is_none());
+    }
+
     /// CR 608.2c: Faller's Faithful "that creature wasn't dealt damage this turn"
     /// → Not{WasDealtDamageThisTurn, LKI}. (Part B card; recognizer-side proof.)
     #[test]
@@ -8950,21 +9297,22 @@ mod tests {
         ));
         assert!(matches!(
             &conditions[1],
-            AbilityCondition::CastFromZone {
-                zone: Zone::Library
+            AbilityCondition::WasCast {
+                zone: Some(Zone::Library)
             }
         ));
     }
 
-    /// CR 608.2e: Full instead-clause assembly for Fblthp's ETB draw rider.
+    /// CR 608.2c: Full instead-clause assembly for Fblthp's ETB draw rider.
     #[test]
     fn fblthp_library_origin_instead_clause() {
-        let instead = try_parse_generic_instead_clause(
+        let InsteadLowering::Branch(instead) = try_parse_generic_instead_clause(
             "If it entered from your library or was cast from your library, draw two cards instead.",
             AbilityKind::Spell,
             &mut ParseContext::default(),
-        )
-        .expect("instead clause must parse");
+        ) else {
+            panic!("instead clause must lower to a conditional branch");
+        };
         assert!(matches!(&*instead.effect, Effect::Draw { .. }));
         let cond = instead
             .condition
@@ -8979,7 +9327,52 @@ mod tests {
         ));
     }
 
-    /// CR 608.2e: ETB base draw + library-origin instead override chain.
+    /// L02 BB-FU4 narrowing fence (CR 601.2a + CR 707.10): the copy-correct
+    /// `∃cast` And-wrap is applied ONLY to the "anywhere other than X"
+    /// producer. The opposite-presupposition "you didn't cast it from X" arm
+    /// stays a BARE `Not(WasCast{Some(X)})` — wrapping it would regress
+    /// reanimate/copy semantics (a reanimated object correctly evaluates true
+    /// there). This directly exercises both arms of the exact edited function:
+    /// removing the wrap from line ~1090 flips the first assertion; adding a
+    /// wrap to line ~1049 flips the second.
+    #[test]
+    fn bbfu4_only_anywhere_other_than_gains_existential_cast_conjunct() {
+        // Positive-cast presupposition → And[WasCast{None}, Not(WasCast{Some(Hand)})].
+        let (anywhere, rest_a) = strip_cast_from_zone_conditional(
+            "if this spell was cast from anywhere other than your hand",
+        );
+        assert_eq!(rest_a, "");
+        assert_eq!(
+            anywhere,
+            Some(AbilityCondition::And {
+                conditions: vec![
+                    AbilityCondition::WasCast { zone: None },
+                    AbilityCondition::Not {
+                        condition: Box::new(AbilityCondition::WasCast {
+                            zone: Some(Zone::Hand)
+                        }),
+                    },
+                ],
+            }),
+            "the 'anywhere other than' arm must gain the ∃cast And-wrap"
+        );
+
+        // Opposite presupposition → BARE Not, NO And-wrap.
+        let (didnt, rest_d) =
+            strip_cast_from_zone_conditional("if you didn't cast it from your hand");
+        assert_eq!(rest_d, "");
+        assert_eq!(
+            didnt,
+            Some(AbilityCondition::Not {
+                condition: Box::new(AbilityCondition::WasCast {
+                    zone: Some(Zone::Hand)
+                }),
+            }),
+            "the 'didn't cast it from X' arm must stay a bare Not (no ∃cast conjunct)"
+        );
+    }
+
+    /// CR 608.2c: ETB base draw + library-origin instead override chain.
     #[test]
     fn fblthp_etb_draw_chain_with_library_instead() {
         let def = parse_effect_chain(

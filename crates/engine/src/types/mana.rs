@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-use super::ability::{AbilityTag, Comparator};
+use super::ability::{AbilityTag, Comparator, TargetFilter};
 use super::events::GameEvent;
 use super::identifiers::ObjectId;
 use super::keywords::{Keyword, KeywordKind};
@@ -476,16 +476,6 @@ pub enum ManaRestriction {
     /// "Spend this mana only to cast a creature spell of the chosen type."
     /// The `String` is the chosen creature type (e.g., "Elf").
     OnlyForCreatureType(String),
-    /// CR 106.6 + CR 205.3m + CR 903.3: "a creature spell that shares a creature
-    /// type with your commander" — relational spend filter for Path of Ancestry.
-    /// This is a distinct *relational-to-commander* axis, not a fixed-subtype
-    /// parameterization of `OnlyForCreatureType`: the matching subtype set is
-    /// computed from live commander state per spend, so it cannot be evaluated
-    /// from `SpellMeta` alone. `allows_spell` returns `false` (no commander
-    /// context here); the real relational evaluation happens at the
-    /// `apply_mana_spell_grants` spend-check site, which has game-state access —
-    /// mirroring how `OnlyForXCosts` defers full detection to its call site.
-    SharesCreatureTypeWithCommander,
     /// CR 106.6: "Spend this mana only to cast creature spells or activate abilities of creatures."
     /// Allows spending for spells of `spell_type` (checked via `allows_spell`) OR for ability
     /// activations whose scope is described by `ability` (checked via `allows_activation`):
@@ -637,10 +627,6 @@ impl ManaRestriction {
             // carries no commander context, so this restriction can never
             // independently authorize a spend here — it returns `false` and the
             // authoritative relational evaluation (comparing the spell's creature
-            // subtypes against the controller's commander's creature types) is done
-            // at the `apply_mana_spell_grants` call site, which has `&GameState`.
-            // Mirrors the deferral contract of `OnlyForXCosts`.
-            ManaRestriction::SharesCreatureTypeWithCommander => false,
             // CR 106.6: The spell-casting half of the OR — allows if the spell has the
             // required type, consulting both core card types (Creature, Instant, ...)
             // and subtypes (Elemental, Goblin, ...). Flamebraider's "Elemental" names
@@ -747,7 +733,6 @@ impl ManaRestriction {
             ManaRestriction::OnlyForSpell
             | ManaRestriction::OnlyForSpellType(_)
             | ManaRestriction::OnlyForCreatureType(_)
-            | ManaRestriction::SharesCreatureTypeWithCommander
             | ManaRestriction::OnlyForSpellWithKeywordKind(_)
             | ManaRestriction::OnlyForSpellWithKeywordKindFromZone(_, _)
             | ManaRestriction::OnlyForSpellWithManaValue { .. }
@@ -828,26 +813,49 @@ impl ManaRestriction {
 
 /// CR 106.6: Additional effect that the mana confers upon the spell it is spent on.
 /// E.g., "that spell can't be countered" (Cavern of Souls, Delighted Halfling).
+fn default_mana_keyword_grant_duration() -> Box<crate::types::ability::Duration> {
+    Box::new(crate::types::ability::Duration::UntilEndOfTurn)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ManaSpellGrant {
     /// The spell cast with this mana can't be countered.
     CantBeCountered,
-    /// CR 106.6 + CR 702: If the spell this mana is spent on satisfies
-    /// `restriction`, grant it `keyword` until end of turn.
+    /// CR 106.6 + CR 702.10: If the spell this mana is spent on satisfies
+    /// `restriction`, grant it `keyword` for `duration` (subtype lands use
+    /// `UntilEndOfTurn`; Hall of the Bandit Lord uses `Permanent`).
     AddKeywordUntilEndOfTurn {
         keyword: Keyword,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         restriction: Option<ManaRestriction>,
+        #[serde(default = "default_mana_keyword_grant_duration")]
+        duration: Box<crate::types::ability::Duration>,
     },
     /// CR 106.6 + CR 603.3: "When you spend this mana to cast a [filter] spell,
     /// [effect]" — a reflexive trigger riding the produced mana (Lapis Orb of
-    /// Dragonkind, Scaled Nurturer, Gilanra). When the mana is spent on a spell
-    /// satisfying `restriction` (`None` = any spell), the controller's `ability`
-    /// is put on the stack as a triggered ability. The ability's source is the
-    /// permanent that produced the mana.
+    /// Dragonkind, Scaled Nurturer, Gilanra, Path of Ancestry, Primal Wellspring,
+    /// Pyromancer's Goggles). When the mana is spent on a spell matching `filter`,
+    /// the controller's `ability` is put on the stack as a triggered ability. The
+    /// ability's source is the permanent that produced the mana.
+    ///
+    /// `filter` is the CR 603.3 TRIGGER EVENT filter — "which spell makes this
+    /// fire" — and is deliberately a [`TargetFilter`], NOT a [`ManaRestriction`].
+    /// The two answer different questions and coincide only by accident.
+    /// `ManaRestriction` is CR 106.6 SPEND legality ("what may this mana pay
+    /// for"), and NOT ONE of these cards restricts its mana: Pyromancer's Goggles'
+    /// {R} may be spent on anything; it merely TRIGGERS when spent on a red instant
+    /// or sorcery. Typing this field as a spend restriction forced its filter
+    /// vocabulary to grow along the wrong axis — a color predicate would have had
+    /// to be bolted onto `ManaRestriction` purely to serve a trigger — which is the
+    /// cross-rule-section conflation the categorical-boundary rule forbids.
+    /// `TargetFilter` is the engine's existing "which object matches" vocabulary
+    /// (the same one `TriggerDefinition::valid_card` uses), so the whole
+    /// type × color × mana-value class is expressible with no new variant.
+    ///
+    /// Genuine CR 106.6 spend restrictions are unaffected — they live on the
+    /// separate [`ManaUnit::restrictions`] field. `TargetFilter::Any` = any spell.
     TriggerOnSpend {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        restriction: Option<ManaRestriction>,
+        filter: TargetFilter,
         ability: Box<crate::types::ability::AbilityDefinition>,
     },
 }
@@ -2173,29 +2181,14 @@ mod tests {
         assert!(!restriction.allows_spell(&elf_instant));
     }
 
-    #[test]
-    fn shares_creature_type_with_commander_defers_to_call_site() {
-        // CR 106.6 + CR 903.3: The relational commander-subtype filter carries no
-        // commander context in `SpellMeta`, so `allows_spell`/`allows_activation`
-        // must return `false` for every payment context. The authoritative
-        // relational evaluation happens at the `apply_mana_spell_grants` spend
-        // site (game-state aware). This documents the deferral contract.
-        let restriction = ManaRestriction::SharesCreatureTypeWithCommander;
-        let elf_creature = SpellMeta {
-            types: vec!["Creature".to_string()],
-            subtypes: vec!["Elf".to_string()],
-            keyword_kinds: vec![],
-            cast_from_zone: None,
-            mana_value: None,
-            color_count: None,
-            has_x_in_cost: false,
-            is_face_down: false,
-        };
-        assert!(!restriction.allows_spell(&elf_creature));
-        let source_types = vec!["Creature".to_string()];
-        let source_subtypes = vec!["Elf".to_string()];
-        assert!(!restriction.allows_activation(&source_types, &source_subtypes, None));
-    }
+    // NOTE: `shares_creature_type_with_commander_defers_to_call_site` was DELETED with
+    // the `ManaRestriction::SharesCreatureTypeWithCommander` variant it documented. That
+    // variant was never a CR 106.6 spend restriction — Path of Ancestry's mana may be
+    // spent on anything — so it carried a permanently-`false` `allows_spell`, and the
+    // test existed only to pin that hole. The predicate now lives where it belongs, as
+    // `FilterProp::SharesCreatureTypeWithCommander`, and its behavior is pinned by the
+    // RUNTIME test `mana_spend_trigger_shares_creature_type_with_commander`
+    // (game/casting_tests.rs), which is the only layer that can prove it.
 
     #[test]
     fn spend_for_prefers_unrestricted_mana() {

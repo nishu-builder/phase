@@ -265,7 +265,16 @@ fn resolve_all_declined_opponent_may(
             // OptionalEffectPerformed sub).
             if let Some(ref else_branch) = sub.else_ability {
                 let mut else_resolved = else_branch.as_ref().clone();
+                // CR 608.2c: the else branch resolves as the continuation of the
+                // stashed optional ability. Preserve a captured event-context
+                // target (such as the affected player of a replaced Draw) after
+                // the post-replacement drain that supplied it has retired.
+                if else_resolved.targets.is_empty() && !ability.targets.is_empty() {
+                    else_resolved.targets = ability.targets.clone();
+                }
                 else_resolved.context = ability.context.clone();
+                else_resolved
+                    .set_replacement_applied_recursive(ability.replacement_applied.clone());
                 effects::resolve_ability_chain(state, &else_resolved, events, 1)
                     .map_err(|e| EngineError::InvalidAction(format!("{e:?}")))?;
             }
@@ -1031,6 +1040,7 @@ pub(super) fn handle_unless_payment(
             AbilityCost::Tap
             | AbilityCost::Untap
             | AbilityCost::Unattach
+            | AbilityCost::UnattachFrom { .. }
             | AbilityCost::Loyalty { .. }
             | AbilityCost::PaySpeed { .. }
             | AbilityCost::Exile { .. }
@@ -1113,6 +1123,7 @@ pub(super) fn handle_unless_payment(
             events.push(GameEvent::EffectResolved {
                 kind: EffectKind::from(&pending_effect.effect),
                 source_id: pending_effect.source_id,
+                subject: None,
             });
 
             // CR 118.12 + CR 118.12a: "[Effect] unless [player] pays [cost].
@@ -1481,6 +1492,7 @@ pub(super) fn handle_ward_discard_choice(
     events.push(GameEvent::EffectResolved {
         kind: EffectKind::from(&pending_effect.effect),
         source_id: pending_effect.source_id,
+        subject: None,
     });
 
     set_active_priority(state);
@@ -1620,6 +1632,7 @@ pub(super) fn handle_ward_sacrifice_choice(
     events.push(GameEvent::EffectResolved {
         kind: EffectKind::from(&pending_effect.effect),
         source_id: pending_effect.source_id,
+        subject: None,
     });
 
     set_active_priority(state);
@@ -1671,6 +1684,7 @@ pub(super) fn handle_unless_bounce_choice(
     events.push(GameEvent::EffectResolved {
         kind: EffectKind::from(&pending_effect.effect),
         source_id: pending_effect.source_id,
+        subject: None,
     });
 
     set_active_priority(state);

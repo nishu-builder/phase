@@ -592,11 +592,111 @@ fn parse_guessed_number_ref(input: &str) -> OracleResult<'_, QuantityRef> {
     .parse(input)
 }
 
+/// Alchemy (digital-only) intensity: "<self-possessive> intensity".
+///
+/// The self-reference is normalized to `~` upstream, so Arek, False
+/// Goldwarden's "where X is Arek's intensity" arrives as "~'s intensity"; a
+/// spell reading its own counter says "this spell's intensity" (Mycelic
+/// Ballad). Both denote the SOURCE object, which is what
+/// `QuantityRef::Intensity { scope: Source }` resolves against (game/quantity.rs).
+///
+/// Without this arm the phrase fell through to the raw-text
+/// `QuantityRef::Variable`, which resolves to 0 — every intensity card silently
+/// did nothing while reading as supported.
+fn parse_intensity_ref(input: &str) -> OracleResult<'_, QuantityRef> {
+    value(
+        QuantityRef::Intensity {
+            scope: ObjectScope::Source,
+        },
+        terminated(
+            // "this spell's" is a leaf variant of the same self-possessive axis;
+            // it is kept local rather than pushed into `parse_self_possessive`,
+            // whose many other callers do not expect a stack-only possessive.
+            alt((parse_self_possessive, value((), tag("this spell's")))),
+            tag(" intensity"),
+        ),
+    )
+    .parse(input)
+}
+
+/// CR 120.10: The EXCESS damage the preceding effect in this resolution dealt —
+/// the damage beyond lethal ("If those sources together dealt an amount of
+/// damage to a creature greater than lethal damage, excess damage equal to the
+/// difference was dealt to that creature").
+///
+/// `QuantityRef::PreviousEffectAmount { channel: Excess }` reads
+/// `GameState::last_effect_excess_amount`, which the damage effects stamp
+/// alongside the total and which is cleared at depth-0 — the same
+/// resolution-local scope the "this way" wording denotes. The CONDITION peer
+/// (`AbilityCondition::PreviousEffectAmount { channel: Excess }`, "if excess
+/// damage was dealt this way") already read that channel; only the QUANTITY side
+/// was missing, so every one of these clauses was dropped whole.
+///
+/// Only the shape that carries an explicit "this way" is bound here:
+///
+///   `[the amount of ]excess damage dealt to <subject> this way`
+///   (Goblin Negotiation, Hell to Pay, Lacerate Flesh)
+///
+/// The bare demonstrative `"that excess damage"` is deliberately NOT bound, and
+/// that is a correctness constraint, not an oversight. Its antecedent is fixed by
+/// the sibling clause, and the two readings resolve from DIFFERENT state:
+///
+///   - Contest of Claws — "If excess damage was dealt THIS WAY, … where X is that
+///     excess damage." The antecedent is an effect in the SAME resolution, so
+///     `last_effect_excess_amount` is live. `PreviousEffectAmount { Excess }` is right.
+///   - Fall of Cair Andros — "Whenever a creature an opponent controls is dealt
+///     excess noncombat damage, amass Orcs X, where X is that excess damage." The
+///     antecedent is the TRIGGERING EVENT. The triggered ability resolves as its own
+///     top-level chain, and `last_effect_excess_amount` is cleared in the depth-0
+///     prelude (`effects/mod.rs`), so `PreviousEffectAmount { Excess }` reads
+///     `None` -> 0. Binding it there would render as supported and silently amass 0 —
+///     a BETTER-DISGUISED version of the raw-text `Variable` fabrication it replaced.
+///
+/// A context-free leaf combinator cannot tell those apart: the disambiguator is the
+/// sibling condition ("dealt this way") versus the trigger condition, which lives one
+/// layer up. Until that rebind exists at the clause layer, the bare demonstrative
+/// stays an honest red rather than a well-typed lie.
+fn parse_excess_damage_ref(input: &str) -> OracleResult<'_, QuantityRef> {
+    value(
+        QuantityRef::PreviousEffectAmount {
+            channel: DamageChannel::Excess,
+        },
+        (
+            opt(alt((tag("the amount of "), tag("the ")))),
+            tag("excess damage dealt to "),
+            // CR 120.10 enumerates the three permanent kinds that can be dealt
+            // excess damage (creature / planeswalker / battle).
+            alt((
+                tag("that creature"),
+                tag("that planeswalker"),
+                tag("that permanent"),
+                tag("that battle"),
+                tag("it"),
+            )),
+            tag(" this way"),
+        ),
+    )
+    .parse(input)
+}
+
+/// CR 107.3: "the chosen number" — the number a player named for this object
+/// (Liquid Fire's additional cost; Fluros of Myra's Marvels' as-enters choice).
+/// `QuantityRef::ChosenNumber` reads `ChosenAttribute::Number` off the source
+/// object (game/quantity.rs), which is where the choice is recorded.
+fn parse_chosen_number_ref(input: &str) -> OracleResult<'_, QuantityRef> {
+    value(QuantityRef::ChosenNumber, tag("the chosen number")).parse(input)
+}
+
 pub fn parse_quantity_ref(input: &str) -> OracleResult<'_, QuantityRef> {
     alt((
         alt((
             parse_guessed_number_ref,
             parse_object_count_by_shared_quality,
+            parse_chosen_number_ref,
+            parse_intensity_ref,
+            // CR 120.10: must precede the generic damage/number arms so the
+            // "excess" channel wins over a plain damage reading.
+            parse_excess_damage_ref,
         )),
         parse_the_number_of,
         parse_object_property_aggregate_ref,
@@ -669,6 +769,9 @@ pub fn parse_quantity_ref(input: &str) -> OracleResult<'_, QuantityRef> {
             parse_cost_paid_object_ref,
             parse_cost_paid_object_prepositional_ref,
             parse_cost_paid_object_chosen_revealed_ref,
+            // CR 608.2k + CR 202.3: "that Equipment's mana value" (Captain
+            // America's Throw) — demonstrative back-reference to the paid attachment.
+            parse_cost_paid_object_demonstrative_ref,
         )),
         parse_event_context_refs,
     ))
@@ -684,13 +787,57 @@ pub fn parse_quantity_ref(input: &str) -> OracleResult<'_, QuantityRef> {
         parse_chroma_devotion_ref,
         parse_graveyard_chroma_ref,
         parse_counters_among_ref,
+        // CR 105.1 + CR 105.2: bare "colors among <filter>" — reached after a
+        // parent has consumed "there are N " (Puca's Eye: "there are five colors
+        // among permanents you control"). The tail combinator (`tag("colors
+        // among ") + parse_type_phrase`) is shared with the "the number of
+        // colors among ..." path; registering it here makes it reachable in the
+        // bare-suffix context too.
+        parse_number_of_distinct_colors_among_permanents_tail,
         // CR 402.1: "the player with the {most|fewest} cards in hand" — the
         // cross-player hand-size extremum, the hand-zone peer of the life
         // extremum. Distinctive "the player with the " prefix; no ordering
         // hazard with sibling arms.
         parse_player_with_extremum_cards_in_hand,
+        // CR 118.9 / CR 601.3: bare "<type> on the battlefield" object count.
+        // Placed LAST (lowest priority) so every specific arm — notably
+        // `parse_greatest_commander_mana_value_ref` for "the greatest mana value
+        // of a commander you own on the battlefield" — wins first; this fallback
+        // only claims a bare type phrase nothing else recognized (Blasphemous
+        // Edict's "creatures on the battlefield").
+        parse_type_count_on_battlefield,
     )))
     .parse(input)
+}
+
+/// CR 118.9 + CR 601.3: "<type> on the battlefield" → count of matching objects
+/// on the battlefield. The GE / "N or more" sibling of `parse_no_on_battlefield`
+/// (`oracle_nom/condition.rs`, which emits the `== 0` form); reached after a
+/// parent combinator (`parse_there_are_conditions`) has consumed the "there are
+/// N or more " quantifier, leaving the bare noun phrase (Blasphemous Edict's
+/// "creatures on the battlefield").
+///
+/// The full phrase is decoded by `parse_type_phrase`, so the " on the
+/// battlefield" locative is re-attached as `FilterProp::InZone { Battlefield }`
+/// exactly as the for-each battlefield-count fallback does
+/// (`oracle_quantity::parse_type_phrase_with_ctx`) — this arm therefore produces
+/// byte-identical `ObjectCount` filters for any for-each clause it now intercepts
+/// at the shared `parse_quantity_ref` seam. Guarded two ways so it stays strictly
+/// additive on that high-traffic surface: the phrase must END with the battlefield
+/// locative (rejecting "…on the battlefield or in the command zone", which its
+/// dedicated commander-mana-value arm claims), and the type phrase must fully
+/// consume and be non-`Any`.
+fn parse_type_count_on_battlefield(input: &str) -> OracleResult<'_, QuantityRef> {
+    let (after_anchor, _) = take_until(" on the battlefield").parse(input)?;
+    let (after_anchor, _) = tag(" on the battlefield").parse(after_anchor)?;
+    if !after_anchor.trim().is_empty() {
+        return Err(oracle_err(input));
+    }
+    let (filter, type_rest) = parse_type_phrase(input);
+    if matches!(filter, TargetFilter::Any) || !type_rest.trim().is_empty() {
+        return Err(oracle_err(input));
+    }
+    Ok(("", QuantityRef::ObjectCount { filter }))
 }
 
 /// CR 109.3 + CR 205.3m: Parse "the greatest/fewest/total number of
@@ -992,36 +1139,180 @@ fn parse_the_number_of(input: &str) -> OracleResult<'_, QuantityRef> {
     parse_number_of_inner(rest)
 }
 
+/// CR 107.1: The maximizing extremum adjective. Oracle text prints several
+/// interchangeable superlatives for the same `AggregateFunction::Max`
+/// ("greatest power", "highest mana value"); they are one axis, not one phrase
+/// each. Verdant Rejuvenation prints "highest".
+fn parse_max_extremum_adjective(input: &str) -> OracleResult<'_, ()> {
+    value((), alt((tag("greatest"), tag("highest"), tag("largest")))).parse(input)
+}
+
+/// CR 208.1 + CR 202.3: The aggregable object properties. Shared by every
+/// aggregate form so the property axis is declared once.
+fn parse_aggregate_property(input: &str) -> OracleResult<'_, ObjectProperty> {
+    alt((
+        value(ObjectProperty::Power, tag("power")),
+        value(ObjectProperty::Toughness, tag("toughness")),
+        parse_mana_value_phrase,
+    ))
+    .parse(input)
+}
+
+/// CR 608.2c: The nouns a chain-set anaphor can name. Plurals precede their
+/// singulars — otherwise `tag("card")` would match the prefix of "cards" and
+/// strand a trailing "s".
+fn parse_tracked_set_noun(input: &str) -> OracleResult<'_, ()> {
+    value(
+        (),
+        alt((
+            tag("cards"),
+            tag("card"),
+            tag("permanents"),
+            tag("permanent"),
+            tag("creatures"),
+            tag("creature"),
+        )),
+    )
+    .parse(input)
+}
+
+/// CR 608.2c: The participles that name the action which PUBLISHED the chain
+/// tracked set.
+///
+/// This list is deliberately restricted to the causes the engine actually
+/// stamps (`ThisWayCause::{Exiled, Discarded, Sacrificed, Milled}`, stamped via
+/// `publish_tracked_set_with_causes`). "goaded" is **excluded on purpose**:
+/// `game/effects/goad.rs` publishes no tracked set, so binding "creatures
+/// goaded this way" (Havoc Eater) would aggregate over a stale or empty set and
+/// silently resolve to 0 — a well-typed lie. It stays an honest red until goad
+/// publishes its set.
+fn parse_this_way_participle(input: &str) -> OracleResult<'_, ()> {
+    value(
+        (),
+        alt((
+            tag("exiled"),
+            tag("discarded"),
+            tag("sacrificed"),
+            tag("milled"),
+        )),
+    )
+    .parse(input)
+}
+
+/// CR 608.2c: The EXPLICIT chain-set anaphor — `[the ]<noun> <participle> this
+/// way`. The trailing "this way" is what makes it unambiguous: it names the set
+/// published by an effect in THIS resolution, so it cannot be confused with the
+/// linked-exile pool ("the exiled card" = exiled with the source, persistently)
+/// or the cost-paid referent ("the sacrificed permanent" = a cost). That is why
+/// this — and not the bare pre-nominal form — is the shape allowed to stand
+/// alone as a referent after "the <property> of ".
+fn parse_this_way_anaphor(input: &str) -> OracleResult<'_, ()> {
+    value(
+        (),
+        (
+            opt(tag("the ")),
+            parse_tracked_set_noun,
+            tag(" "),
+            parse_this_way_participle,
+            tag(" this way"),
+        ),
+    )
+    .parse(input)
+}
+
+/// CR 608.2c: The anaphor that names the chain tracked set published by the
+/// immediately-preceding effect in the same ability ("those exiled cards", "the
+/// cards discarded this way", "the creatures sacrificed this way").
+///
+/// Single authority for chain-set anaphora, composed on two independent axes
+/// (noun x participle) rather than enumerated as a phrase table. Two
+/// grammatical shapes carry the same meaning:
+///
+/// - post-nominal participle: `[the ]<noun> <participle> this way`
+/// - pre-nominal adjective:   `{those|the} exiled <noun>`
+///
+/// The pre-nominal shape stays exile-only, exactly as before, and is reachable
+/// ONLY behind an aggregate prefix ("the total power of …"), where it is
+/// unambiguous. It must never be offered as a bare referent: outside that
+/// context "the exiled card" is claimed by two OTHER referents — the
+/// linked-exile pool (`parse_linked_exile_mana_value_ref` — "the mana value of
+/// the exiled card") and the craft-material pool ("… the exiled card used to
+/// craft it"). See [`parse_this_way_anaphor`] for the bare-referent form.
+fn parse_tracked_set_anaphor(input: &str) -> OracleResult<'_, ()> {
+    alt((
+        // Pre-nominal: "those exiled cards" / "the exiled cards". Unchanged.
+        value(
+            (),
+            (
+                alt((tag("those "), tag("the "))),
+                tag("exiled "),
+                parse_tracked_set_noun,
+            ),
+        ),
+        parse_this_way_anaphor,
+    ))
+    .parse(input)
+}
+
 /// CR 208.1 + CR 202.3: Parse object-property aggregate quantities such as
 /// "the greatest power among <filter>" and "the total mana value of <filter>".
 /// The aggregate axis and object-property axis are independent typed choices,
 /// so new siblings extend this combinator instead of adding one-off phrase
 /// recognition in the legacy quantity entry points.
 fn parse_object_property_aggregate_ref(input: &str) -> OracleResult<'_, QuantityRef> {
+    // CR 608.2c: the SINGULAR "this way" referent — "the <property> of <the
+    // noun <participle> this way>" (Ruinous Intrusion, Astarion's Thirst).
+    // There is no aggregate adjective here, so it cannot share the
+    // extremum/total prefix alt below. It is gated on the anaphor actually
+    // matching, which is what keeps it from stealing the cost-paid
+    // prepositional form ("the mana value of the sacrificed permanent" —
+    // pre-nominal participle, no "this way"; see
+    // `parse_cost_paid_object_prepositional_ref`).
+    //
+    // `Sum` over a one-member set is that member's value; this follows the
+    // precedent already set for the singular "the card exiled this way".
+    if let Ok((rest, property)) = (
+        tag::<_, _, OracleError<'_>>("the "),
+        parse_aggregate_property,
+        tag(" of "),
+    )
+        .parse(input)
+        .map(|(rest, (_, property, _))| (rest, property))
+    {
+        // Only the EXPLICIT "this way" anaphor may stand alone here — the bare
+        // pre-nominal "the exiled card" belongs to the linked-exile and
+        // craft-material referents (see `parse_this_way_anaphor`).
+        if let Ok((anaphor_rest, _)) = parse_this_way_anaphor(rest) {
+            return Ok((
+                anaphor_rest,
+                QuantityRef::TrackedSetAggregate {
+                    function: AggregateFunction::Sum,
+                    property,
+                    source: crate::types::ability::TrackedAnaphorSource::ChainSet,
+                },
+            ));
+        }
+    }
+
+    // The aggregate axis and the object-property axis are independent, so they
+    // are composed rather than enumerated: three properties x N extremum
+    // adjectives would otherwise be a permutation table.
     let (rest, (function, property)) = alt((
-        value(
-            (AggregateFunction::Max, ObjectProperty::Power),
-            tag("the greatest power among "),
+        // "the {greatest|highest|largest} <property> among "
+        map(
+            (
+                tag("the "),
+                parse_max_extremum_adjective,
+                tag(" "),
+                parse_aggregate_property,
+                tag(" among "),
+            ),
+            |(_, (), _, property, _)| (AggregateFunction::Max, property),
         ),
-        value(
-            (AggregateFunction::Max, ObjectProperty::Toughness),
-            tag("the greatest toughness among "),
-        ),
-        value(
-            (AggregateFunction::Max, ObjectProperty::ManaValue),
-            tag("the greatest mana value among "),
-        ),
-        value(
-            (AggregateFunction::Sum, ObjectProperty::Power),
-            tag("the total power of "),
-        ),
-        value(
-            (AggregateFunction::Sum, ObjectProperty::Toughness),
-            tag("the total toughness of "),
-        ),
-        value(
-            (AggregateFunction::Sum, ObjectProperty::ManaValue),
-            tag("the total mana value of "),
+        // "the total <property> of "
+        map(
+            (tag("the total "), parse_aggregate_property, tag(" of ")),
+            |(_, property, _)| (AggregateFunction::Sum, property),
         ),
     ))
     .parse(input)?;
@@ -1040,16 +1331,7 @@ fn parse_object_property_aggregate_ref(input: &str) -> OracleResult<'_, Quantity
             },
         ));
     }
-    if let Ok((anaphor_rest, _)) = alt((
-        tag::<_, _, OracleError<'_>>("those exiled cards"),
-        tag("the exiled cards"),
-        tag("the cards exiled this way"),
-        tag("cards exiled this way"),
-        tag("the card exiled this way"),
-        tag("card exiled this way"),
-    ))
-    .parse(rest)
-    {
+    if let Ok((anaphor_rest, _)) = parse_tracked_set_anaphor(rest) {
         return Ok((
             anaphor_rest,
             QuantityRef::TrackedSetAggregate {
@@ -2134,7 +2416,7 @@ fn parse_scoped_zone_ref(input: &str) -> OracleResult<'_, (ZoneRef, CountScope)>
 /// templating used "its" exclusively, so admitting the gendered forms here
 /// keeps the whole "his/her/their <characteristic>" class on one path rather
 /// than special-casing one card.
-fn parse_self_possessive(input: &str) -> OracleResult<'_, ()> {
+pub(crate) fn parse_self_possessive(input: &str) -> OracleResult<'_, ()> {
     value(
         (),
         alt((
@@ -2644,6 +2926,34 @@ fn parse_cost_paid_object_chosen_revealed_ref(input: &str) -> OracleResult<'_, Q
         ObjectProperty::ManaValue | ObjectProperty::ManaSymbolCount(_) => {
             return Err(oracle_err(input))
         }
+    };
+    Ok((rest, qty))
+}
+
+/// CR 608.2k + CR 202.3: Demonstrative back-reference to the attachment paid as
+/// this ability's cost. "that Equipment's mana value" / "that Aura's power" —
+/// "that <attachment-type>" points at the object unattached (or otherwise paid)
+/// as the cost (Captain America's Throw: "Unattach an Equipment from ~ … that
+/// Equipment's mana value"). Restricted to attachment subtypes (Equipment / Aura
+/// / Fortification) so it never collides with target demonstratives like "that
+/// creature". Resolves against the same `ObjectScope::CostPaidObject` referent as
+/// the participle possessive form above.
+fn parse_cost_paid_object_demonstrative_ref(input: &str) -> OracleResult<'_, QuantityRef> {
+    let (rest, _) = tag("that ").parse(input)?;
+    let (rest, _) = alt((tag("equipment"), tag("aura"), tag("fortification"))).parse(rest)?;
+    let (rest, property) = parse_object_property_possessive_suffix(rest)?;
+    let qty = match property {
+        ObjectProperty::ManaValue => QuantityRef::ObjectManaValue {
+            scope: ObjectScope::CostPaidObject,
+        },
+        ObjectProperty::Power => QuantityRef::Power {
+            scope: ObjectScope::CostPaidObject,
+        },
+        ObjectProperty::Toughness => QuantityRef::Toughness {
+            scope: ObjectScope::CostPaidObject,
+        },
+        // `parse_object_property_possessive_suffix` never emits ManaSymbolCount.
+        ObjectProperty::ManaSymbolCount(_) => return Err(oracle_err(input)),
     };
     Ok((rest, qty))
 }
@@ -3211,7 +3521,8 @@ pub(crate) fn parse_for_each_clause_ref_with_context<'a>(
     parse_for_each_clause_ref_with_they_controller(input, they_controller)
 }
 
-/// CR 608.2c + CR 609.3: Read the Runes — "for each card[s] drawn this way".
+/// CR 608.2c: Read the Runes — "for each card[s] drawn this way". The "this way"
+/// anaphor reads the count the preceding draw in the same effect established.
 fn parse_for_each_card_drawn_this_way(input: &str) -> OracleResult<'_, QuantityRef> {
     let (rest, _) = alt((tag("card drawn this way"), tag("cards drawn this way"))).parse(input)?;
     Ok((rest, QuantityRef::EventContextAmount))
@@ -3325,6 +3636,7 @@ fn parse_for_each_clause_ref_with_they_controller(
         // an unconsumed remainder, dropping the quantity (Skycat Sovereign, Aven
         // Gagglemaster, Aerial Assault, Alert Heedbonder, Overgrown Battlement).
         parse_for_each_controlled_type_with_keyword,
+        parse_for_each_object_spell_could_target,
         parse_for_each_controlled_type,
         // CR 201.2: "for each [other] <type> named <CardName> you control"
         // (Seven Dwarves). The `named X` qualifier sits between the type word
@@ -3513,6 +3825,27 @@ fn parse_mana_spent_to_cast_ref(input: &str) -> OracleResult<'_, QuantityRef> {
         ));
     }
 
+    // CR 107.4h: "{S} spent to cast <self>" — the snow mana symbol "can also be
+    // used to refer to mana of any type produced by a snow source spent to pay a
+    // cost". That is exactly `FromSource`, whose filter selects the PRODUCING
+    // source (game/quantity.rs counts each spent-mana snapshot whose source
+    // matches), so a Snow-supertype filter is the precise model. Graven Lore,
+    // Blessing of Frost, Blood on the Snow. The symbol is matched case-insensitively
+    // because this combinator runs on both original and lowercased text.
+    if let Ok((rest, _)) = parse_snow_mana_symbol(input) {
+        let (rest, _) = tag(" spent to cast ").parse(rest)?;
+        let (rest, _scope) = parse_mana_spent_self_subject(rest)?;
+        return Ok((
+            rest,
+            QuantityRef::ManaSpentToCast {
+                scope: CastManaObjectScope::SelfObject,
+                metric: CastManaSpentMetric::FromSource {
+                    source_filter: snow_source_filter(),
+                },
+            },
+        ));
+    }
+
     let (rest, _) = tag("mana spent to cast ").parse(input)?;
     // SelfObject literal retained: this ref form never accepts "that" subjects.
     let (rest, _scope) = parse_mana_spent_self_subject(rest)?;
@@ -3549,6 +3882,26 @@ pub(crate) fn parse_mana_source_filter(input: &str) -> OracleResult<'_, TargetFi
     Ok((rest, source_filter))
 }
 
+/// CR 107.4h: The snow mana symbol `{S}`. Matched case-insensitively because
+/// this combinator runs on both original-case and lowercased text.
+pub(crate) fn parse_snow_mana_symbol(input: &str) -> OracleResult<'_, ()> {
+    value((), alt((tag::<_, _, OracleError<'_>>("{s}"), tag("{S}")))).parse(input)
+}
+
+/// CR 106.3 + CR 107.4h: The filter that selects a SNOW SOURCE — any object with
+/// the Snow supertype. Single authority for the `{S}` model, shared by every
+/// "mana produced by a snow source" reading so the two entry points
+/// (`parse_mana_spent_to_cast_ref` here and `parse_mana_spent_to_cast_amount` in
+/// `oracle_quantity`) cannot drift apart.
+pub(crate) fn snow_source_filter() -> TargetFilter {
+    TargetFilter::Typed(TypedFilter {
+        properties: vec![FilterProp::HasSupertype {
+            value: crate::types::card_type::Supertype::Snow,
+        }],
+        ..Default::default()
+    })
+}
+
 /// CR 400.7d: Parse the subject anaphora of a "mana spent to cast <subject>"
 /// clause and report which `CastManaObjectScope` it selects.
 ///
@@ -3570,6 +3923,12 @@ pub(crate) fn parse_mana_spent_self_subject(input: &str) -> OracleResult<'_, Cas
         value(CastManaObjectScope::SelfObject, tag("this permanent")),
         value(CastManaObjectScope::SelfObject, tag("it")),
         value(CastManaObjectScope::SelfObject, tag("them")),
+        // CR 400.7d: gendered self-anaphora — Oracle text for a legendary
+        // creature refers to the spell as "her"/"him" (Toph, Greatest
+        // Earthbender: "where X is the amount of mana spent to cast her").
+        // Same self-object axis as "it"/"them"; only the pronoun differs.
+        value(CastManaObjectScope::SelfObject, tag("her")),
+        value(CastManaObjectScope::SelfObject, tag("him")),
         value(CastManaObjectScope::SelfObject, tag("~")),
     ))
     .parse(input)
@@ -4485,6 +4844,46 @@ fn parse_for_each_controlled_type_with_keyword(input: &str) -> OracleResult<'_, 
     ))
 }
 
+/// CR 115.1 + CR 707.10: "[other] <type> [you control] [on the battlefield] that
+/// [the] spell could target" — Zada ("other creature you control that the spell
+/// could target"), Ink-Treader Nephilim ("other creature that spell could target"),
+/// Precursor Golem ("other Golem on the battlefield that the spell could target").
+/// Optional "other"/"another" excludes the trigger source;
+/// `CouldBeTargetedByTriggeringSpell` gates on spell legality at runtime.
+fn parse_for_each_object_spell_could_target(input: &str) -> OracleResult<'_, QuantityRef> {
+    let (rest, has_other) = opt(alt((
+        value((), tag::<_, _, OracleError<'_>>("other ")),
+        value((), tag("another ")),
+    )))
+    .parse(input)?;
+    let (rest, tf) = parse_type_filter_word(rest)?;
+    let (rest, controller) = opt(map(
+        alt((tag(" you already control"), tag(" you control"))),
+        |_| ControllerRef::You,
+    ))
+    .parse(rest)?;
+    let (rest, _) = opt(tag(" on the battlefield")).parse(rest)?;
+    let (rest, _) = alt((
+        tag(" that the spell could target"),
+        tag(" that spell could target"),
+    ))
+    .parse(rest)?;
+    let mut properties = vec![FilterProp::CouldBeTargetedByTriggeringSpell];
+    if has_other.is_some() {
+        properties.push(FilterProp::Another);
+    }
+    Ok((
+        rest,
+        QuantityRef::ObjectCount {
+            filter: TargetFilter::Typed(TypedFilter {
+                type_filters: vec![tf],
+                controller,
+                properties,
+            }),
+        },
+    ))
+}
+
 fn parse_for_each_controlled_type(input: &str) -> OracleResult<'_, QuantityRef> {
     // CR 109.4: Only objects on the stack or on the battlefield have a
     // controller, so a "you control" count is over battlefield permanents
@@ -4629,10 +5028,46 @@ fn parse_player_counter_possessor(input: &str) -> OracleResult<'_, CountScope> {
 mod tests {
     use super::*;
     use crate::types::ability::{
-        AggregateFunction, FilterProp, ObjectProperty, SharedQuality, SharedQualityRelation,
-        TargetFilter, TypeFilter, TypedFilter,
+        AggregateFunction, ControllerRef, FilterProp, ObjectProperty, QuantityRef, SharedQuality,
+        SharedQualityRelation, TargetFilter, TypeFilter, TypedFilter,
     };
     use crate::types::mana::ManaColor;
+
+    #[test]
+    fn parse_for_each_object_spell_could_target_covers_zada_and_ink_treader() {
+        let zada = parse_for_each_object_spell_could_target(
+            "other creature you control that the spell could target",
+        )
+        .expect("zada for-each count");
+        assert!(matches!(
+            zada.1,
+            QuantityRef::ObjectCount {
+                filter: TargetFilter::Typed(TypedFilter {
+                    type_filters,
+                    controller: Some(ControllerRef::You),
+                    properties,
+                }),
+            } if type_filters == vec![TypeFilter::Creature]
+                && properties.contains(&FilterProp::Another)
+                && properties.contains(&FilterProp::CouldBeTargetedByTriggeringSpell)
+        ));
+
+        let ink_treader =
+            parse_for_each_object_spell_could_target("other creature that spell could target")
+                .expect("ink-treader for-each count");
+        assert!(matches!(
+            ink_treader.1,
+            QuantityRef::ObjectCount {
+                filter: TargetFilter::Typed(TypedFilter {
+                    type_filters,
+                    controller: None,
+                    properties,
+                }),
+            } if type_filters == vec![TypeFilter::Creature]
+                && properties.contains(&FilterProp::Another)
+                && properties.contains(&FilterProp::CouldBeTargetedByTriggeringSpell)
+        ));
+    }
 
     /// CR 400.7 + CR 700.4 + CR 109.5: the shared death-suffix combinator returns
     /// the controller scope for all four "that died" tag forms and rejects
@@ -4861,9 +5296,10 @@ mod tests {
         }
     }
 
-    /// CR 609.3 + CR 208.1: "the total power of the cards exiled this way"
-    /// reads the most recent chain tracked set (Stitcher Geralf), not the
-    /// linked-exile craft pool.
+    /// CR 608.2c + CR 208.1: the "this way" anaphor in "the total power of the
+    /// cards exiled this way" reads the most recent chain tracked set (Stitcher
+    /// Geralf) — the set the earlier text published — not the linked-exile craft
+    /// pool.
     #[test]
     fn parse_total_power_of_cards_exiled_this_way_is_tracked_set_aggregate() {
         use crate::types::ability::TrackedAnaphorSource;
@@ -9436,5 +9872,174 @@ mod tests {
             panic!("expected typed filter");
         };
         assert!(tf.properties.contains(&FilterProp::NonToken));
+    }
+
+    #[test]
+    fn parse_that_equipments_mana_value_is_cost_paid_object() {
+        // CR 608.2k + CR 202.3: Captain America's Throw — "that Equipment's mana
+        // value" back-references the unattached (cost-paid) Equipment.
+        let (rest, q) = parse_quantity_ref("that equipment's mana value").unwrap();
+        assert_eq!(rest, "");
+        assert_eq!(
+            q,
+            QuantityRef::ObjectManaValue {
+                scope: ObjectScope::CostPaidObject,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_that_creature_is_not_cost_paid_demonstrative() {
+        // Negative: the demonstrative cost-paid ref is restricted to attachment
+        // subtypes, so "that creature's mana value" must NOT resolve to a
+        // CostPaidObject demonstrative (it would otherwise shadow target refs).
+        let parsed = parse_quantity_ref("that creature's mana value");
+        assert!(
+            parsed.is_err()
+                || !matches!(
+                    parsed,
+                    Ok((
+                        _,
+                        QuantityRef::ObjectManaValue {
+                            scope: ObjectScope::CostPaidObject
+                        }
+                    ))
+                ),
+            "\"that creature\" must not become a cost-paid demonstrative: {parsed:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // t78 class D + C(ii): bindable quantity expressions whose typed home and
+    // live resolver both already exist. Each witness below is a full-pool face
+    // that currently fails to bind (honest red) or, worse, silently swallows
+    // its count.
+    // ---------------------------------------------------------------------
+
+    /// CR 202.3: "the HIGHEST mana value among <filter>" — the extremum
+    /// adjective is an independent axis from the property. Verdant
+    /// Rejuvenation prints "highest"; only "greatest" was recognized, so the
+    /// whole where-X clause fell to an honest red.
+    #[test]
+    fn aggregate_extremum_adjective_synonyms_bind() {
+        for phrase in [
+            "the highest mana value among creatures you control",
+            "the greatest mana value among creatures you control",
+            "the largest mana value among creatures you control",
+        ] {
+            let (rest, q) = parse_quantity_ref(phrase)
+                .unwrap_or_else(|e| panic!("{phrase:?} must bind: {e:?}"));
+            assert_eq!(rest, "", "{phrase:?} must fully consume");
+            assert!(
+                matches!(
+                    q,
+                    QuantityRef::Aggregate {
+                        function: AggregateFunction::Max,
+                        property: ObjectProperty::ManaValue,
+                        ..
+                    }
+                ),
+                "{phrase:?} -> {q:?}"
+            );
+        }
+    }
+
+    /// CR 608.2c: the "<noun> <participle> this way" anaphor names the chain
+    /// tracked set the immediately-preceding effect published. The participle
+    /// axis is independent of the noun axis; only `exiled` was recognized, so
+    /// `discarded` / `sacrificed` fell to honest reds.
+    ///
+    /// Restricted to causes the engine actually STAMPS
+    /// (`ThisWayCause::{Exiled,Discarded,Sacrificed,Milled}`). "goaded" is
+    /// deliberately absent — `effects/goad.rs` publishes no tracked set, so
+    /// binding it would resolve against a stale/empty set (a lying-green).
+    #[test]
+    fn tracked_set_anaphor_participle_axis_binds() {
+        // Ill-Timed Explosion (discarded), Sword of the Ages / Reign of the
+        // Pit (sacrificed), and the pre-existing exile forms.
+        for (phrase, function, property) in [
+            (
+                "the greatest mana value among cards discarded this way",
+                AggregateFunction::Max,
+                ObjectProperty::ManaValue,
+            ),
+            (
+                "the total power of the creatures sacrificed this way",
+                AggregateFunction::Sum,
+                ObjectProperty::Power,
+            ),
+            (
+                "the total power of the cards exiled this way",
+                AggregateFunction::Sum,
+                ObjectProperty::Power,
+            ),
+        ] {
+            let (rest, q) = parse_quantity_ref(phrase)
+                .unwrap_or_else(|e| panic!("{phrase:?} must bind: {e:?}"));
+            assert_eq!(rest, "", "{phrase:?} must fully consume");
+            match q {
+                QuantityRef::TrackedSetAggregate {
+                    function: f,
+                    property: p,
+                    source: crate::types::ability::TrackedAnaphorSource::ChainSet,
+                } => {
+                    assert_eq!(f, function, "{phrase:?} aggregate function");
+                    assert_eq!(p, property, "{phrase:?} property");
+                }
+                other => panic!("{phrase:?} must be a ChainSet TrackedSetAggregate, got {other:?}"),
+            }
+        }
+    }
+
+    /// CR 608.2c: a SINGULAR "this way" referent with no aggregate adjective —
+    /// "the mana value of the permanent exiled this way" (Ruinous Intrusion),
+    /// "the power of the creature exiled this way" (Astarion's Thirst). The
+    /// established precedent (`the card exiled this way`) reads these through
+    /// the chain tracked set; `Sum` over a one-member set is that member's
+    /// value.
+    #[test]
+    fn tracked_set_anaphor_singular_property_of_binds() {
+        for (phrase, property) in [
+            (
+                "the mana value of the permanent exiled this way",
+                ObjectProperty::ManaValue,
+            ),
+            (
+                "the power of the creature exiled this way",
+                ObjectProperty::Power,
+            ),
+        ] {
+            let (rest, q) = parse_quantity_ref(phrase)
+                .unwrap_or_else(|e| panic!("{phrase:?} must bind: {e:?}"));
+            assert_eq!(rest, "", "{phrase:?} must fully consume");
+            match q {
+                QuantityRef::TrackedSetAggregate {
+                    function: AggregateFunction::Sum,
+                    property: p,
+                    source: crate::types::ability::TrackedAnaphorSource::ChainSet,
+                } => assert_eq!(p, property, "{phrase:?} property"),
+                other => panic!("{phrase:?} must be a ChainSet TrackedSetAggregate, got {other:?}"),
+            }
+        }
+    }
+
+    /// CR 608.2c: the "sacrificed permanent" COST referent must keep resolving
+    /// to `CostPaidObject` — the new "this way" anaphor arm must not steal the
+    /// pre-nominal participle form (Morbid Curiosity). Negative control for
+    /// `tracked_set_anaphor_singular_property_of_binds`.
+    #[test]
+    fn cost_paid_prepositional_referent_is_not_stolen_by_anaphor() {
+        let (rest, q) = parse_quantity_ref("the mana value of the sacrificed permanent")
+            .expect("cost-paid prepositional must still bind");
+        assert_eq!(rest, "");
+        assert!(
+            matches!(
+                q,
+                QuantityRef::ObjectManaValue {
+                    scope: ObjectScope::CostPaidObject
+                }
+            ),
+            "the sacrificed-permanent COST referent must stay CostPaidObject, got {q:?}"
+        );
     }
 }

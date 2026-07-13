@@ -509,6 +509,70 @@ pub fn check_fizzle(original_targets: &[TargetRef], legal_targets: &[TargetRef])
     legal_targets.is_empty()
 }
 
+/// CR 115.1 + CR 707.10: True when `candidate_id` could be chosen as a target of
+/// the spell that triggered the current `SpellCast` event (Zada copy-count filter).
+pub(crate) fn object_could_be_targeted_by_triggering_spell(
+    state: &GameState,
+    candidate_id: ObjectId,
+) -> bool {
+    let Some(event) = state.current_trigger_event.as_ref() else {
+        return false;
+    };
+    let Some(spell_id) = extract_source_from_event(event) else {
+        return false;
+    };
+    let spell_controller = match event {
+        GameEvent::SpellCast { controller, .. } => *controller,
+        _ => return false,
+    };
+    let Some(spell_ability) = triggering_spell_resolved_ability(state, spell_id, spell_controller)
+    else {
+        return false;
+    };
+    let Ok(slots) = crate::game::ability_utils::build_target_slots(state, &spell_ability) else {
+        return false;
+    };
+    slots.iter().any(|slot| {
+        slot.legal_targets
+            .contains(&TargetRef::Object(candidate_id))
+    })
+}
+
+/// CR 707.10a: Resolve the triggering spell's `ResolvedAbility` for legality
+/// checks. Prefer the live stack entry; fall back to `resolving_stack_entry`
+/// (spell mid-resolution) or reconstruct from the spell object when the stack
+/// entry is gone (e.g. countered before a `SpellCast` trigger resolves).
+fn triggering_spell_resolved_ability(
+    state: &GameState,
+    spell_id: ObjectId,
+    controller: PlayerId,
+) -> Option<ResolvedAbility> {
+    if let Some(ability) = state
+        .stack
+        .iter()
+        .rev()
+        .find(|entry| entry.id == spell_id)
+        .and_then(|entry| entry.ability())
+    {
+        return Some(ability.clone());
+    }
+    if let Some(entry) = state.resolving_stack_entry.as_ref() {
+        if entry.id == spell_id {
+            if let Some(ability) = entry.ability() {
+                return Some(ability.clone());
+            }
+        }
+    }
+    let obj = state.objects.get(&spell_id)?;
+    let def = crate::game::casting::combined_spell_ability_def(obj)?;
+    let mut resolved =
+        crate::game::ability_utils::build_resolved_from_def(&def, spell_id, controller);
+    if let Some(targets) = super::restrictions::triggering_spell_targets(state, spell_id) {
+        resolved.targets = targets;
+    }
+    Some(resolved)
+}
+
 /// Resolve event-context TargetFilter variants using the current trigger event.
 /// These variants auto-resolve at effect resolution time from `state.current_trigger_event`
 /// without requiring player selection (CR 603.2).
@@ -1098,11 +1162,11 @@ pub(crate) fn resolve_event_context_target_for_event_or_state(
         // resolution. Returns `None` if invoked outside the post-replacement
         // window — caller should never reach this filter from elsewhere.
         TargetFilter::PostReplacementSourceController => {
-            let source_obj_id = state.post_replacement_event_source?;
+            let source_obj_id = state.post_replacement_event_source()?;
             let controller = state.objects.get(&source_obj_id)?.controller;
             Some(TargetRef::Player(controller))
         }
-        TargetFilter::PostReplacementDamageTarget => state.post_replacement_event_target.clone(),
+        TargetFilter::PostReplacementDamageTarget => state.post_replacement_event_target().cloned(),
         // CR 108.3 + CR 400.3 + CR 615.5: Owner of the prevented event's damage
         // recipient ("that creature's owner shuffles it into their library").
         // Mirrors `PostReplacementSourceController`'s player-projection but reads
@@ -1110,7 +1174,7 @@ pub(crate) fn resolve_event_context_target_for_event_or_state(
         // slot / controller (CR 109.4). Routed here to the recipient's owner's
         // library by CR 400.3.
         TargetFilter::PostReplacementDamageTargetOwner => {
-            match &state.post_replacement_event_target {
+            match state.post_replacement_event_target() {
                 Some(TargetRef::Object(id)) => {
                     state.objects.get(id).map(|o| TargetRef::Player(o.owner))
                 }
@@ -1356,6 +1420,36 @@ pub(crate) fn extract_source_from_event(
         // re-typed to the dedicated per-blocker event).
         GameEvent::AttackerBecameBlockedByFilteredBlocker { blocker, .. } => Some(*blocker),
         _ => None,
+    }
+}
+
+/// CR 603.2c + CR 508.1: Extract EVERY object the trigger event names as a
+/// subject — the set-valued widening of [`extract_source_from_event`].
+///
+/// A batched trigger's plural anaphor ("them", "those creatures", "their total
+/// power") refers to the whole triggering batch, so an aggregate reduced over
+/// that batch must see every member. `AttackersDeclared` is the only event that
+/// carries a multi-object batch *within a single event* (CR 508.1: attackers are
+/// declared together as one turn-based action), and the singleton extractor
+/// deliberately collapses a >1 attacker batch to `None` — there is no single
+/// "the" attacker to name. Reducing an aggregate over that `None` yields an
+/// empty set, i.e. 0: a silent wrong answer on every multi-attacker board.
+///
+/// Every other event names exactly one subject, so this widening DELEGATES to
+/// the singleton and lifts its answer into a 1-vec. That keeps the two
+/// extractors from drifting apart and leaves every existing singleton caller
+/// untouched.
+///
+/// CR 603.10a: batched *dies* triggers are unaffected — they emit one
+/// `ZoneChanged` event PER creature, so their batch is reconstructed by
+/// collecting ACROSS events, never within one. This function preserves that
+/// (each `ZoneChanged` contributes its own 1-vec).
+pub(crate) fn extract_sources_from_event(event: &crate::types::events::GameEvent) -> Vec<ObjectId> {
+    use crate::types::events::GameEvent;
+    match event {
+        // CR 508.1: the full declared-attackers batch.
+        GameEvent::AttackersDeclared { attacker_ids, .. } => attacker_ids.clone(),
+        _ => extract_source_from_event(event).into_iter().collect(),
     }
 }
 
@@ -2139,6 +2233,23 @@ pub(crate) fn latest_tracked_set_id(state: &GameState) -> Option<TrackedSetId> {
         .map(|(&id, _)| id)
 }
 
+/// CR 608.2c: Single authority for resolving the parser's `TrackedSetId(0)`
+/// sentinel to a concrete set id: the active resolution-chain set first
+/// (`chain_tracked_set_id`), else the latest non-empty published set. `None`
+/// when no set is available — sentinel consumers stay fail-closed (match
+/// nothing).
+///
+/// [`resolve_tracked_set_sentinel`] inserts one extra rung BETWEEN these two —
+/// `current_combat_damage_source_filter`, for "those creatures" anaphors on a
+/// simultaneous combat-damage trigger (CR 510.2). That rung yields a
+/// `TargetFilter`, not a `TrackedSetId`, which is why it cannot fold into this
+/// id-level helper and why that function keeps its own ladder.
+pub(crate) fn resolve_tracked_set_id(state: &GameState) -> Option<TrackedSetId> {
+    state
+        .chain_tracked_set_id
+        .or_else(|| latest_tracked_set_id(state))
+}
+
 /// CR 510.2 + CR 608.2c: In a simultaneous combat-damage event, "those
 /// creatures" on the resolving trigger can refer to the filtered source set
 /// carried by `CombatDamageDealtToPlayer`.
@@ -2233,7 +2344,9 @@ mod tests {
     use crate::game::zones::create_object;
     use crate::types::ability::{Comparator, ContinuousModification, Duration, QuantityExpr};
     use crate::types::card_type::CoreType;
-    use crate::types::game_state::CastingVariant;
+    use crate::types::game_state::{
+        CastingVariant, DrainStatus, PostReplacementDrain, ResidentDrainPolicy,
+    };
     use crate::types::identifiers::CardId;
     use crate::types::keywords::{HexproofFilter, ProtectionTarget};
     use crate::types::mana::ManaColor;
@@ -2308,7 +2421,19 @@ mod tests {
         let (mut state, c0, _c1) = setup_with_creatures();
         // c0 is controlled by P0 — pretend it's the prevented damage source
         // and the prevention shield (e.g. Swans) is controlled by P1.
-        state.post_replacement_event_source = Some(c0);
+        // `Dispatching`, not `Ready`: production reads this filter from inside a
+        // running continuation, whose own work has already been taken out of the
+        // drain but whose prevented-event context is still readable (CR 615.5).
+        state.post_replacement_drains.install(
+            PostReplacementDrain {
+                status: DrainStatus::Dispatching,
+                source: None,
+                applied: HashSet::new(),
+                event_source: Some(c0),
+                event_target: None,
+            },
+            ResidentDrainPolicy::Replace,
+        );
         let result = resolve_event_context_target(
             &state,
             &TargetFilter::PostReplacementSourceController,
@@ -2323,7 +2448,7 @@ mod tests {
         // Outside that window the slot is `None` and the filter should return
         // `None`, letting callers fall back to controller / target_player.
         let (state, _c0, _c1) = setup_with_creatures();
-        assert!(state.post_replacement_event_source.is_none());
+        assert!(state.post_replacement_event_source().is_none());
         let result = resolve_event_context_target(
             &state,
             &TargetFilter::PostReplacementSourceController,
@@ -2344,7 +2469,17 @@ mod tests {
         // would return P0 and fail this assertion.
         let (mut state, _c0, c1) = setup_with_creatures();
         state.objects.get_mut(&c1).unwrap().controller = PlayerId(0);
-        state.post_replacement_event_target = Some(TargetRef::Object(c1));
+        // `Dispatching` for the same reason as the sibling test above.
+        state.post_replacement_drains.install(
+            PostReplacementDrain {
+                status: DrainStatus::Dispatching,
+                source: None,
+                applied: HashSet::new(),
+                event_target: Some(TargetRef::Object(c1)),
+                event_source: None,
+            },
+            ResidentDrainPolicy::Replace,
+        );
         let result = resolve_event_context_target(
             &state,
             &TargetFilter::PostReplacementDamageTargetOwner,
@@ -2357,7 +2492,7 @@ mod tests {
     fn post_replacement_damage_target_owner_returns_none_when_slot_empty() {
         // Defensive: only resolves inside the post-replacement window.
         let (state, _c0, _c1) = setup_with_creatures();
-        assert!(state.post_replacement_event_target.is_none());
+        assert!(state.post_replacement_event_target().is_none());
         let result = resolve_event_context_target(
             &state,
             &TargetFilter::PostReplacementDamageTargetOwner,
@@ -4788,6 +4923,56 @@ mod tests {
         );
         // Suppress unused-variable warning when setup_with_creatures changes.
         let _ = &mut state;
+    }
+
+    /// CR 508.1 + CR 603.2c: the SET-valued extractor is a pure widening of the
+    /// singleton.
+    ///
+    /// The singleton deliberately collapses a MULTI-attacker `AttackersDeclared`
+    /// to `None` — there is no single "the" attacker — and every one of its
+    /// callers depends on that. But an aggregate reduced over that `None` sees an
+    /// EMPTY set, i.e. 0, on every multi-attacker board. `extract_sources_from_event`
+    /// returns the whole batch instead, and delegates every other event arm back
+    /// to the singleton so the two cannot drift.
+    #[test]
+    fn set_extractor_widens_the_multi_attacker_batch_that_the_singleton_drops() {
+        use crate::types::events::GameEvent;
+
+        let a = ObjectId(11);
+        let b = ObjectId(12);
+        let batch = GameEvent::AttackersDeclared {
+            attacker_ids: vec![a, b],
+            defending_player: PlayerId(1),
+            attacks: vec![],
+        };
+
+        assert_eq!(
+            extract_source_from_event(&batch),
+            None,
+            "the singleton must STILL collapse a 2-attacker batch to None — this \
+             is the behavior its existing callers rely on, and it is untouched"
+        );
+        assert_eq!(
+            extract_sources_from_event(&batch),
+            vec![a, b],
+            "the set extractor must return EVERY attacker"
+        );
+
+        // Pure widening: a 1-attacker batch agrees with the singleton, and a
+        // non-batch event is lifted to a 1-vec rather than losing its subject.
+        let solo = GameEvent::AttackersDeclared {
+            attacker_ids: vec![a],
+            defending_player: PlayerId(1),
+            attacks: vec![],
+        };
+        assert_eq!(extract_source_from_event(&solo), Some(a));
+        assert_eq!(extract_sources_from_event(&solo), vec![a]);
+
+        assert_eq!(
+            extract_sources_from_event(&GameEvent::PermanentUntapped { object_id: b }),
+            vec![b],
+            "a singleton-subject event must be lifted, not dropped"
+        );
     }
 
     /// CR 509.1g + CR 608.2c: for "When this creature blocks a creature,

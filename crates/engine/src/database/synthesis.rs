@@ -2959,7 +2959,10 @@ pub fn synthesize_dredge(face: &mut CardFace) {
     );
     mill.sub_ability = Some(Box::new(return_to_hand));
 
-    let mut replacement = ReplacementDefinition::new(ReplacementEvent::Draw);
+    // CR 702.52a + CR 121.6b: Dredge replaces a single individual card draw
+    // ("if you would draw a card, you may instead mill N"), not the instruction count.
+    let mut replacement = ReplacementDefinition::new(ReplacementEvent::Draw)
+        .draw_scope(crate::types::ability::DrawReplacementScope::IndividualDraw);
     replacement.mode = crate::types::ability::ReplacementMode::Optional { decline: None };
     replacement.description = Some(
         "CR 702.52a: Dredge — instead of drawing, you may mill N cards and return this \
@@ -5868,7 +5871,7 @@ fn is_extort_trigger(t: &TriggerDefinition) -> bool {
                                 &*gain.effect,
                                 Effect::GainLife {
                                     amount: QuantityExpr::Ref {
-                                        qty: QuantityRef::PreviousEffectAmount,
+                                        qty: QuantityRef::PreviousEffectAmount { .. },
                                     },
                                     player: TargetFilter::Controller,
                                 }
@@ -5973,7 +5976,9 @@ fn build_extort_trigger() -> TriggerDefinition {
         AbilityKind::Spell,
         Effect::GainLife {
             amount: QuantityExpr::Ref {
-                qty: QuantityRef::PreviousEffectAmount,
+                qty: QuantityRef::PreviousEffectAmount {
+                    channel: crate::types::ability::DamageChannel::Total,
+                },
             },
             player: TargetFilter::Controller,
         },
@@ -14589,7 +14594,7 @@ mod extort_synthesis_tests {
         assert!(matches!(
             amount,
             QuantityExpr::Ref {
-                qty: QuantityRef::PreviousEffectAmount
+                qty: QuantityRef::PreviousEffectAmount { .. }
             }
         ));
         assert!(matches!(player, TargetFilter::Controller));
@@ -14709,7 +14714,9 @@ mod extort_synthesis_tests {
         drain.sub_ability = Some(Box::new(ResolvedAbility::new(
             Effect::GainLife {
                 amount: QuantityExpr::Ref {
-                    qty: QuantityRef::PreviousEffectAmount,
+                    qty: QuantityRef::PreviousEffectAmount {
+                        channel: DamageChannel::Total,
+                    },
                 },
                 player: TargetFilter::Controller,
             },
@@ -15874,6 +15881,7 @@ mod myriad_runtime_tests {
         // Make Muddle become a copy of the target "except it has myriad".
         let copy_ability = ResolvedAbility::new(
             Effect::BecomeCopy {
+                recipient: TargetFilter::SelfRef,
                 target: TargetFilter::Any,
                 duration: Some(Duration::UntilEndOfTurn),
                 mana_value_limit: None,

@@ -97,10 +97,17 @@ pub(crate) fn is_defiler_cost_pattern(lower: &str) -> bool {
 /// structural pre-filter; the lowering (`parse_spells_alternative_cost`)
 /// re-parses with combinators and strict-fails on non-mana / unparsed filters.
 pub(crate) fn is_spells_alternative_cost_pattern(lower: &str) -> bool {
-    lower_starts_with(lower, "you may pay ")
+    // CR 118.9 + CR 601.2b: an optional once-per-turn frequency prefix (As
+    // Foretold: "Once each turn, ...") precedes the "you may pay ..." grant.
+    // Strip it via the shared lowering combinator before the structural gate.
+    let after_frequency = opt(crate::parser::oracle_static::parse_alt_cost_frequency_prefix)
+        .parse(lower)
+        .map_or(lower, |(rest, _)| rest);
+    lower_starts_with(after_frequency, "you may pay ")
         && scan_contains(lower, "rather than pay")
         && scan_contains(lower, "mana cost for")
-        && scan_contains(lower, "spells you cast")
+        // Accept singular ("a spell you cast") and plural ("spells you cast").
+        && (scan_contains(lower, "spell you cast") || scan_contains(lower, "spells you cast"))
 }
 
 /// CR 118.9 + CR 701.59a: Collect-evidence alternative-cost grant static —
@@ -364,12 +371,15 @@ const STATIC_CONTAINS_PATTERNS: &[&str] = &[
     // The "of ..." infix between "abilities" and "can't be activated" blocks the contiguous
     // scan above; recognize the dispatched prefix separately so parse_static_line is reached.
     "activated abilities of ",
-    // CR 701.23 + CR 609.3: Ashiok-class search prohibition.
+    // CR 701.23 + CR 101.2: Ashiok-class search prohibition — a "can't search"
+    // effect takes precedence over any effect directing a search.
     "can't cause their controller to search their library",
-    // CR 603.2 + CR 609.3: The Master, Multiplied-class sacrifice/exile prohibition.
+    // CR 603.2 + CR 101.2: The Master, Multiplied-class sacrifice/exile prohibition —
+    // the "can't" effect takes precedence over the triggered ability directing it.
     "triggered abilities ",
     "can't cause you to sacrifice or exile",
-    // CR 701.23 + CR 609.3: Mindlock Orb-class search prohibition.
+    // CR 701.23 + CR 101.2: Mindlock Orb-class search prohibition — the "can't"
+    // effect takes precedence over any effect directing a search.
     "can't search libraries",
     "cannot search libraries",
     "may not search libraries",
@@ -545,6 +555,14 @@ fn is_static_compound_pattern(lower: &str) -> bool {
         opt(alt((
             tag::<_, _, OracleError<'_>>("once during each of your turns, "),
             tag("once each turn, "),
+            // CR 117.1c: "During your turn, you may [cast|play] … from <zone>"
+            // — the timing qualifier gates a standing cast-from-zone permission
+            // (Leonardo, Sewer Samurai; Festival of Embers). Route to the static
+            // parser ahead of the Priority-8 "enters … counter" replacement gate;
+            // the graveyard/exile builder honors the qualifier via a
+            // `DuringYourTurn` condition. Narrowly widens only the leading
+            // frequency/timing qualifier, not the zone anchors below.
+            tag("during your turn, "),
         ))),
         alt((tag("you may play"), tag("you may cast"))),
     )
@@ -564,7 +582,14 @@ fn is_static_compound_pattern(lower: &str) -> bool {
             // permission (The Matrix of Time). Routes to `parse_static_line` so
             // it lowers to `StaticMode::ExileCastPermission { pool: Persistent }`
             // instead of falling through to the imperative impulse-draw flow.
-            || scan_contains(lower, "from among cards exiled with"))
+            || scan_contains(lower, "from among cards exiled with")
+            // CR 108.3 + CR 113.6b: The "cards you own exiled with ~" variant
+            // (Intrepid Paleontologist; Dawnhand Dissident) carries a "you own"
+            // ownership infix between "cards" and "exiled with". Tolerate it so
+            // the ExileCastPermission line routes to the static parser instead
+            // of the Priority-8 replacement gate. Narrowly widens the exile
+            // anchor to accept the ownership infix.
+            || scan_contains(lower, "from among cards you own exiled with"))
     {
         return true;
     }
