@@ -156,3 +156,85 @@ fn monstrosity_count() -> QuantityExpr {
         ),
     }
 }
+
+// ---------------------------------------------------------------------------
+// THE COST-X SIBLING (#96) — the X/X token minted by an X-cost spell's own ETB.
+//
+// This is NOT the where-X walk. These cards carry no "where X is …" tail at all; their X
+// is the X PAID TO CAST THE SPELL, and the rewrite that owns it is
+// `rewrite_cost_x_in_effect` (`Variable("X")` -> `CostXPaid`).
+//
+// That walk rewrote `Effect::Token`'s `count` but never its `power`/`toughness`, so an X/X
+// token kept a bare `Variable("X")` in its P/T — which resolves to 0. Arboreal Alliance's
+// Treefolk entered as an **0/0** and died instantly to state-based actions (CR 704.5f)
+// while the card rendered as fully supported.
+//
+// SCOPE, stated so this is not over-read: this closes the Token P/T slot, NOT #96's class.
+// `rewrite_cost_x_in_effect` still has a `_ => {}` wildcard, and its CALLER is gated by
+// `trigger_should_rewrite_cost_x` to ChangesZone->Battlefield self-ETB triggers only — so a
+// cost-X trigger that is not a self-ETB (Shark Typhoon's CYCLING trigger) never reaches
+// this walk at all and is still an 0/0 today. #96 stays open. See the report for why that
+// one is a two-part engine change rather than a parser arm.
+// ---------------------------------------------------------------------------
+
+/// CR 107.3m + CR 704.5f — Arboreal Alliance. "When this enchantment enters, create an X/X
+/// green Treefolk creature token."
+///
+/// The witness casts for X=4 and asserts the token's power resolves to 4. `CostXPaid` reads
+/// `cost_x_paid` off the source object (stamped by `finalize_cast`, CR 107.3m); an
+/// unrewritten `Variable("X")` reads nothing and falls through to **0**. So 0 is precisely
+/// the pre-fix bug, and the assertion cannot pass while the slot is a bare placeholder.
+#[test]
+fn cost_x_token_pt_is_x_by_x_not_zero_by_zero() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let source = scenario.add_creature(P0, "Arboreal Alliance", 1, 1).id();
+    let mut runner = scenario.build();
+
+    // CR 107.3m: the {X} paid to cast the spell, stashed on the permanent.
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&source)
+        .expect("source object")
+        .cost_x_paid = Some(4);
+
+    let power = cost_x_token_power();
+    let resolved = resolve_quantity(runner.state(), &power, P0, source);
+
+    assert_eq!(
+        resolved, 4,
+        "CR 107.3m: the Treefolk must be a 4/4 — X is the X paid to cast the spell. 0 means the \
+         token's P/T is still a bare Variable(\"X\") that rewrite_cost_x_in_effect never rewrote \
+         (it rewrote only the token's `count`), so the Treefolk enters 0/0 and dies instantly to \
+         SBAs (CR 704.5f) while the card reads as fully supported. Got {resolved} from {power:?}"
+    );
+}
+
+/// Pull the ETB token's power out of Arboreal Alliance's real Oracle text.
+fn cost_x_token_power() -> QuantityExpr {
+    let parsed = parse_oracle_text(
+        "When this enchantment enters, create an X/X green Treefolk creature token.\nWhenever you \
+         attack with one or more Elves, populate.",
+        "Arboreal Alliance",
+        &[],
+        &["Enchantment".to_string()],
+        &[],
+    );
+    let power = parsed
+        .triggers
+        .iter()
+        .find_map(|trigger| match &*trigger.execute.as_ref()?.effect {
+            Effect::Token { power, .. } => Some(power.clone()),
+            _ => None,
+        })
+        .expect("Arboreal Alliance must lower a token-creating ETB trigger");
+
+    match power {
+        PtValue::Quantity(quantity) => quantity,
+        other => panic!(
+            "the Treefolk's power must lower to a dynamic quantity, not {other:?} — a bare \
+             PtValue::Variable(\"X\") here means the cost-X P/T rewrite never ran"
+        ),
+    }
+}
