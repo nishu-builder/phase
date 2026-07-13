@@ -696,7 +696,7 @@ fn drive_full_route(
             } if *player == offer.caster
                 && *copy_id == expected_chain_source
                 && *effect_kind == crate::types::ability::EffectKind::CopySpell
-                && *effect_source_id == *copy_id
+                && *effect_source_id == Some(*copy_id)
                 && target_slots.len() == 1
                 && target_slots[0].current
                     == Some(crate::types::ability::TargetRef::Player(offer.caster)) =>
