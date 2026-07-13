@@ -4490,10 +4490,21 @@ fn filter_refs_parent_target(filter: &TargetFilter) -> bool {
         | TargetFilter::ParentTargetOwner
         | TargetFilter::ParentTarget
         | TargetFilter::ParentTargetSlot { .. } => true,
-        TargetFilter::Typed(typed) => matches!(
-            typed.controller,
-            Some(ControllerRef::ParentTargetController)
-        ),
+        TargetFilter::Typed(typed) => {
+            matches!(typed.controller, Some(ControllerRef::ParentTargetController))
+                // CR 608.2c + CR 109.1: a `DistinctFrom { reference: ParentTarget }`
+                // property (Jodah's "put the rest ..." exclusion of the declined
+                // hit, Radiance's "each OTHER creature that shares a color with it")
+                // reads the parent's chosen target, so the enclosing effect must
+                // inherit `ability.targets` on a decline for the exclusion to fire.
+                || typed.properties.iter().any(|prop| {
+                    matches!(
+                        prop,
+                        FilterProp::DistinctFrom { reference }
+                            if filter_refs_parent_target(reference)
+                    )
+                })
+        }
         TargetFilter::Or { filters } | TargetFilter::And { filters } => {
             filters.iter().any(filter_refs_parent_target)
         }

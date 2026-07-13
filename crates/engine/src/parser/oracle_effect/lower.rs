@@ -867,6 +867,89 @@ pub(super) fn normalize_linked_exile_cast_bottom_cleanup(effect: &mut Effect) {
     }
 }
 
+/// CR 608.2c + CR 701.13a: Head-aware companion to
+/// [`is_linked_exile_cast_bottom_cleanup`] for the Jodah, the Unifier class —
+/// `ExileFromTopUntil { NextMatches }` → optional `CastFromZone { ParentTarget }`
+/// → `PutAtLibraryPosition { Bottom, TrackedSet }`.
+///
+/// The plain linked-exile gate cannot fire here: neither the `ParentTarget`
+/// cast nor the parser-default `TrackedSet` cleanup references
+/// `ExiledBySource`, so `is_linked_exile_cast_bottom_cleanup` returns false and
+/// the "put the rest on the bottom" step is left addressing the wrong pool (a
+/// tracked set nothing publishes) — the whole exiled pile is then stranded.
+///
+/// The distinguishing feature is the chain HEAD being
+/// `ExileFromTopUntil { until: NextMatches }`: those cards are physically in the
+/// exile zone, so the cleanup must scan exile, NOT the library. The Dig/look
+/// class ("look at the top N, put the rest on the bottom") legitimately keeps
+/// the parser-default library-only `TrackedSet` — its rest-cards never left the
+/// library — and is excluded because its head is not `ExileFromTopUntil`.
+pub(super) fn is_exile_until_cast_bottom_cleanup(
+    head_effect: &Effect,
+    cast_effect: &Effect,
+    cleanup_effect: &Effect,
+) -> bool {
+    if !matches!(
+        head_effect,
+        Effect::ExileFromTopUntil {
+            until: crate::types::ability::UntilCondition::NextMatches { .. },
+            ..
+        }
+    ) {
+        return false;
+    }
+    let Effect::CastFromZone { target, .. } = cast_effect else {
+        return false;
+    };
+    // The cast anaphors the hit via `ParentTarget`; a cast that already reads
+    // `ExiledBySource` is the plain Chaos Wand / Etali shape handled elsewhere.
+    if !matches!(target, TargetFilter::ParentTarget) {
+        return false;
+    }
+    matches!(
+        cleanup_effect,
+        Effect::PutAtLibraryPosition {
+            position: LibraryPosition::Bottom,
+            target: TargetFilter::TrackedSet { .. } | TargetFilter::TrackedSetFiltered { .. },
+            ..
+        }
+    )
+}
+
+/// CR 608.2c + CR 701.13a: Rewrite the Jodah bottom-cleanup to "the rest"
+/// semantics — every card this ExileFromTopUntil exiled EXCEPT the hit the
+/// player may have cast. `And { ExiledBySource, DistinctFrom { ParentTarget } }`
+/// scans the exile zone (via `ExiledBySource`) and, per the Scryfall ruling,
+/// excludes the ParentTarget: a DECLINED hit REMAINS IN EXILE, so it must not be
+/// swept to the bottom. `DistinctFrom { ParentTarget }` fails open when the
+/// cleanup carries no object targets (the no-hit / library-exhausted case),
+/// which is exactly right — with no hit, all exiled cards go to the bottom.
+pub(super) fn normalize_exile_until_cast_bottom_cleanup(effect: &mut Effect) {
+    if let Effect::PutAtLibraryPosition {
+        ref mut target,
+        ref mut count,
+        position,
+    } = effect
+    {
+        if matches!(position, LibraryPosition::Bottom) {
+            *target = TargetFilter::And {
+                filters: vec![
+                    TargetFilter::ExiledBySource,
+                    TargetFilter::Typed(TypedFilter::default().properties(vec![
+                        FilterProp::DistinctFrom {
+                            reference: Box::new(TargetFilter::ParentTarget),
+                        },
+                    ])),
+                ],
+            };
+            // "All of them" placeholder — mirrors the existing linked-exile
+            // normalize; the resolver treats `count: 0` on a Bottom cleanup as
+            // "every matching card".
+            *count = QuantityExpr::Fixed { value: 0 };
+        }
+    }
+}
+
 pub(super) fn is_spend_mana_as_any_color_rider(clause: &ClauseIr) -> bool {
     let Effect::GenericEffect {
         static_abilities, ..

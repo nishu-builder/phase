@@ -35,10 +35,11 @@ use super::lower::{
     extract_verb_up_to_multi_target, fold_copy_spell_gains_haste_and_quoted_grant,
     fold_enters_this_way_counter_rider, fold_search_choose_type_conditional_destination,
     fold_token_it_has_grants_into_token_statics, gate_other_revealed_card_on_multiplayer_reveal,
-    gate_reflexive_rider_on_declined_optional_target, is_land_enters_tapped_rider,
-    is_linked_exile_cast_bottom_cleanup, is_spend_mana_as_any_color_rider, is_stable_branch_amount,
+    gate_reflexive_rider_on_declined_optional_target, is_exile_until_cast_bottom_cleanup,
+    is_land_enters_tapped_rider, is_linked_exile_cast_bottom_cleanup,
+    is_spend_mana_as_any_color_rider, is_stable_branch_amount,
     nest_whenever_this_turn_token_cleanup_delayed_trigger,
-    normalize_linked_exile_cast_bottom_cleanup,
+    normalize_exile_until_cast_bottom_cleanup, normalize_linked_exile_cast_bottom_cleanup,
     parse_controlled_by_different_players_target_constraint,
     parse_same_zone_owner_target_constraint, parse_total_mana_value_target_constraint,
     patch_choose_from_zone_counter_continuation_target, patch_population_head_tap_anaphor,
@@ -2317,6 +2318,23 @@ fn normalize_linked_exile_cast_pair(
         normalize_linked_exile_cast_bottom_cleanup(&mut chain.effect);
         prev.else_ability = Some(Box::new(chain.clone()));
         return true;
+    }
+    // CR 608.2c + CR 701.13a: Jodah, the Unifier — the head-aware companion
+    // gate. `prev` is `ExileFromTopUntil { NextMatches }`; `chain` is its
+    // optional `CastFromZone { ParentTarget }` with the bottom cleanup already
+    // nested beneath it. Rewrite that cleanup to the linked exile set and make
+    // it the decline branch, preserving the hit in exile when the cast is
+    // declined.
+    if chain.optional {
+        if let Some(cleanup) = chain.sub_ability.as_deref().cloned() {
+            if is_exile_until_cast_bottom_cleanup(&prev.effect, &chain.effect, &cleanup.effect) {
+                if let Some(cleanup_mut) = chain.sub_ability.as_deref_mut() {
+                    normalize_exile_until_cast_bottom_cleanup(&mut cleanup_mut.effect);
+                    chain.else_ability = Some(Box::new(cleanup_mut.clone()));
+                    return true;
+                }
+            }
+        }
     }
     false
 }
