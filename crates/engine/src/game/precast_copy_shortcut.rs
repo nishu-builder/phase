@@ -22,6 +22,8 @@ use crate::types::triggers::TriggerMode;
 
 use super::{engine::EngineError, turn_control};
 
+/// Bounded proof length for the finite clone route, keeping shortcut replay
+/// nonlethal and below the engine's per-action work limit.
 const COPY_COUNT: usize = 3;
 const REPLAY_STEP_CAP: usize = 256;
 
