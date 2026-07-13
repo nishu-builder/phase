@@ -635,7 +635,7 @@ mod tests {
         use engine::database::card_db::CardDatabase;
         use engine::game::scenario::{GameScenario, P0};
         use engine::game::scenario_db::GameScenarioDbExt;
-        use engine::types::actions::CastPaymentMode;
+        use engine::types::game_state::CastPaymentMode;
         use engine::types::zones::Zone;
 
         const CHAIN_OF_SMOG: &str =
