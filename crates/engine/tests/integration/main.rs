@@ -719,6 +719,7 @@ mod vigor_regression;
 mod vincents_limit_break_tiered;
 mod virulent_emissary_trigger;
 mod vivien_invocation_reflexive_power;
+mod vizier_of_many_faces_embalm_copy_panic_5278;
 mod volatile_fault_that_player_search;
 mod vraska_betrayals_sting;
 mod wedding_ring_etb_token_copy;
