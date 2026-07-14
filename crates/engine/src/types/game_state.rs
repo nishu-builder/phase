@@ -87,6 +87,35 @@ mod object_id_set_serde {
     }
 }
 
+/// Deterministic serde for the batched zone-change trigger replay guard.
+mod batched_zone_change_trigger_fired_serde {
+    use super::*;
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S>(
+        set: &HashSet<(ObjectId, usize, usize)>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut entries = set.iter().copied().collect::<Vec<_>>();
+        entries.sort_unstable_by_key(|(object_id, trigger_index, zone_change_index)| {
+            (object_id.0, *trigger_index, *zone_change_index)
+        });
+        entries.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<HashSet<(ObjectId, usize, usize)>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        HashSet::deserialize(deserializer)
+    }
+}
+
 /// Deterministic serde for persistent `(player, creature type)` checkpoint sets.
 mod player_creature_type_set_serde {
     use super::*;
@@ -7785,7 +7814,11 @@ pub struct GameState {
     /// `process_triggers` pass over the same `ZoneChanged` events from
     /// stacking duplicate batched triggers (issue #3866) without suppressing a
     /// later distinct leave by the same object in the same turn.
-    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "HashSet::is_empty",
+        with = "batched_zone_change_trigger_fired_serde"
+    )]
     pub batched_zone_change_trigger_fired: HashSet<(ObjectId, usize, usize)>,
     /// CR 403.3: Battlefield entry snapshots this turn, enabling data-driven ETB queries.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
