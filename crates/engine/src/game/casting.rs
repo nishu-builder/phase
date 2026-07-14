@@ -11886,6 +11886,276 @@ fn can_cast_prepared_now(
     can_cast_prepared_now_with_probe(state, player, prepared, None)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MandatoryAdditionalCostPreview {
+    ApplicablePayable,
+    ApplicableUnpayable,
+    NotApplicable,
+}
+
+fn static_condition_depends_on_additional_cost_paid(condition: &StaticCondition) -> bool {
+    match condition {
+        StaticCondition::AdditionalCostPaid => true,
+        StaticCondition::And { conditions } | StaticCondition::Or { conditions } => conditions
+            .iter()
+            .any(static_condition_depends_on_additional_cost_paid),
+        StaticCondition::Not { condition } => {
+            static_condition_depends_on_additional_cost_paid(condition)
+        }
+        _ => false,
+    }
+}
+
+fn has_additional_cost_dependent_reduction(
+    state: &GameState,
+    player: PlayerId,
+    obj: &crate::game::game_object::GameObject,
+) -> bool {
+    let has_self_reduction = obj.static_definitions.iter_all().any(|def| {
+        !def.active_zones.is_empty()
+            && def.active_zones.contains(&obj.zone)
+            && matches!(def.affected, Some(TargetFilter::SelfRef))
+            && matches!(
+                &def.mode,
+                StaticMode::ModifyCost {
+                    mode: CostModifyMode::Reduce,
+                    ..
+                }
+            )
+            && match &def.mode {
+                StaticMode::ModifyCost { spell_filter, .. } => {
+                    spell_filter.as_ref().is_none_or(|filter| {
+                        !cost_filter_has_target_ref(filter)
+                            && spell_matches_cost_filter_for(
+                                state, player, obj.id, filter, obj.id, false,
+                            )
+                    })
+                }
+                _ => false,
+            }
+            && def
+                .condition
+                .as_ref()
+                .is_some_and(static_condition_depends_on_additional_cost_paid)
+    });
+    if has_self_reduction {
+        return true;
+    }
+
+    // CR 601.2f: A battlefield cost reduction can become applicable only after
+    // the spell's additional cost is announced. The preview does not mutate the
+    // authoritative pending-cast context, so preserve the legacy candidate when
+    // any otherwise-applicable external reduction depends on that announcement.
+    super::functioning_abilities::game_functioning_statics(state).any(|(source, def)| {
+        if matches!(def.affected, Some(TargetFilter::SelfRef))
+            || !matches!(
+                &def.mode,
+                StaticMode::ModifyCost {
+                    mode: CostModifyMode::Reduce,
+                    ..
+                }
+            )
+            || !def
+                .condition
+                .as_ref()
+                .is_some_and(static_condition_depends_on_additional_cost_paid)
+        {
+            return false;
+        }
+
+        if let Some(TargetFilter::Typed(filter)) = &def.affected {
+            match filter.controller {
+                Some(crate::types::ability::ControllerRef::You) if player != source.controller => {
+                    return false;
+                }
+                Some(crate::types::ability::ControllerRef::Opponent)
+                    if player == source.controller =>
+                {
+                    return false;
+                }
+                _ => {}
+            }
+        }
+
+        let StaticMode::ModifyCost { spell_filter, .. } = &def.mode else {
+            unreachable!("ModifyCost was matched above")
+        };
+        spell_filter.as_ref().is_none_or(|filter| {
+            cost_filter_has_target_ref(filter)
+                || spell_matches_cost_filter_for(state, player, obj.id, filter, source.id, false)
+        })
+    })
+}
+
+fn preview_pending_cast_for_mandatory_additional_cost(
+    state: &GameState,
+    player: PlayerId,
+    prepared: &PreparedSpellCast,
+) -> Option<PendingCast> {
+    let obj = state.objects.get(&prepared.object_id)?;
+    if prepared.casting_variant != CastingVariant::Normal
+        || prepared.modal.is_some()
+        || casting_costs::cost_has_x(&prepared.mana_cost)
+        || casting_costs::cost_has_x(&prepared.base_mana_cost)
+        || alternative_spell_layout(obj).is_some()
+        || cast_spell_face_choice_available(obj)
+        || obj.mutate_form.is_some()
+        || obj
+            .card_types
+            .subtypes
+            .iter()
+            .any(|subtype| subtype == "Aura")
+        || has_additional_cost_dependent_reduction(state, player, obj)
+        || prepared.ability_def.as_ref().is_some_and(|ability| {
+            ability.distribute.is_some() || !ability.target_constraints.is_empty()
+        })
+    {
+        return None;
+    }
+
+    let ability = prepared.ability_def.as_ref().map_or_else(
+        || {
+            ResolvedAbility::new(
+                Effect::Unimplemented {
+                    name: String::new(),
+                    description: None,
+                },
+                Vec::new(),
+                prepared.object_id,
+                player,
+            )
+        },
+        |ability_def| build_resolved_from_def(ability_def, prepared.object_id, player),
+    );
+    if !build_target_slots(state, &ability).ok()?.is_empty() {
+        return None;
+    }
+
+    let mut pending = PendingCast::new(
+        prepared.object_id,
+        prepared.card_id,
+        ability,
+        prepared.mana_cost.clone(),
+    );
+    pending.base_cost = Some(prepared.base_mana_cost.clone());
+    pending.casting_variant = prepared.casting_variant;
+    pending.cast_timing_permission = prepared.cast_timing_permission;
+    pending.distribute = prepared
+        .ability_def
+        .as_ref()
+        .and_then(|ability| ability.distribute.clone());
+    pending.target_constraints = prepared
+        .ability_def
+        .as_ref()
+        .map(|ability| ability.target_constraints.clone())
+        .unwrap_or_default();
+    pending.origin_zone = prepared.origin_zone;
+    pending.payment_mode = prepared.payment_mode;
+    Some(pending)
+}
+
+fn mandatory_additional_cost_preview_shape_is_supported(cost: &AbilityCost) -> bool {
+    match cost {
+        AbilityCost::Mana {
+            cost: ManaCost::Cost { shards, .. },
+        } => !shards.iter().any(|shard| matches!(shard, ManaCostShard::X)),
+        AbilityCost::Exile {
+            zone: Some(Zone::Graveyard),
+            filter: None,
+            ..
+        } => true,
+        AbilityCost::Mana { .. }
+        | AbilityCost::ManaDynamic { .. }
+        | AbilityCost::Tap
+        | AbilityCost::Untap
+        | AbilityCost::Loyalty { .. }
+        | AbilityCost::Sacrifice(_)
+        | AbilityCost::PayLife { .. }
+        | AbilityCost::Discard { .. }
+        | AbilityCost::Exile { .. }
+        | AbilityCost::ExileMaterials { .. }
+        | AbilityCost::CollectEvidence { .. }
+        | AbilityCost::ExileWithAggregate { .. }
+        | AbilityCost::TapCreatures { .. }
+        | AbilityCost::RemoveCounter { .. }
+        | AbilityCost::PayEnergy { .. }
+        | AbilityCost::PaySpeed { .. }
+        | AbilityCost::ReturnToHand { .. }
+        | AbilityCost::Unattach
+        | AbilityCost::UnattachFrom { .. }
+        | AbilityCost::Mill { .. }
+        | AbilityCost::Exert
+        | AbilityCost::Blight { .. }
+        | AbilityCost::Reveal { .. }
+        | AbilityCost::Behold { .. }
+        | AbilityCost::Composite { .. }
+        | AbilityCost::OneOf { .. }
+        | AbilityCost::Waterbend { .. }
+        | AbilityCost::NinjutsuFamily { .. }
+        | AbilityCost::EffectCost { .. }
+        | AbilityCost::PerCounter { .. }
+        | AbilityCost::KeywordCostOfCastSpell { .. }
+        | AbilityCost::Unimplemented { .. } => false,
+    }
+}
+
+fn preview_mandatory_additional_cost_branch(
+    state: &GameState,
+    player: PlayerId,
+    pending: &PendingCast,
+    cost: &AbilityCost,
+) -> MandatoryAdditionalCostPreview {
+    if !mandatory_additional_cost_preview_shape_is_supported(cost) {
+        return MandatoryAdditionalCostPreview::NotApplicable;
+    }
+    match casting_costs::additional_cost_declaration_is_offerable(
+        state,
+        player,
+        pending,
+        cost.clone(),
+    ) {
+        Ok(true) => MandatoryAdditionalCostPreview::ApplicablePayable,
+        Ok(false) => MandatoryAdditionalCostPreview::ApplicableUnpayable,
+        Err(_) => MandatoryAdditionalCostPreview::NotApplicable,
+    }
+}
+
+fn preview_mandatory_additional_cost(
+    state: &GameState,
+    player: PlayerId,
+    prepared: &PreparedSpellCast,
+    additional_cost: &AdditionalCost,
+) -> MandatoryAdditionalCostPreview {
+    let Some(pending) = preview_pending_cast_for_mandatory_additional_cost(state, player, prepared)
+    else {
+        return MandatoryAdditionalCostPreview::NotApplicable;
+    };
+
+    match additional_cost {
+        AdditionalCost::Choice(first, second) => {
+            let first = preview_mandatory_additional_cost_branch(state, player, &pending, first);
+            let second = preview_mandatory_additional_cost_branch(state, player, &pending, second);
+            if matches!(first, MandatoryAdditionalCostPreview::NotApplicable)
+                || matches!(second, MandatoryAdditionalCostPreview::NotApplicable)
+            {
+                MandatoryAdditionalCostPreview::NotApplicable
+            } else if matches!(first, MandatoryAdditionalCostPreview::ApplicablePayable)
+                || matches!(second, MandatoryAdditionalCostPreview::ApplicablePayable)
+            {
+                MandatoryAdditionalCostPreview::ApplicablePayable
+            } else {
+                MandatoryAdditionalCostPreview::ApplicableUnpayable
+            }
+        }
+        AdditionalCost::Required(cost) => {
+            preview_mandatory_additional_cost_branch(state, player, &pending, cost)
+        }
+        AdditionalCost::Optional { .. } | AdditionalCost::Kicker { .. } => {
+            MandatoryAdditionalCostPreview::NotApplicable
+        }
+    }
+}
+
 fn can_cast_prepared_now_with_probe(
     state: &GameState,
     player: PlayerId,
@@ -11985,6 +12255,21 @@ fn can_cast_prepared_now_with_probe(
         && !was_discarded_this_turn(state, prepared.object_id)
     {
         return false;
+    }
+
+    // CR 118.3 + CR 601.2f + CR 601.2h: A mandatory additional cost is part of the
+    // spell's total cost and must be payable in full. This deliberately narrow
+    // preview covers only fixed mana and unfiltered fixed-count graveyard-exile
+    // branches whose announcement can be evaluated without making choices or
+    // changing the total-cost calculation. Unsupported shapes preserve the
+    // existing candidate behavior; only a conclusive unpayable result suppresses
+    // the offered cast.
+    if let Some(additional_cost) = obj.additional_cost.as_ref() {
+        if preview_mandatory_additional_cost(state, player, prepared, additional_cost)
+            == MandatoryAdditionalCostPreview::ApplicableUnpayable
+        {
+            return false;
+        }
     }
 
     // CR 702.119a-c: Emerge affordability is the reduced emerge cost after

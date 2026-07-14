@@ -8539,6 +8539,504 @@ fn create_generic_creature_in_hand(
     obj_id
 }
 
+fn create_stoneglider_preview_fixture(state: &mut GameState, card_id: u64) -> ObjectId {
+    let spell =
+        create_generic_creature_in_hand(state, card_id, PlayerId(0), "Soaring Stoneglider", 2);
+    let obj = state.objects.get_mut(&spell).unwrap();
+    obj.mana_cost = ManaCost::Cost {
+        shards: vec![ManaCostShard::White],
+        generic: 2,
+    };
+    obj.additional_cost = Some(AdditionalCost::Choice(
+        AbilityCost::Exile {
+            count: 2,
+            zone: Some(Zone::Graveyard),
+            filter: None,
+        },
+        AbilityCost::Mana {
+            cost: ManaCost::Cost {
+                shards: vec![ManaCostShard::White],
+                generic: 1,
+            },
+        },
+    ));
+    spell
+}
+
+fn normal_cast_is_offered(state: &GameState, spell: ObjectId) -> bool {
+    crate::ai_support::legal_actions(state)
+        .iter()
+        .any(|action| {
+            matches!(
+                action,
+                GameAction::CastSpell { object_id, .. } if *object_id == spell
+            )
+        })
+}
+
+fn cast_spell_action(spell: ObjectId, card_id: u64) -> GameAction {
+    GameAction::CastSpell {
+        object_id: spell,
+        card_id: CardId(card_id),
+        targets: Vec::new(),
+        payment_mode: CastPaymentMode::Auto,
+    }
+}
+
+#[test]
+fn stoneglider_is_not_offered_when_neither_additional_cost_branch_is_payable() {
+    let mut state = setup_game_at_main_phase();
+    let spell = create_stoneglider_preview_fixture(&mut state, 40_100);
+    add_mana(&mut state, PlayerId(0), ManaType::White, 1);
+    add_mana(&mut state, PlayerId(0), ManaType::Colorless, 2);
+
+    assert!(
+        can_feasibly_pay_mana_cost(
+            &state,
+            PlayerId(0),
+            Some(spell),
+            &state.objects[&spell].mana_cost,
+        ),
+        "the printed {{2}}{{W}} cost must remain independently payable"
+    );
+    assert!(
+        !normal_cast_is_offered(&state, spell),
+        "the production legal-action path must suppress a cast when neither the two-card exile branch nor the combined {{3}}{{W}}{{W}} branch is payable"
+    );
+}
+
+#[test]
+fn stoneglider_combined_mana_branch_completes_the_production_cast_flow() {
+    let mut state = setup_game_at_main_phase();
+    let spell = create_stoneglider_preview_fixture(&mut state, 40_101);
+    add_mana(&mut state, PlayerId(0), ManaType::White, 2);
+    add_mana(&mut state, PlayerId(0), ManaType::Colorless, 3);
+    let graveyard_cards: Vec<_> = (0..2)
+        .map(|index| {
+            create_object(
+                &mut state,
+                CardId(40_103 + index),
+                PlayerId(0),
+                format!("Graveyard card {index}"),
+                Zone::Graveyard,
+            )
+        })
+        .collect();
+
+    assert!(
+        normal_cast_is_offered(&state, spell),
+        "the production legal-action path must keep the cast when the printed and additional mana total is payable"
+    );
+
+    apply_as_current(&mut state, cast_spell_action(spell, 40_101))
+        .expect("CastSpell must reach the additional-cost branch decision");
+    assert!(matches!(
+        state.waiting_for,
+        WaitingFor::OptionalCostChoice {
+            cost: AdditionalCost::Choice(_, _),
+            ..
+        }
+    ));
+
+    apply_as_current(&mut state, GameAction::DecideOptionalCost { pay: false })
+        .expect("choosing the additional-mana branch must finalize the cast");
+
+    assert_eq!(state.stack.len(), 1);
+    assert_eq!(state.objects[&spell].zone, Zone::Stack);
+    assert_eq!(state.players[0].mana_pool.total(), 0);
+    assert!(
+        graveyard_cards
+            .iter()
+            .all(|card| state.objects[card].zone == Zone::Graveyard),
+        "choosing the mana branch must not exile the alternative-cost cards"
+    );
+}
+
+#[test]
+fn stoneglider_graveyard_exile_branch_completes_the_production_cast_flow() {
+    let mut state = setup_game_at_main_phase();
+    let spell = create_stoneglider_preview_fixture(&mut state, 40_102);
+    add_mana(&mut state, PlayerId(0), ManaType::White, 1);
+    add_mana(&mut state, PlayerId(0), ManaType::Colorless, 2);
+    let graveyard_cards: Vec<_> = (0..2)
+        .map(|index| {
+            create_object(
+                &mut state,
+                CardId(40_110 + index),
+                PlayerId(0),
+                format!("Graveyard card {index}"),
+                Zone::Graveyard,
+            )
+        })
+        .collect();
+
+    assert!(
+        normal_cast_is_offered(&state, spell),
+        "the production legal-action path must keep the cast when the graveyard-exile branch is payable even though the combined mana branch is not"
+    );
+
+    apply_as_current(&mut state, cast_spell_action(spell, 40_102))
+        .expect("CastSpell must reach the additional-cost branch decision");
+    assert!(matches!(
+        state.waiting_for,
+        WaitingFor::OptionalCostChoice {
+            cost: AdditionalCost::Choice(_, _),
+            ..
+        }
+    ));
+
+    apply_as_current(&mut state, GameAction::DecideOptionalCost { pay: true })
+        .expect("choosing the graveyard-exile branch must reach object selection");
+    match &state.waiting_for {
+        WaitingFor::PayCost {
+            kind:
+                PayCostKind::ExileFromZone {
+                    zone: ExileCostSourceZone::Graveyard,
+                },
+            choices,
+            count,
+            ..
+        } => {
+            assert_eq!(*count, 2);
+            assert!(graveyard_cards.iter().all(|card| choices.contains(card)));
+        }
+        other => panic!("expected graveyard PayCost selection, got {other:?}"),
+    }
+
+    apply_as_current(
+        &mut state,
+        GameAction::SelectCards {
+            cards: graveyard_cards.clone(),
+        },
+    )
+    .expect("selected graveyard cards must be exiled and finalize the cast");
+
+    assert_eq!(state.stack.len(), 1);
+    assert_eq!(state.objects[&spell].zone, Zone::Stack);
+    assert_eq!(state.players[0].mana_pool.total(), 0);
+    assert!(
+        graveyard_cards
+            .iter()
+            .all(|card| state.objects[card].zone == Zone::Exile),
+        "the chosen cards must be exiled as the paid additional cost"
+    );
+}
+
+#[test]
+fn required_fixed_mana_additional_cost_uses_the_combined_total() {
+    let mut state = setup_game_at_main_phase();
+    let spell = create_generic_creature_in_hand(
+        &mut state,
+        40_120,
+        PlayerId(0),
+        "Required Mana Sibling",
+        2,
+    );
+    state.objects.get_mut(&spell).unwrap().additional_cost =
+        Some(AdditionalCost::Required(AbilityCost::Mana {
+            cost: ManaCost::generic(1),
+        }));
+    add_mana(&mut state, PlayerId(0), ManaType::Colorless, 2);
+
+    assert!(
+        can_feasibly_pay_mana_cost(
+            &state,
+            PlayerId(0),
+            Some(spell),
+            &state.objects[&spell].mana_cost,
+        ),
+        "the printed cost must be independently payable"
+    );
+    assert!(
+        !normal_cast_is_offered(&state, spell),
+        "the production legal-action path must include required fixed mana in the total"
+    );
+}
+
+#[test]
+fn payable_required_fixed_mana_completes_the_production_cast_flow() {
+    let mut state = setup_game_at_main_phase();
+    let spell = create_generic_creature_in_hand(
+        &mut state,
+        40_121,
+        PlayerId(0),
+        "Payable Required Mana Sibling",
+        2,
+    );
+    state.objects.get_mut(&spell).unwrap().additional_cost =
+        Some(AdditionalCost::Required(AbilityCost::Mana {
+            cost: ManaCost::generic(1),
+        }));
+    add_mana(&mut state, PlayerId(0), ManaType::Colorless, 3);
+
+    assert!(normal_cast_is_offered(&state, spell));
+    apply_as_current(&mut state, cast_spell_action(spell, 40_121))
+        .expect("the required mana cost must be declared, paid, and finalized");
+
+    assert_eq!(state.stack.len(), 1);
+    assert_eq!(state.objects[&spell].zone, Zone::Stack);
+    assert_eq!(state.players[0].mana_pool.total(), 0);
+}
+
+#[test]
+fn mandatory_additional_cost_preview_classifier_is_deliberately_narrow() {
+    let fixed_mana = AbilityCost::Mana {
+        cost: ManaCost::generic(1),
+    };
+    let graveyard_exile = AbilityCost::Exile {
+        count: 2,
+        zone: Some(Zone::Graveyard),
+        filter: None,
+    };
+    assert!(mandatory_additional_cost_preview_shape_is_supported(
+        &fixed_mana
+    ));
+    assert!(mandatory_additional_cost_preview_shape_is_supported(
+        &graveyard_exile
+    ));
+
+    let excluded = [
+        AbilityCost::Mana {
+            cost: ManaCost::Cost {
+                shards: vec![ManaCostShard::X],
+                generic: 0,
+            },
+        },
+        AbilityCost::Mana {
+            cost: ManaCost::SelfManaCost,
+        },
+        AbilityCost::ManaDynamic {
+            quantity: QuantityExpr::Fixed { value: 1 },
+        },
+        AbilityCost::Exile {
+            count: 1,
+            zone: None,
+            filter: None,
+        },
+        AbilityCost::Exile {
+            count: 1,
+            zone: Some(Zone::Hand),
+            filter: None,
+        },
+        AbilityCost::Exile {
+            count: 1,
+            zone: Some(Zone::Graveyard),
+            filter: Some(TargetFilter::Any),
+        },
+        AbilityCost::ExileMaterials {
+            materials: TargetFilter::Any,
+            count: crate::types::ability::CostObjectCount::at_least(2),
+        },
+        AbilityCost::Composite {
+            costs: vec![fixed_mana.clone()],
+        },
+        AbilityCost::OneOf {
+            costs: vec![fixed_mana],
+        },
+        AbilityCost::PayLife {
+            amount: QuantityExpr::Fixed { value: 2 },
+        },
+    ];
+    for cost in excluded {
+        assert!(
+            !mandatory_additional_cost_preview_shape_is_supported(&cost),
+            "unsupported preview shape must preserve legacy candidate behavior: {cost:?}"
+        );
+    }
+}
+
+#[test]
+fn choice_preview_is_not_applicable_when_either_branch_is_unsupported() {
+    let mut state = setup_game_at_main_phase();
+    let spell =
+        create_generic_creature_in_hand(&mut state, 40_130, PlayerId(0), "Mixed Preview Choice", 1);
+    state.objects.get_mut(&spell).unwrap().additional_cost = Some(AdditionalCost::Choice(
+        AbilityCost::Mana {
+            cost: ManaCost::generic(2),
+        },
+        AbilityCost::PayLife {
+            amount: QuantityExpr::Fixed { value: 50 },
+        },
+    ));
+    add_mana(&mut state, PlayerId(0), ManaType::Colorless, 1);
+
+    assert!(
+        normal_cast_is_offered(&state, spell),
+        "an unsupported choice branch must make the whole preview non-applicable, not suppress the legacy candidate"
+    );
+}
+
+fn create_unsupported_ability_metadata_preview_fixture(
+    state: &mut GameState,
+    card_id: u64,
+    configure: impl FnOnce(&mut AbilityDefinition),
+) -> ObjectId {
+    let spell = create_generic_creature_in_hand(
+        state,
+        card_id,
+        PlayerId(0),
+        "Unsupported Ability Metadata Sibling",
+        1,
+    );
+    let mut ability = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::Draw {
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::Controller,
+        },
+    );
+    configure(&mut ability);
+    let obj = state.objects.get_mut(&spell).unwrap();
+    Arc::make_mut(&mut obj.abilities).push(ability);
+    obj.additional_cost = Some(AdditionalCost::Required(AbilityCost::Mana {
+        cost: ManaCost::generic(2),
+    }));
+    spell
+}
+
+#[test]
+fn distribution_metadata_makes_the_preview_fail_closed_at_the_legal_action_boundary() {
+    let mut state = setup_game_at_main_phase();
+    let spell =
+        create_unsupported_ability_metadata_preview_fixture(&mut state, 40_133, |ability| {
+            ability.distribute = Some(crate::types::game_state::DistributionUnit::Damage);
+        });
+    add_mana(&mut state, PlayerId(0), ManaType::Colorless, 1);
+
+    assert!(
+        normal_cast_is_offered(&state, spell),
+        "distribution metadata must preserve the legacy candidate instead of conclusively suppressing it"
+    );
+}
+
+#[test]
+fn target_constraints_make_the_preview_fail_closed_at_the_legal_action_boundary() {
+    let mut state = setup_game_at_main_phase();
+    let spell =
+        create_unsupported_ability_metadata_preview_fixture(&mut state, 40_134, |ability| {
+            ability
+                .target_constraints
+                .push(crate::types::game_state::TargetSelectionConstraint::DifferentTargetPlayers);
+        });
+    add_mana(&mut state, PlayerId(0), ManaType::Colorless, 1);
+
+    assert!(
+        normal_cast_is_offered(&state, spell),
+        "target-constraint metadata must preserve the legacy candidate instead of conclusively suppressing it"
+    );
+}
+
+#[test]
+fn required_pay_life_keeps_the_existing_life_gate() {
+    let mut state = setup_game_at_main_phase();
+    state.players[0].life = 1;
+    let spell = create_generic_creature_in_hand(
+        &mut state,
+        40_131,
+        PlayerId(0),
+        "Required Life Sibling",
+        1,
+    );
+    state.objects.get_mut(&spell).unwrap().additional_cost =
+        Some(AdditionalCost::Required(AbilityCost::PayLife {
+            amount: QuantityExpr::Fixed { value: 2 },
+        }));
+    add_mana(&mut state, PlayerId(0), ManaType::Colorless, 1);
+
+    assert!(
+        !mandatory_additional_cost_preview_shape_is_supported(
+            match state.objects[&spell].additional_cost.as_ref().unwrap() {
+                AdditionalCost::Required(cost) => cost,
+                other => panic!("expected Required cost, got {other:?}"),
+            }
+        ),
+        "PayLife must remain outside the new preview classifier"
+    );
+    assert!(
+        !normal_cast_is_offered(&state, spell),
+        "the pre-existing Required(PayLife) affordability gate must remain authoritative"
+    );
+}
+
+#[test]
+fn additional_cost_dependent_self_reduction_preserves_legacy_candidate_behavior() {
+    let mut state = setup_game_at_main_phase();
+    let spell = create_generic_creature_in_hand(
+        &mut state,
+        40_132,
+        PlayerId(0),
+        "Additional-Cost Reduction Sibling",
+        2,
+    );
+    let reduction = StaticDefinition::new(StaticMode::ModifyCost {
+        mode: CostModifyMode::Reduce,
+        amount: ManaCost::generic(2),
+        spell_filter: None,
+        dynamic_count: None,
+    })
+    .affected(TargetFilter::SelfRef)
+    .condition(StaticCondition::AdditionalCostPaid)
+    .active_zones(vec![Zone::Hand, Zone::Stack]);
+    let obj = state.objects.get_mut(&spell).unwrap();
+    obj.additional_cost = Some(AdditionalCost::Required(AbilityCost::Mana {
+        cost: ManaCost::generic(2),
+    }));
+    obj.static_definitions.push(reduction);
+    add_mana(&mut state, PlayerId(0), ManaType::Colorless, 2);
+
+    assert!(
+        normal_cast_is_offered(&state, spell),
+        "the narrow preview must not lock a total before an additional-cost-dependent reduction can apply"
+    );
+}
+
+#[test]
+fn additional_cost_dependent_external_reduction_preserves_legacy_candidate_behavior() {
+    let mut state = setup_game_at_main_phase();
+    let spell = create_generic_creature_in_hand(
+        &mut state,
+        40_135,
+        PlayerId(0),
+        "Externally Reduced Additional-Cost Sibling",
+        2,
+    );
+    state.objects.get_mut(&spell).unwrap().additional_cost =
+        Some(AdditionalCost::Required(AbilityCost::Mana {
+            cost: ManaCost::generic(2),
+        }));
+
+    let reducer = create_object(
+        &mut state,
+        CardId(40_136),
+        PlayerId(0),
+        "Additional-Cost Reducer".to_string(),
+        Zone::Battlefield,
+    );
+    state
+        .objects
+        .get_mut(&reducer)
+        .unwrap()
+        .static_definitions
+        .push(
+            StaticDefinition::new(StaticMode::ModifyCost {
+                mode: CostModifyMode::Reduce,
+                amount: ManaCost::generic(2),
+                spell_filter: None,
+                dynamic_count: None,
+            })
+            .affected(TargetFilter::Typed(
+                TypedFilter::card().controller(ControllerRef::You),
+            ))
+            .condition(StaticCondition::AdditionalCostPaid),
+        );
+    add_mana(&mut state, PlayerId(0), ManaType::Colorless, 2);
+
+    assert!(
+        normal_cast_is_offered(&state, spell),
+        "an external reduction that depends on announcing the additional cost must make the narrow preview non-applicable"
+    );
+}
+
 /// Build a basic-land card in `owner`'s hand — the negative control; the
 /// mass-hand cost grant's filter excludes Land.
 fn create_land_in_hand(
