@@ -994,7 +994,20 @@ pub fn filter_state_for_viewer(state: &GameState, viewer: PlayerId) -> GameState
         }
     }
 
-    filtered.auto_pass.retain(|pid, _| *pid == viewer);
+    filtered
+        .auto_pass
+        .retain(|_, session| session.requested_by == Some(viewer));
+    for session in filtered.auto_pass.values_mut() {
+        if let crate::types::game_state::AutoPassMode::UntilTurnBoundary {
+            stack_baseline, ..
+        } = &mut session.mode
+        {
+            *stack_baseline = Some(Default::default());
+        }
+    }
+    filtered.stack_commitments.clear();
+    filtered.next_stack_commit_id = 0;
+    filtered.full_control.retain(|pid, _| *pid == viewer);
     filtered.phase_stops.retain(|pid, _| *pid == viewer);
     filtered
         .may_trigger_auto_choices

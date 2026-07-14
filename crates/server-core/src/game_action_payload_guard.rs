@@ -491,6 +491,7 @@ pub fn guard_game_action_payload(action: &GameAction) -> Result<(), String> {
         | GameAction::ChooseLegend { .. }
         | GameAction::ChooseBattleProtector { .. }
         | GameAction::SetAutoPass { .. }
+        | GameAction::SetFullControl { .. }
         | GameAction::CancelAutoPass
         | GameAction::SubmitPayAmount { .. }
         | GameAction::LearnDecision { .. }

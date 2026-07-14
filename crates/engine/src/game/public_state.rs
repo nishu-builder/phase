@@ -17,6 +17,12 @@ use super::turn_control;
 /// is split into [`finalize_display_state`] so engine-owned fast-forward loops
 /// can keep rules state current while batching expensive display recomputes.
 pub fn finalize_rules_state(state: &mut GameState) {
+    // Priority automation observes stack occurrences rather than reusable
+    // object ids. Reconcile after any action that may have created a stack
+    // entry and before a Priority state is exposed to a consumer.
+    if matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+        state.reconcile_stack_commitments();
+    }
     // Backward-compat for the 2026-05-09 audit M4
     // post-replacement-continuation slot fold. Idempotent on already-migrated
     // states; cheap on every other invocation.

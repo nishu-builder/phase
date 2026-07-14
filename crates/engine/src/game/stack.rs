@@ -198,6 +198,7 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
         Some(e) => e,
         None => return,
     };
+    state.prune_stack_commitment(entry.id);
     let paid_snapshot = state.stack_paid_facts.remove(&entry.id);
 
     // CR 113.3b: Activated keyword abilities (Equip / Crew / Saddle / Station)
@@ -2146,6 +2147,7 @@ fn resolve_batched(
     for _ in 0..consumed {
         match state.stack.pop_back() {
             Some(entry) => {
+                state.prune_stack_commitment(entry.id);
                 state.stack_paid_facts.remove(&entry.id);
                 state.stack_trigger_event_batches.remove(&entry.id);
                 popped.push(entry);
@@ -2471,6 +2473,7 @@ fn resolve_inert_noop_batch(
         let Some(entry) = state.stack.pop_back() else {
             break;
         };
+        state.prune_stack_commitment(entry.id);
         state.stack_paid_facts.remove(&entry.id);
         state.stack_trigger_event_batches.remove(&entry.id);
         events.push(GameEvent::StackResolved {

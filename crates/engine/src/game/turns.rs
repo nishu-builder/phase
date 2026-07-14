@@ -1038,9 +1038,9 @@ pub fn start_next_turn(state: &mut GameState, events: &mut Vec<GameEvent>) {
     // is skipped (the `turns_to_skip` fast-path returns before this point),
     // MyNextTurnStart clears at the next non-skipped turn start — matching how
     // EndOfCurrentTurn already interacts with skips.
-    state.auto_pass.retain(|&pid, mode| match mode {
+    state.auto_pass.retain(|&pid, session| match &session.mode {
         AutoPassMode::UntilStackEmpty { .. } => true,
-        AutoPassMode::UntilTurnBoundary { until } => match *until {
+        AutoPassMode::UntilTurnBoundary { until, .. } => match *until {
             TurnBoundary::EndOfCurrentTurn => false,
             TurnBoundary::MyNextTurnStart => pid != active,
         },
@@ -2668,6 +2668,7 @@ mod tests {
     use super::*;
     use crate::game::zones::create_object;
     use crate::types::card_type::Supertype;
+    use crate::types::game_state::{AutoPassSession, TurnPassPolicy};
     use crate::types::identifiers::{CardId, ObjectId};
     use crate::types::player::PlayerId;
     use std::sync::Arc;
@@ -4190,9 +4191,14 @@ mod tests {
         state.active_player = PlayerId(0);
         state.auto_pass.insert(
             PlayerId(0),
-            AutoPassMode::UntilTurnBoundary {
-                until: TurnBoundary::EndOfCurrentTurn,
-            },
+            AutoPassSession::new(
+                PlayerId(0),
+                AutoPassMode::UntilTurnBoundary {
+                    until: TurnBoundary::EndOfCurrentTurn,
+                    policy: TurnPassPolicy::UntilResponse,
+                    stack_baseline: Some(Default::default()),
+                },
+            ),
         );
         // Reach-guard: the session is live before the boundary.
         assert!(state.auto_pass.contains_key(&PlayerId(0)));
@@ -4217,9 +4223,14 @@ mod tests {
         state.active_player = PlayerId(0);
         state.auto_pass.insert(
             PlayerId(0),
-            AutoPassMode::UntilTurnBoundary {
-                until: TurnBoundary::MyNextTurnStart,
-            },
+            AutoPassSession::new(
+                PlayerId(0),
+                AutoPassMode::UntilTurnBoundary {
+                    until: TurnBoundary::MyNextTurnStart,
+                    policy: TurnPassPolicy::UntilResponse,
+                    stack_baseline: Some(Default::default()),
+                },
+            ),
         );
 
         let mut events = Vec::new();
@@ -4227,9 +4238,14 @@ mod tests {
         assert_eq!(state.active_player, PlayerId(1));
 
         assert_eq!(
-            state.auto_pass.get(&PlayerId(0)),
+            state
+                .auto_pass
+                .get(&PlayerId(0))
+                .map(|session| &session.mode),
             Some(&AutoPassMode::UntilTurnBoundary {
-                until: TurnBoundary::MyNextTurnStart
+                until: TurnBoundary::MyNextTurnStart,
+                policy: TurnPassPolicy::UntilResponse,
+                stack_baseline: Some(Default::default()),
             }),
             "MyNextTurnStart must survive an opponent's turn start"
         );
@@ -4240,9 +4256,14 @@ mod tests {
         sibling.active_player = PlayerId(0);
         sibling.auto_pass.insert(
             PlayerId(0),
-            AutoPassMode::UntilTurnBoundary {
-                until: TurnBoundary::EndOfCurrentTurn,
-            },
+            AutoPassSession::new(
+                PlayerId(0),
+                AutoPassMode::UntilTurnBoundary {
+                    until: TurnBoundary::EndOfCurrentTurn,
+                    policy: TurnPassPolicy::UntilResponse,
+                    stack_baseline: Some(Default::default()),
+                },
+            ),
         );
         start_next_turn(&mut sibling, &mut Vec::new());
         assert!(
@@ -4261,9 +4282,14 @@ mod tests {
         state.active_player = PlayerId(0);
         state.auto_pass.insert(
             PlayerId(0),
-            AutoPassMode::UntilTurnBoundary {
-                until: TurnBoundary::MyNextTurnStart,
-            },
+            AutoPassSession::new(
+                PlayerId(0),
+                AutoPassMode::UntilTurnBoundary {
+                    until: TurnBoundary::MyNextTurnStart,
+                    policy: TurnPassPolicy::UntilResponse,
+                    stack_baseline: Some(Default::default()),
+                },
+            ),
         );
 
         let mut events = Vec::new();
@@ -4299,22 +4325,33 @@ mod tests {
         state.active_player = PlayerId(0);
         state.auto_pass.insert(
             PlayerId(0),
-            AutoPassMode::UntilTurnBoundary {
-                until: TurnBoundary::EndOfCurrentTurn,
-            },
+            AutoPassSession::new(
+                PlayerId(0),
+                AutoPassMode::UntilTurnBoundary {
+                    until: TurnBoundary::EndOfCurrentTurn,
+                    policy: TurnPassPolicy::UntilResponse,
+                    stack_baseline: Some(Default::default()),
+                },
+            ),
         );
         state.auto_pass.insert(
             PlayerId(1),
-            AutoPassMode::UntilStackEmpty {
-                initial_stack_len: 2,
-            },
+            AutoPassSession::new(
+                PlayerId(1),
+                AutoPassMode::UntilStackEmpty {
+                    initial_stack_len: 2,
+                },
+            ),
         );
 
         start_next_turn(&mut state, &mut Vec::new());
 
         assert!(!state.auto_pass.contains_key(&PlayerId(0)));
         assert_eq!(
-            state.auto_pass.get(&PlayerId(1)),
+            state
+                .auto_pass
+                .get(&PlayerId(1))
+                .map(|session| &session.mode),
             Some(&AutoPassMode::UntilStackEmpty {
                 initial_stack_len: 2
             }),

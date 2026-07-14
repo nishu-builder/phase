@@ -13,6 +13,7 @@ pub fn load_saved_game_state(raw: &str) -> Result<GameState, serde_json::Error> 
     migrate_saved_state(&mut value);
     serde_json::from_value::<Saved>(value).map(|saved| {
         let mut state = saved.game_state;
+        state.restore_priority_automation();
         // A deserialized state carries `layers_dirty = Full` and a conservative
         // all-present `static_mode_presence`. `choose_action` takes `&GameState`
         // and cannot flush, so flush here — otherwise every presence-gated scan

@@ -215,6 +215,7 @@ fn cleanup_failed_prepared_copy_cast(state: &mut GameState, copy_id: ObjectId) {
     // Defensive cleanup for any failed cast attempt after synthesizing the
     // ephemeral copy object.
     state.stack.retain(|entry| entry.id != copy_id);
+    state.prune_stack_commitment(copy_id);
     state.objects.remove(&copy_id);
 }
 

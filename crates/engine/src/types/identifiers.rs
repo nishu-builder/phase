@@ -12,6 +12,15 @@ pub struct CardId(pub u64);
 #[serde(transparent)]
 pub struct ObjectId(pub u64);
 
+/// Monotonic identity for one occurrence of an object on the stack.
+///
+/// `ObjectId` is intentionally reusable when a spell is returned to its
+/// announcement state and cast again. Priority automation needs to distinguish
+/// those occurrences, so it tracks this engine-minted id alongside the stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct StackCommitId(pub u64);
+
 /// Unique identifier for a set of objects tracked across delayed trigger boundaries.
 /// CR 603.7: Delayed triggers reference the specific objects from the originating effect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

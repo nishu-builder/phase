@@ -139,6 +139,7 @@ pub fn resolve(
                 let source_permanent_id = state.stack[idx].source_id;
                 let removed_entry_id = state.stack[idx].id;
                 state.stack.remove(idx);
+                state.prune_stack_commitment(removed_entry_id);
                 state.stack_paid_facts.remove(&removed_entry_id);
 
                 // CR 701.6a: removal from the stack IS the counter; emit the
@@ -371,6 +372,7 @@ pub fn resolve_all(
         let exiles_on_counter = casting_variant.replaces_stack_to_graveyard_with_exile();
         let removed_entry_id = state.stack[idx].id;
         state.stack.remove(idx);
+        state.prune_stack_commitment(removed_entry_id);
         state.stack_paid_facts.remove(&removed_entry_id);
 
         // CR 701.6a: removal from the stack IS the counter; emit the event

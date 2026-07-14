@@ -6,17 +6,19 @@ use crate::types::ability::{EffectKind, KeywordAction, TargetRef};
 #[cfg(test)]
 use crate::types::ability::{EffectScope, TapStateChange};
 use crate::types::actions::{
-    GameAction, MayTriggerAutoChoiceOp, PriorityYieldOp, TriggerOrderTemplateOp,
+    ActionAutomationClass, GameAction, MayTriggerAutoChoiceOp, PriorityYieldOp,
+    TriggerOrderTemplateOp,
 };
 use crate::types::events::{BendingType, ContestRound, GameEvent, ManaTapState, PlayerActionKind};
 use crate::types::game_state::{
-    ActionResult, AssistState, AutoPassMode, AutoPassRequest, CastOfferKind, ConvokeMode,
-    CostResume, GameState, LandPlayRecord, LoopDetectionMode, MayTriggerAutoChoiceKey, PayCostKind,
-    RetargetScope, StackEntry, StackEntryKind, WaitingFor,
+    ActionResult, AssistState, AutoPassMode, AutoPassRequest, AutoPassSession, CastOfferKind,
+    ConvokeMode, CostResume, FullControlMode, GameState, LandPlayRecord, LoopDetectionMode,
+    MayTriggerAutoChoiceKey, PayCostKind, RetargetScope, StackEntry, StackEntryKind,
+    TurnPassPolicy, WaitingFor,
 };
 use crate::types::identifiers::{CardId, ObjectId};
 use crate::types::match_config::MatchType;
-use crate::types::phase::Phase;
+use crate::types::phase::{Phase, PhaseStopRetention};
 use crate::types::player::PlayerId;
 use crate::types::statics::StaticMode;
 use crate::types::zones::Zone;
@@ -74,6 +76,15 @@ pub enum EngineError {
 pub enum PublicFinalizeMode {
     Immediate,
     DeferredDisplay,
+}
+
+/// Whether this reducer boundary may run product priority automation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionDriveContext {
+    Product,
+    RulesOnlySimulation,
+    ResolveAllNoNestedProduct,
+    OutOfBandPreference,
 }
 
 fn handle_unlock_room_door(
@@ -204,7 +215,13 @@ pub(super) fn apply_action_boundary(
     action: GameAction,
     mode: PublicFinalizeMode,
 ) -> Result<ActionResult, EngineError> {
-    apply_action_boundary_with_stack_limit(state, actor, action, mode, None)
+    let drive = match (mode, action.automation_class()) {
+        (PublicFinalizeMode::DeferredDisplay, _) => ActionDriveContext::RulesOnlySimulation,
+        (_, ActionAutomationClass::OutOfBandPreference) => ActionDriveContext::OutOfBandPreference,
+        (_, ActionAutomationClass::RulesDecision)
+        | (_, ActionAutomationClass::PriorityAutomationIntent) => ActionDriveContext::Product,
+    };
+    apply_action_boundary_with_stack_limit(state, actor, action, mode, None, drive)
 }
 
 pub(super) fn apply_action_boundary_with_stack_limit(
@@ -213,6 +230,7 @@ pub(super) fn apply_action_boundary_with_stack_limit(
     action: GameAction,
     mode: PublicFinalizeMode,
     stack_resolution_limit: Option<u32>,
+    drive: ActionDriveContext,
 ) -> Result<ActionResult, EngineError> {
     // Clear transient inter-effect state at the start of each player action.
     // last_effect_count is set by interactive handlers (e.g., DiscardChoice) and
@@ -223,6 +241,25 @@ pub(super) fn apply_action_boundary_with_stack_limit(
     state.die_result_this_resolution = None;
     state.consumed_before_priority_trigger_events.clear();
     check_actor_authorization(state, actor, &action)?;
+    let action_class = action.automation_class();
+    // Snapshot the stopped priority decision before dispatch. A one-shot stop
+    // is consumed only after this exact authenticated in-band rules action
+    // succeeds, even if that action advances the phase.
+    let one_shot_stop = if action_class == ActionAutomationClass::RulesDecision {
+        match state.waiting_for {
+            WaitingFor::Priority { player }
+                if turn_control::authorized_submitter_for_player(state, player) == actor =>
+            {
+                state
+                    .applicable_phase_stop(actor)
+                    .filter(|stop| stop.retention == PhaseStopRetention::OneShot)
+                    .map(|stop| (actor, stop))
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
     let mut result = match apply_action(state, actor, action, stack_resolution_limit) {
         Ok(result) => result,
         Err(err) => {
@@ -230,11 +267,28 @@ pub(super) fn apply_action_boundary_with_stack_limit(
             return Err(err);
         }
     };
+    if let Some((player, consumed)) = one_shot_stop {
+        if let Some(stops) = state.phase_stops.get_mut(&player) {
+            if let Some(index) = stops.iter().position(|stop| *stop == consumed) {
+                stops.remove(index);
+            }
+            if stops.is_empty() {
+                state.phase_stops.remove(&player);
+            }
+        }
+    }
     state.consumed_before_priority_trigger_events.clear();
     reconcile_terminal_result(state, &mut result);
     bump_state_revision(state);
     sync_waiting_for(state, &result.waiting_for);
-    run_auto_pass_loop(state, &mut result);
+    if drive == ActionDriveContext::Product
+        && matches!(
+            action_class,
+            ActionAutomationClass::RulesDecision | ActionAutomationClass::PriorityAutomationIntent
+        )
+    {
+        run_auto_pass_loop(state, &mut result);
+    }
     reconcile_terminal_result(state, &mut result);
     // Debug "infinite mana" (CR 500.5 suppressed for flagged players): restore any
     // pool that a spend during this action depleted, before public state is
@@ -2075,6 +2129,7 @@ fn check_actor_authorization(
     if matches!(
         action,
         GameAction::SetPhaseStops { .. }
+            | GameAction::SetFullControl { .. }
             | GameAction::SetPriorityYield { .. }
             | GameAction::SetMayTriggerAutoChoice { .. }
             | GameAction::SetTriggerOrderTemplate { .. }
@@ -2184,11 +2239,25 @@ enum AutoPassDecision {
 /// current phase is in the user-supplied `phase_stops` list. The per-window
 /// interrupt logic is boundary-agnostic — both `EndOfCurrentTurn` and
 /// `MyNextTurnStart` behave identically within a priority window.
-fn priority_auto_pass_decision(state: &GameState, player: PlayerId) -> AutoPassDecision {
-    let Some(mode) = state.auto_pass.get(&player) else {
+fn priority_auto_pass_decision(state: &mut GameState, player: PlayerId) -> AutoPassDecision {
+    if state.format_config.topology().has_shared_team_turns() {
+        return AutoPassDecision::Finish;
+    }
+    if !state.reconcile_stack_commitments() {
+        return AutoPassDecision::Finish;
+    }
+    let Some(session) = state.auto_pass.get(&player) else {
         return AutoPassDecision::Exit;
     };
-    match mode {
+    let Some(requester) = session.requested_by else {
+        return AutoPassDecision::Finish;
+    };
+    if turn_control::authorized_submitter_for_player(state, player) != requester
+        || state.full_control_active(requester)
+    {
+        return AutoPassDecision::Finish;
+    }
+    match &session.mode {
         AutoPassMode::UntilStackEmpty { initial_stack_len } => {
             if state.stack.is_empty() || state.stack.len() > *initial_stack_len {
                 AutoPassDecision::Finish
@@ -2196,18 +2265,36 @@ fn priority_auto_pass_decision(state: &GameState, player: PlayerId) -> AutoPassD
                 AutoPassDecision::Pass
             }
         }
-        AutoPassMode::UntilTurnBoundary { .. } => {
-            // CR 117.3d: An opponent-controlled top-of-stack normally ends the
-            // session so the player can respond — unless they have pre-committed
-            // to yield priority for that exact triggered ability, in which case
-            // the session keeps auto-passing through it.
-            let opponent_on_stack = state.stack.last().is_some_and(|top| {
-                top.controller != player && !state.is_priority_yielded(player, top)
-            });
-            if opponent_on_stack || state.phase_stop_hit(player) {
+        AutoPassMode::UntilTurnBoundary {
+            policy,
+            stack_baseline,
+            ..
+        } => {
+            if state.phase_stop_hit(requester) {
                 AutoPassDecision::Finish
             } else {
-                AutoPassDecision::Pass
+                match policy {
+                    TurnPassPolicy::PassTurn => AutoPassDecision::Pass,
+                    TurnPassPolicy::UntilResponse => {
+                        let Some(baseline) = stack_baseline else {
+                            return AutoPassDecision::Finish;
+                        };
+                        let opponent_response = state.stack.iter().any(|entry| {
+                            let is_new = state
+                                .stack_commitments
+                                .get(&entry.id)
+                                .is_some_and(|commitment| !baseline.contains(commitment));
+                            is_new
+                                && super::topology::is_opponent(state, player, entry.controller)
+                                && !state.is_priority_yielded(requester, entry)
+                        });
+                        if opponent_response {
+                            AutoPassDecision::Finish
+                        } else {
+                            AutoPassDecision::Pass
+                        }
+                    }
+                }
             }
         }
     }
@@ -2220,7 +2307,10 @@ fn priority_auto_pass_decision(state: &GameState, player: PlayerId) -> AutoPassD
 fn end_of_turn_active(state: &GameState, player: PlayerId) -> bool {
     matches!(
         state.auto_pass.get(&player),
-        Some(AutoPassMode::UntilTurnBoundary { .. })
+        Some(AutoPassSession {
+            mode: AutoPassMode::UntilTurnBoundary { .. },
+            ..
+        })
     )
 }
 
@@ -2333,7 +2423,7 @@ fn pass_priority_once_with_pipeline(
 
 fn active_until_stack_empty_requester(state: &GameState) -> Option<PlayerId> {
     state.auto_pass.iter().find_map(|(player, mode)| {
-        matches!(mode, AutoPassMode::UntilStackEmpty { .. }).then_some(*player)
+        matches!(mode.mode, AutoPassMode::UntilStackEmpty { .. }).then_some(*player)
     })
 }
 
@@ -2382,7 +2472,7 @@ fn finish_completed_or_interrupted_until_stack_empty_sessions(state: &mut GameSt
     let finished: Vec<PlayerId> = state
         .auto_pass
         .iter()
-        .filter_map(|(player, mode)| match mode {
+        .filter_map(|(player, session)| match &session.mode {
             AutoPassMode::UntilStackEmpty { initial_stack_len }
                 if state.stack.is_empty() || state.stack.len() > *initial_stack_len =>
             {
@@ -2590,7 +2680,13 @@ fn run_auto_pass_loop(state: &mut GameState, result: &mut ActionResult) {
             // UntilTurnBoundary: auto-submit empty attackers unless the user
             // flagged this phase as a stop.
             WaitingFor::DeclareAttackers { player, .. }
-                if end_of_turn_active(state, *player) && !state.phase_stop_hit(*player) =>
+                if end_of_turn_active(state, *player)
+                    && !state.phase_stop_hit(turn_control::authorized_submitter_for_player(
+                        state, *player,
+                    ))
+                    && !state.full_control_active(
+                        turn_control::authorized_submitter_for_player(state, *player),
+                    ) =>
             {
                 let mut events = Vec::new();
                 match engine_combat::handle_empty_attackers(state, &mut events) {
@@ -2599,7 +2695,10 @@ fn run_auto_pass_loop(state: &mut GameState, result: &mut ActionResult) {
                         result.events.extend(events);
                         result.waiting_for = wf;
                     }
-                    Err(_) => break,
+                    Err(_) => {
+                        state.auto_pass.remove(player);
+                        break;
+                    }
                 }
             }
 
@@ -2615,9 +2714,12 @@ fn run_auto_pass_loop(state: &mut GameState, result: &mut ActionResult) {
                 player,
                 valid_blocker_ids,
                 ..
-            } if !state.phase_stop_hit(*player)
-                && (valid_blocker_ids.is_empty()
-                    || !super::combat::has_attackers_in_play(state)) =>
+            } if !state.phase_stop_hit(turn_control::authorized_submitter_for_player(
+                state, *player,
+            )) && !state.full_control_active(
+                turn_control::authorized_submitter_for_player(state, *player),
+            ) && (valid_blocker_ids.is_empty()
+                || !super::combat::has_attackers_in_play(state)) =>
             {
                 let mut events = Vec::new();
                 match engine_combat::handle_empty_blockers(state, *player, &mut events) {
@@ -2630,8 +2732,22 @@ fn run_auto_pass_loop(state: &mut GameState, result: &mut ActionResult) {
                 }
             }
 
-            // Non-auto-passable WaitingFor (interactive choice, game over, etc.)
-            _ => break,
+            // Non-priority choices cancel only sessions whose authenticated
+            // requester is authorized for this prompt. Other players' sessions
+            // remain dormant. Game over clears every session.
+            WaitingFor::GameOver { .. } => {
+                state.auto_pass.clear();
+                break;
+            }
+            _ => {
+                let authorized = turn_control::authorized_submitters(state);
+                state.auto_pass.retain(|_, session| {
+                    session
+                        .requested_by
+                        .is_some_and(|requester| !authorized.contains(&requester))
+                });
+                break;
+            }
         }
     }
 }
@@ -2772,7 +2888,9 @@ fn apply_action(
     // `authorized_submitter(state)`, which silently cancelled the wrong player's
     // session when fired while an opponent held the prompt.
     if matches!(action, GameAction::CancelAutoPass) {
-        state.auto_pass.remove(&actor);
+        state
+            .auto_pass
+            .retain(|_, session| session.requested_by != Some(actor));
         return Ok(ActionResult {
             events: vec![],
             waiting_for: state.waiting_for.clone(),
@@ -2787,10 +2905,32 @@ fn apply_action(
     // holds priority (the previous "authorized_submitter" lookup rejected this
     // outright via the WrongPlayer guard, surfacing as an in-game dispatch error).
     if let GameAction::SetPhaseStops { stops } = &action {
+        let mut stops = stops.clone();
+        stops.sort_unstable();
+        stops.dedup();
         if stops.is_empty() {
             state.phase_stops.remove(&actor);
         } else {
-            state.phase_stops.insert(actor, stops.clone());
+            state.phase_stops.insert(actor, stops);
+        }
+        return Ok(ActionResult {
+            events: vec![],
+            waiting_for: state.waiting_for.clone(),
+            log_entries: vec![],
+        });
+    }
+
+    if let GameAction::SetFullControl { mode } = &action {
+        match *mode {
+            FullControlMode::Off => {
+                state.full_control.remove(&actor);
+            }
+            FullControlMode::Held | FullControlMode::Locked => {
+                state.full_control.insert(actor, *mode);
+                state
+                    .auto_pass
+                    .retain(|_, session| session.requested_by != Some(actor));
+            }
         }
         return Ok(ActionResult {
             events: vec![],
@@ -3085,7 +3225,9 @@ fn apply_action(
         state.loop_detect_ring.clear();
     }
 
-    // Any deliberate player action (not auto-pass-related or a simple pass) cancels their auto-pass.
+    // Any deliberate player action (not auto-pass-related or a simple pass) cancels every
+    // semantic-seat auto-pass session armed by the authenticated actor. During turn control,
+    // the session key is the controlled seat rather than the requester's seat.
     // CR 103.5: Use the authenticated `actor` directly so the simultaneous mulligan
     // variants (where `authorized_submitter` is None when multiple players are pending)
     // still clear per-actor side-effect state correctly.
@@ -3094,7 +3236,9 @@ fn apply_action(
         | GameAction::PassPriority
         | GameAction::ReorderHand { .. } => {}
         _ => {
-            state.auto_pass.remove(&actor);
+            state
+                .auto_pass
+                .retain(|_, session| session.requested_by != Some(actor));
         }
     }
 
@@ -6240,22 +6384,43 @@ fn apply_action(
             GameAction::PassParadigmOffer,
         ) => WaitingFor::Priority { player: *player },
         (WaitingFor::Priority { player }, GameAction::SetAutoPass { mode }) => {
+            if state.format_config.topology().has_shared_team_turns() {
+                return Err(EngineError::ActionNotAllowed(
+                    "Priority automation is disabled for shared-team turns".to_string(),
+                ));
+            }
+            if state.full_control_active(actor) {
+                return Err(EngineError::ActionNotAllowed(
+                    "Priority automation is disabled while full control is active".to_string(),
+                ));
+            }
+            if !state.reconcile_stack_commitments() {
+                return Err(EngineError::ActionNotAllowed(
+                    "Priority automation requires a valid committed stack".to_string(),
+                ));
+            }
+            let baseline = Some(state.stack_commitments.values().copied().collect());
             // Convert request to stored mode, capturing engine state as needed.
             let stored_mode = match mode {
                 AutoPassRequest::UntilStackEmpty => AutoPassMode::UntilStackEmpty {
                     initial_stack_len: state.stack.len(),
                 },
-                AutoPassRequest::UntilTurnBoundary { until } => {
-                    AutoPassMode::UntilTurnBoundary { until }
+                AutoPassRequest::UntilTurnBoundary { until, policy } => {
+                    AutoPassMode::UntilTurnBoundary {
+                        until,
+                        policy,
+                        stack_baseline: baseline,
+                    }
                 }
             };
-            state.auto_pass.insert(*player, stored_mode);
-            let wf = pass_priority_once_with_pipeline(state, &mut events, None)?;
-            return Ok(ActionResult {
-                events,
-                waiting_for: wf,
-                log_entries: vec![],
-            });
+            state.auto_pass.insert(
+                *player,
+                AutoPassSession {
+                    requested_by: Some(actor),
+                    mode: stored_mode,
+                },
+            );
+            WaitingFor::Priority { player: *player }
         }
         // CR 701.34a: Proliferate — player selected targets to proliferate.
         (
@@ -7066,6 +7231,7 @@ pub(super) fn begin_pending_trigger_target_selection(
                 if let Some(entry_id) = state.pending_trigger_entry.take() {
                     if state.stack.back().map(|e| e.id) == Some(entry_id) {
                         state.stack.pop_back();
+                        state.prune_stack_commitment(entry_id);
                         state.stack_paid_facts.remove(&entry_id);
                         state.stack_trigger_event_batches.remove(&entry_id);
                     }
@@ -7091,6 +7257,7 @@ pub(super) fn begin_pending_trigger_target_selection(
                 if let Some(entry_id) = state.pending_trigger_entry.take() {
                     if state.stack.back().map(|e| e.id) == Some(entry_id) {
                         state.stack.pop_back();
+                        state.prune_stack_commitment(entry_id);
                         state.stack_paid_facts.remove(&entry_id);
                         state.stack_trigger_event_batches.remove(&entry_id);
                     }
@@ -7111,6 +7278,7 @@ pub(super) fn begin_pending_trigger_target_selection(
                 if let Some(entry_id) = state.pending_trigger_entry.take() {
                     if state.stack.back().map(|e| e.id) == Some(entry_id) {
                         state.stack.pop_back();
+                        state.prune_stack_commitment(entry_id);
                         state.stack_paid_facts.remove(&entry_id);
                         state.stack_trigger_event_batches.remove(&entry_id);
                     }
@@ -7190,6 +7358,7 @@ pub(super) fn begin_pending_trigger_target_selection(
         if let Some(entry_id) = state.pending_trigger_entry.take() {
             if state.stack.back().map(|e| e.id) == Some(entry_id) {
                 state.stack.pop_back();
+                state.prune_stack_commitment(entry_id);
                 state.stack_paid_facts.remove(&entry_id);
                 state.stack_trigger_event_batches.remove(&entry_id);
             }

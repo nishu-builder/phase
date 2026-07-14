@@ -1382,6 +1382,7 @@ pub fn restore_game_state(json_str: &str) -> Result<(), JsValue> {
             rehydrate_game_from_card_db(&mut state, db);
         }
     });
+    state.restore_priority_automation();
     finalize_public_state(&mut state);
     GAME_STATE.with(|cell| cell.set(Some(state)));
     // Restoring (undo, or resuming a save from a fresh worker that never saw
@@ -1451,6 +1452,7 @@ pub fn resume_multiplayer_host_state(json_str: &str) -> Result<(), JsValue> {
             rehydrate_game_from_card_db(&mut state, db);
         }
     });
+    state.restore_priority_automation();
     finalize_public_state(&mut state);
 
     GAME_STATE.with(|cell| cell.set(Some(state)));

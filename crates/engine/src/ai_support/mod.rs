@@ -1274,6 +1274,15 @@ pub fn auto_pass_recommended(state: &GameState, actions: &[GameAction]) -> bool 
         WaitingFor::Priority { player } => *player,
         _ => return false,
     };
+    if state.format_config.topology().has_shared_team_turns() {
+        return false;
+    }
+    let requester = crate::game::turn_control::authorized_submitter_for_player(state, player);
+    // Product automation is keyed to the authenticated requester. Full control
+    // and explicit phase stops always win, including while the stack is non-empty.
+    if state.full_control_active(requester) || state.phase_stop_hit(requester) {
+        return false;
+    }
 
     // Lazy, compute-once locals shared across rungs (§C):
     //  - `cast_probe`: one `PriorityCastProbe` built when the first castability
@@ -1287,23 +1296,6 @@ pub fn auto_pass_recommended(state: &GameState, actions: &[GameAction]) -> bool 
     let mut object_mana_actions: Option<Vec<GameAction>> = None;
     let mut grouped_mana_priority: Option<bool> = None;
 
-    // A phase stop on the current phase (empty stack = initial priority window)
-    // means the player asked to pause here — never recommend auto-pass. Moved
-    // from the frontend so the engine is the single authority. Disjoint from the
-    // CR 117.3d yield short-circuit below, which requires a NON-empty stack
-    // (`stack.back()` is `Some`); this branch requires an EMPTY stack.
-    //
-    // Seat note: this gate keys on the `WaitingFor::Priority` player bound
-    // above; the frontend gate it replaced keyed on `state.priority_player`.
-    // CR 723.5: while controlling another player, one player makes all of that
-    // player's choices — so the priority holder and `priority_player` can be
-    // different seats. With an empty stack those two seats diverge only in that
-    // turn-control case, and this divergence is accepted (the checked seat is
-    // the one actually being asked to act).
-    if state.stack.is_empty() && state.phase_stop_hit(player) {
-        return false;
-    }
-
     // CR 117.3d: A standing priority yield for the top-of-stack trigger is an
     // explicit pre-commitment to pass. It deliberately overrides the castability
     // and meaningful-action holds below (including the issue #4388 opponent-turn
@@ -1312,7 +1304,7 @@ pub fn auto_pass_recommended(state: &GameState, actions: &[GameAction]) -> bool 
     if state
         .stack
         .back()
-        .is_some_and(|top| state.is_priority_yielded(player, top))
+        .is_some_and(|top| state.is_priority_yielded(requester, top))
     {
         return true;
     }
@@ -5429,6 +5421,7 @@ mod tests {
             vec![PhaseStop {
                 phase: Phase::Upkeep,
                 scope: PhaseStopScope::AllTurns,
+                retention: crate::types::phase::PhaseStopRetention::Persistent,
             }],
         );
         assert!(
@@ -5447,6 +5440,7 @@ mod tests {
             vec![PhaseStop {
                 phase: Phase::End,
                 scope: PhaseStopScope::AllTurns,
+                retention: crate::types::phase::PhaseStopRetention::Persistent,
             }],
         );
         assert!(
@@ -5456,13 +5450,11 @@ mod tests {
     }
 
     #[test]
-    fn auto_pass_recommended_true_when_stack_nonempty_despite_stop() {
+    fn auto_pass_recommended_false_when_stack_nonempty_at_stop() {
         let mut state = setup_priority();
         state.phase = Phase::Upkeep;
-        // A phase stop on the current phase, but the stack is NON-empty: the new
-        // gate is empty-stack-only (disjoint from the CR 117.3d yield short-circuit
-        // below), so it must not fire here. Reverting the `is_empty()` guard flips
-        // this to `false`.
+        // A phase stop belongs to the authenticated requester and takes precedence
+        // over both product auto-pass heuristics and standing stack yields.
         state.stack.push_back(StackEntry {
             id: ObjectId(600),
             source_id: ObjectId(600),
@@ -5479,11 +5471,12 @@ mod tests {
             vec![PhaseStop {
                 phase: Phase::Upkeep,
                 scope: PhaseStopScope::AllTurns,
+                retention: crate::types::phase::PhaseStopRetention::Persistent,
             }],
         );
         assert!(
-            super::auto_pass_recommended(&state, &[GameAction::PassPriority]),
-            "the empty-stack-only phase-stop gate must not fire while the stack is non-empty"
+            !super::auto_pass_recommended(&state, &[GameAction::PassPriority]),
+            "a current-phase stop must suppress auto-pass even with a non-empty stack"
         );
     }
 
@@ -5498,6 +5491,7 @@ mod tests {
             vec![PhaseStop {
                 phase: Phase::Upkeep,
                 scope: PhaseStopScope::AllTurns,
+                retention: crate::types::phase::PhaseStopRetention::Persistent,
             }],
         );
         assert!(

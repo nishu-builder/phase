@@ -1987,6 +1987,7 @@ fn set_phase_stops_from_non_priority_actor_succeeds() {
             stops: vec![crate::types::phase::PhaseStop {
                 phase: Phase::End,
                 scope: crate::types::phase::PhaseStopScope::AllTurns,
+                retention: crate::types::phase::PhaseStopRetention::Persistent,
             }],
         },
     );
@@ -2000,6 +2001,7 @@ fn set_phase_stops_from_non_priority_actor_succeeds() {
         Some(&vec![crate::types::phase::PhaseStop {
             phase: Phase::End,
             scope: crate::types::phase::PhaseStopScope::AllTurns,
+            retention: crate::types::phase::PhaseStopRetention::Persistent,
         }]),
         "expected actor (P0) preference to be written, not authorized submitter (P1)",
     );
@@ -2015,9 +2017,14 @@ fn cancel_auto_pass_routes_by_actor() {
     let mut state = setup_game_at_main_phase();
     state.auto_pass.insert(
         PlayerId(0),
-        crate::types::game_state::AutoPassMode::UntilTurnBoundary {
-            until: crate::types::game_state::TurnBoundary::EndOfCurrentTurn,
-        },
+        crate::types::game_state::AutoPassSession::new(
+            PlayerId(0),
+            crate::types::game_state::AutoPassMode::UntilTurnBoundary {
+                until: crate::types::game_state::TurnBoundary::EndOfCurrentTurn,
+                policy: TurnPassPolicy::UntilResponse,
+                stack_baseline: Some(Default::default()),
+            },
+        ),
     );
     state.priority_player = PlayerId(1);
     state.waiting_for = WaitingFor::Priority {
@@ -2500,9 +2507,14 @@ fn until_end_of_turn_yielded_opponent_top_passes_not_finishes() {
     let mut state = setup_game_at_main_phase();
     state.auto_pass.insert(
         PlayerId(0),
-        crate::types::game_state::AutoPassMode::UntilTurnBoundary {
-            until: crate::types::game_state::TurnBoundary::EndOfCurrentTurn,
-        },
+        crate::types::game_state::AutoPassSession::new(
+            PlayerId(0),
+            crate::types::game_state::AutoPassMode::UntilTurnBoundary {
+                until: crate::types::game_state::TurnBoundary::EndOfCurrentTurn,
+                policy: TurnPassPolicy::UntilResponse,
+                stack_baseline: Some(Default::default()),
+            },
+        ),
     );
     let source = ObjectId(500);
     push_token_trigger(&mut state, source, PlayerId(1), Some(4), Some(CardId(77)));
@@ -2510,7 +2522,7 @@ fn until_end_of_turn_yielded_opponent_top_passes_not_finishes() {
     // Without a yield: the opponent trigger ends the session.
     assert!(
         matches!(
-            priority_auto_pass_decision(&state, PlayerId(0)),
+            priority_auto_pass_decision(&mut state, PlayerId(0)),
             AutoPassDecision::Finish
         ),
         "reach-guard: an un-yielded opponent top finishes the session"
@@ -2527,7 +2539,7 @@ fn until_end_of_turn_yielded_opponent_top_passes_not_finishes() {
     );
     assert!(
         matches!(
-            priority_auto_pass_decision(&state, PlayerId(0)),
+            priority_auto_pass_decision(&mut state, PlayerId(0)),
             AutoPassDecision::Pass
         ),
         "CR 117.3d: a matching yield keeps the UntilEndOfTurn session passing"
@@ -2544,7 +2556,7 @@ fn until_end_of_turn_yielded_opponent_top_passes_not_finishes() {
     );
     assert!(
         matches!(
-            priority_auto_pass_decision(&state, PlayerId(0)),
+            priority_auto_pass_decision(&mut state, PlayerId(0)),
             AutoPassDecision::Finish
         ),
         "a non-yielded opponent trigger still finishes the session"

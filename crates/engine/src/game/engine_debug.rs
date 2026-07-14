@@ -422,6 +422,7 @@ pub fn apply_debug_action(
             state.priority_player = active_player;
             state.combat = None;
             state.stack.clear();
+            state.stack_commitments.clear();
             state.waiting_for = WaitingFor::Priority {
                 player: active_player,
             };

@@ -30,7 +30,7 @@ use crate::types::ability::{ActivationRestriction, DamageModification};
 use crate::types::card_type::{CoreType, Supertype};
 use crate::types::counter::CounterType;
 use crate::types::game_state::{loop_states_equal, GameState, StackEntry, StackEntryKind};
-use crate::types::identifiers::ObjectId;
+use crate::types::identifiers::{ObjectId, StackCommitId};
 use crate::types::mana::ManaType;
 use crate::types::phase::Phase;
 use crate::types::player::{Player, PlayerId};
@@ -662,6 +662,15 @@ pub fn loop_states_equal_modulo_resources(a: &GameState, b: &GameState) -> bool 
         && pa.last_recast_context == pb.last_recast_context
 }
 
+/// Remove the stack axis from a discarded loop-comparison clone, including the
+/// private occurrence identity that `GameState` equality compares alongside the
+/// authoritative stack.
+fn clear_projected_stack(state: &mut GameState) {
+    state.stack.clear();
+    state.stack_commitments.clear();
+    state.next_stack_commit_id = 0;
+}
+
 /// CR 606.3: per-object `loyalty_activations_this_turn` equality across two
 /// projected states. Transparent for non-loyalty loops (all-zero counts compare
 /// equal); discriminating for loyalty loops (the count grows each activation).
@@ -788,8 +797,8 @@ pub(crate) fn loop_states_cover_modulo_growth(prior: &GameState, current: &GameS
     // plus loyalty-activation parity plus strict object damage/counter equality.
     let mut pa = project_out_resources(prior);
     let mut pb = project_out_resources(current);
-    pa.stack.clear();
-    pb.stack.clear();
+    clear_projected_stack(&mut pa);
+    clear_projected_stack(&mut pb);
     if !(loop_states_equal(&pa, &pb)
         && loyalty_activation_counts_match(&pa, &pb)
         && object_resource_axes_match(prior, current))
@@ -931,8 +940,8 @@ pub(crate) fn loop_states_cover_modulo_object_growth(
     let cf = flush_clone(current);
     let mut pa = project_out_resources(&pf);
     let mut pb = project_out_resources(&cf);
-    pa.stack.clear();
-    pb.stack.clear();
+    clear_projected_stack(&mut pa);
+    clear_projected_stack(&mut pb);
 
     // P-19: absolute-ObjectId battlefield set-difference. Growth must be PURE —
     // no battlefield object may leave (a shrink is a real board change, not ω-cover).
@@ -1101,8 +1110,8 @@ pub(crate) fn loop_states_cover_modulo_fodder_growth(
     let cf = flush_clone(current);
     let mut pa = project_out_resources(&pf);
     let mut pb = project_out_resources(&cf);
-    pa.stack.clear();
-    pb.stack.clear();
+    clear_projected_stack(&mut pa);
+    clear_projected_stack(&mut pb);
 
     // Excluded set = ALL fodder ids in BOTH projected frames (the drifting/growing
     // pile). Unlike the object-growth `bf_current − bf_prior` add-set, an existing
@@ -1415,8 +1424,8 @@ fn eq_except_growable(pa: &GameState, pb: &GameState, grown: &HashSet<ObjectId>)
     }
     a.battlefield.clear(); // allow-raw-zone: clears a discarded comparison CLONE for loop-cover equality (fn takes &GameState, mutates a local clone) - not a gameplay zone event
     b.battlefield.clear(); // allow-raw-zone: clears a discarded comparison CLONE for loop-cover equality (fn takes &GameState, mutates a local clone) - not a gameplay zone event
-    a.stack.clear();
-    b.stack.clear();
+    clear_projected_stack(&mut a);
+    clear_projected_stack(&mut b);
     // Rebase-adaptation (ONE-SIDED-SAFETY): compare the new upstream scalar
     // `post_replacement_token_substitution_count` here even though upstream's
     // `impl PartialEq for GameState` excludes it. Excluding a COUNT from the cover gate
@@ -2627,9 +2636,19 @@ fn project_out_resources(state: &GameState) -> GameState {
     // a stack-entry id): left AS-IS, a residual mismatch can only suppress a match.
     // Canonicalizing the position id can therefore never MANUFACTURE a false positive
     // (a wrongful win); it can only make a genuine repeat visible.
+    let mut canonical_commitments = BTreeMap::new();
     for (pos, entry) in s.stack.iter_mut().enumerate() {
-        entry.id = ObjectId(pos as u64);
+        let canonical_id = ObjectId(pos as u64);
+        entry.id = canonical_id;
+        canonical_commitments.insert(canonical_id, StackCommitId(pos as u64));
     }
+    // `normalize_for_loop` canonicalizes occurrence values before this modulo-only
+    // stack-id rewrite. Re-key the private sidecar at the same ownership boundary;
+    // otherwise it retains each live entry's pre-canonical id and the strict
+    // `GameState` equality below still observes the very identity projected out
+    // above.
+    s.stack_commitments = canonical_commitments;
+    s.next_stack_commit_id = s.stack.len() as u64;
 
     s
 }
@@ -3725,6 +3744,18 @@ mod tests {
         let mut b = a.clone();
         b.stack.clear();
         b.stack.push_back(trigger_entry(11, 500, 0)); // same source, fresh id
+
+        let projected_a = project_out_resources(&a);
+        let projected_b = project_out_resources(&b);
+        assert_eq!(
+            projected_a.stack_commitments,
+            BTreeMap::from([(ObjectId(0), StackCommitId(0))]),
+            "the modulo stack-id projection must re-key its private occurrence sidecar"
+        );
+        assert_eq!(
+            projected_a.stack_commitments, projected_b.stack_commitments,
+            "fresh live stack ids must not survive through the occurrence sidecar"
+        );
         assert!(
             loop_states_equal_modulo_resources(&a, &b),
             "same triggered ability from the same source must compare equal modulo its fresh id"
@@ -4456,8 +4487,8 @@ mod tests {
         // Sanity: the projection hides it (the 2p equality path would still match).
         let mut pa = project_out_resources(&prior);
         let mut pb = project_out_resources(&current);
-        pa.stack.clear();
-        pb.stack.clear();
+        clear_projected_stack(&mut pa);
+        clear_projected_stack(&mut pb);
         assert!(
             loop_states_equal(&pa, &pb),
             "fixture: the -1/-1 counter drift is projection-invisible (isolates B1)"

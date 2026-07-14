@@ -6,7 +6,9 @@ use crate::types::game_state::{GameState, WaitingFor};
 use crate::types::log::GameLogEntry;
 use crate::types::player::PlayerId;
 
-use super::engine::{apply_action_boundary_with_stack_limit, PublicFinalizeMode};
+use super::engine::{
+    apply_action_boundary_with_stack_limit, ActionDriveContext, PublicFinalizeMode,
+};
 use super::public_state::finalize_display_state;
 use super::{topology, turn_control};
 
@@ -132,6 +134,7 @@ where
             action,
             mode,
             stack_resolution_limit,
+            ActionDriveContext::ResolveAllNoNestedProduct,
         ) else {
             break;
         };
@@ -313,6 +316,7 @@ mod tests {
         };
         state.priority_player = semantic_seat;
         state.stack = stack.into_iter().collect();
+        state.reconcile_stack_commitments();
         state
     }
 
@@ -324,6 +328,7 @@ mod tests {
         };
         state.priority_player = semantic_seat;
         state.stack = stack.into_iter().collect();
+        state.reconcile_stack_commitments();
         state
     }
 
@@ -476,6 +481,7 @@ mod tests {
                 stops: vec![PhaseStop {
                     phase: Phase::PreCombatMain,
                     scope: PhaseStopScope::AllTurns,
+                    retention: crate::types::phase::PhaseStopRetention::Persistent,
                 }],
             })
         });
@@ -488,6 +494,7 @@ mod tests {
             Some(&vec![PhaseStop {
                 phase: Phase::PreCombatMain,
                 scope: PhaseStopScope::AllTurns,
+                retention: crate::types::phase::PhaseStopRetention::Persistent,
             }])
         );
     }
@@ -548,6 +555,7 @@ mod tests {
                 stops: vec![PhaseStop {
                     phase: Phase::PreCombatMain,
                     scope: PhaseStopScope::AllTurns,
+                    retention: crate::types::phase::PhaseStopRetention::Persistent,
                 }],
             })
         });
@@ -560,6 +568,7 @@ mod tests {
             Some(&vec![PhaseStop {
                 phase: Phase::PreCombatMain,
                 scope: PhaseStopScope::AllTurns,
+                retention: crate::types::phase::PhaseStopRetention::Persistent,
             }])
         );
     }

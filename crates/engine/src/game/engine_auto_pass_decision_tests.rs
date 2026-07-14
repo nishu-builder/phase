@@ -9,9 +9,11 @@ use crate::types::ability::{
 use crate::types::actions::GameAction;
 use crate::types::card_type::CoreType;
 use crate::types::events::GameEvent;
-use crate::types::game_state::{CastingVariant, TurnBoundary};
+use crate::types::game_state::{
+    AutoPassSession, CastingVariant, TurnBoundary, TurnPassPolicy, YieldTarget,
+};
 use crate::types::identifiers::{CardId, ObjectId};
-use crate::types::phase::{PhaseStop, PhaseStopScope};
+use crate::types::phase::{PhaseStop, PhaseStopRetention, PhaseStopScope};
 use crate::types::zones::Zone;
 
 fn stack_entry(controller: PlayerId) -> StackEntry {
@@ -29,7 +31,35 @@ fn stack_entry(controller: PlayerId) -> StackEntry {
 }
 
 fn stop(phase: Phase, scope: PhaseStopScope) -> PhaseStop {
-    PhaseStop { phase, scope }
+    PhaseStop {
+        phase,
+        scope,
+        retention: crate::types::phase::PhaseStopRetention::Persistent,
+    }
+}
+
+fn one_shot_stop(phase: Phase, scope: PhaseStopScope) -> PhaseStop {
+    PhaseStop {
+        phase,
+        scope,
+        retention: PhaseStopRetention::OneShot,
+    }
+}
+
+fn turn_session(
+    state: &mut GameState,
+    player: PlayerId,
+    policy: TurnPassPolicy,
+) -> AutoPassSession {
+    assert!(state.reconcile_stack_commitments());
+    AutoPassSession::new(
+        player,
+        AutoPassMode::UntilTurnBoundary {
+            until: TurnBoundary::EndOfCurrentTurn,
+            policy,
+            stack_baseline: Some(state.stack_commitments.values().copied().collect()),
+        },
+    )
 }
 
 fn is_pass(d: &AutoPassDecision) -> bool {
@@ -66,6 +96,7 @@ fn apply_reconciles_eliminated_two_player_game_to_game_over() {
         GameAction::SetAutoPass {
             mode: AutoPassRequest::UntilTurnBoundary {
                 until: TurnBoundary::EndOfCurrentTurn,
+                policy: TurnPassPolicy::UntilResponse,
             },
         },
     )
@@ -107,13 +138,23 @@ fn set_auto_pass_carries_requested_boundary_via_dispatch() {
             &mut state,
             PlayerId(0),
             GameAction::SetAutoPass {
-                mode: AutoPassRequest::UntilTurnBoundary { until },
+                mode: AutoPassRequest::UntilTurnBoundary {
+                    until,
+                    policy: TurnPassPolicy::UntilResponse,
+                },
             },
         )
         .unwrap();
         assert_eq!(
-            state.auto_pass.get(&PlayerId(0)),
-            Some(&AutoPassMode::UntilTurnBoundary { until }),
+            state
+                .auto_pass
+                .get(&PlayerId(0))
+                .map(|session| &session.mode),
+            Some(&AutoPassMode::UntilTurnBoundary {
+                until,
+                policy: TurnPassPolicy::UntilResponse,
+                stack_baseline: Some(Default::default()),
+            }),
             "SetAutoPass must store the requested boundary {until:?}"
         );
     }
@@ -179,11 +220,34 @@ fn push_spell(state: &mut GameState, id: ObjectId, controller: PlayerId, ability
     });
 }
 
+fn push_yieldable_trigger(
+    state: &mut GameState,
+    entry_id: ObjectId,
+    source_id: ObjectId,
+    controller: PlayerId,
+) {
+    state.stack.push_back(StackEntry {
+        id: entry_id,
+        source_id,
+        controller,
+        kind: StackEntryKind::TriggeredAbility {
+            source_id,
+            ability: Box::new(draw_ability(source_id, controller)),
+            condition: None,
+            trigger_event: None,
+            description: None,
+            source_name: "Trigger".to_string(),
+            subject_match_count: None,
+            die_result: None,
+        },
+    });
+}
+
 #[test]
 fn exit_when_no_auto_pass_set() {
-    let state = GameState::default();
+    let mut state = GameState::default();
     assert!(matches!(
-        priority_auto_pass_decision(&state, PlayerId(0)),
+        priority_auto_pass_decision(&mut state, PlayerId(0)),
         AutoPassDecision::Exit
     ));
 }
@@ -196,11 +260,19 @@ fn until_end_of_turn_passes_through_empty_stack_without_phase_stop() {
     };
     state.auto_pass.insert(
         PlayerId(0),
-        AutoPassMode::UntilTurnBoundary {
-            until: TurnBoundary::EndOfCurrentTurn,
-        },
+        AutoPassSession::new(
+            PlayerId(0),
+            AutoPassMode::UntilTurnBoundary {
+                until: TurnBoundary::EndOfCurrentTurn,
+                policy: TurnPassPolicy::UntilResponse,
+                stack_baseline: Some(Default::default()),
+            },
+        ),
     );
-    assert!(is_pass(&priority_auto_pass_decision(&state, PlayerId(0))));
+    assert!(is_pass(&priority_auto_pass_decision(
+        &mut state,
+        PlayerId(0)
+    )));
 }
 
 #[test]
@@ -211,11 +283,19 @@ fn until_end_of_turn_finishes_on_opponent_stack_activity() {
     state.stack.push_back(stack_entry(PlayerId(1)));
     state.auto_pass.insert(
         PlayerId(0),
-        AutoPassMode::UntilTurnBoundary {
-            until: TurnBoundary::EndOfCurrentTurn,
-        },
+        AutoPassSession::new(
+            PlayerId(0),
+            AutoPassMode::UntilTurnBoundary {
+                until: TurnBoundary::EndOfCurrentTurn,
+                policy: TurnPassPolicy::UntilResponse,
+                stack_baseline: Some(Default::default()),
+            },
+        ),
     );
-    assert!(is_finish(&priority_auto_pass_decision(&state, PlayerId(0))));
+    assert!(is_finish(&priority_auto_pass_decision(
+        &mut state,
+        PlayerId(0)
+    )));
 }
 
 #[test]
@@ -225,11 +305,19 @@ fn until_end_of_turn_passes_through_own_stack_activity() {
     state.stack.push_back(stack_entry(PlayerId(0)));
     state.auto_pass.insert(
         PlayerId(0),
-        AutoPassMode::UntilTurnBoundary {
-            until: TurnBoundary::EndOfCurrentTurn,
-        },
+        AutoPassSession::new(
+            PlayerId(0),
+            AutoPassMode::UntilTurnBoundary {
+                until: TurnBoundary::EndOfCurrentTurn,
+                policy: TurnPassPolicy::UntilResponse,
+                stack_baseline: Some(Default::default()),
+            },
+        ),
     );
-    assert!(is_pass(&priority_auto_pass_decision(&state, PlayerId(0))));
+    assert!(is_pass(&priority_auto_pass_decision(
+        &mut state,
+        PlayerId(0)
+    )));
 }
 
 #[test]
@@ -242,15 +330,23 @@ fn until_end_of_turn_finishes_at_configured_phase_stop() {
     };
     state.auto_pass.insert(
         PlayerId(0),
-        AutoPassMode::UntilTurnBoundary {
-            until: TurnBoundary::EndOfCurrentTurn,
-        },
+        AutoPassSession::new(
+            PlayerId(0),
+            AutoPassMode::UntilTurnBoundary {
+                until: TurnBoundary::EndOfCurrentTurn,
+                policy: TurnPassPolicy::UntilResponse,
+                stack_baseline: Some(Default::default()),
+            },
+        ),
     );
     state.phase_stops.insert(
         PlayerId(0),
         vec![stop(Phase::DeclareBlockers, PhaseStopScope::AllTurns)],
     );
-    assert!(is_finish(&priority_auto_pass_decision(&state, PlayerId(0))));
+    assert!(is_finish(&priority_auto_pass_decision(
+        &mut state,
+        PlayerId(0)
+    )));
 }
 
 /// V8: the per-window interrupt logic is boundary-agnostic. A
@@ -262,6 +358,8 @@ fn until_end_of_turn_finishes_at_configured_phase_stop() {
 fn my_next_turn_start_window_behavior_matches_end_of_current_turn() {
     let mode = AutoPassMode::UntilTurnBoundary {
         until: TurnBoundary::MyNextTurnStart,
+        policy: TurnPassPolicy::UntilResponse,
+        stack_baseline: Some(Default::default()),
     };
 
     // Empty stack, no phase stop → Pass.
@@ -269,27 +367,38 @@ fn my_next_turn_start_window_behavior_matches_end_of_current_turn() {
         phase: Phase::PostCombatMain,
         ..GameState::default()
     };
-    empty.auto_pass.insert(PlayerId(0), mode);
-    assert!(is_pass(&priority_auto_pass_decision(&empty, PlayerId(0))));
+    empty
+        .auto_pass
+        .insert(PlayerId(0), AutoPassSession::new(PlayerId(0), mode.clone()));
+    assert!(is_pass(&priority_auto_pass_decision(
+        &mut empty,
+        PlayerId(0)
+    )));
 
     // Opponent-controlled top-of-stack → Finish.
     let mut opp = GameState::default();
     opp.stack.push_back(stack_entry(PlayerId(1)));
-    opp.auto_pass.insert(PlayerId(0), mode);
-    assert!(is_finish(&priority_auto_pass_decision(&opp, PlayerId(0))));
+    opp.auto_pass
+        .insert(PlayerId(0), AutoPassSession::new(PlayerId(0), mode.clone()));
+    assert!(is_finish(&priority_auto_pass_decision(
+        &mut opp,
+        PlayerId(0)
+    )));
 
     // User-flagged phase stop → Finish.
     let mut stopped = GameState {
         phase: Phase::DeclareBlockers,
         ..GameState::default()
     };
-    stopped.auto_pass.insert(PlayerId(0), mode);
+    stopped
+        .auto_pass
+        .insert(PlayerId(0), AutoPassSession::new(PlayerId(0), mode));
     stopped.phase_stops.insert(
         PlayerId(0),
         vec![stop(Phase::DeclareBlockers, PhaseStopScope::AllTurns)],
     );
     assert!(is_finish(&priority_auto_pass_decision(
-        &stopped,
+        &mut stopped,
         PlayerId(0)
     )));
 }
@@ -308,9 +417,14 @@ fn until_end_of_turn_scope_gates_session_owner_auto_pass() {
         };
         state.auto_pass.insert(
             PlayerId(0),
-            AutoPassMode::UntilTurnBoundary {
-                until: TurnBoundary::EndOfCurrentTurn,
-            },
+            AutoPassSession::new(
+                PlayerId(0),
+                AutoPassMode::UntilTurnBoundary {
+                    until: TurnBoundary::EndOfCurrentTurn,
+                    policy: TurnPassPolicy::UntilResponse,
+                    stack_baseline: Some(Default::default()),
+                },
+            ),
         );
         state
             .phase_stops
@@ -319,16 +433,16 @@ fn until_end_of_turn_scope_gates_session_owner_auto_pass() {
     };
 
     // OpponentsTurns stop, active player is the opponent → finishes.
-    let opp_turn = base(PlayerId(1), PhaseStopScope::OpponentsTurns);
+    let mut opp_turn = base(PlayerId(1), PhaseStopScope::OpponentsTurns);
     assert!(is_finish(&priority_auto_pass_decision(
-        &opp_turn,
+        &mut opp_turn,
         PlayerId(0)
     )));
 
     // OwnTurn stop, but active player is the opponent → does NOT finish (passes).
-    let own_on_opp_turn = base(PlayerId(1), PhaseStopScope::OwnTurn);
+    let mut own_on_opp_turn = base(PlayerId(1), PhaseStopScope::OwnTurn);
     assert!(is_pass(&priority_auto_pass_decision(
-        &own_on_opp_turn,
+        &mut own_on_opp_turn,
         PlayerId(0)
     )));
 }
@@ -433,9 +547,14 @@ fn until_end_of_turn_does_not_auto_submit_available_blockers() {
     };
     state.auto_pass.insert(
         PlayerId(0),
-        AutoPassMode::UntilTurnBoundary {
-            until: TurnBoundary::EndOfCurrentTurn,
-        },
+        AutoPassSession::new(
+            PlayerId(0),
+            AutoPassMode::UntilTurnBoundary {
+                until: TurnBoundary::EndOfCurrentTurn,
+                policy: TurnPassPolicy::UntilResponse,
+                stack_baseline: Some(Default::default()),
+            },
+        ),
     );
 
     let mut result = ActionResult {
@@ -588,9 +707,14 @@ fn declare_attackers_own_turn_stop_pauses_empty_attacker_submit() {
     // attributable to the phase stop rather than a missing auto-pass session.
     state.auto_pass.insert(
         PlayerId(0),
-        AutoPassMode::UntilTurnBoundary {
-            until: TurnBoundary::EndOfCurrentTurn,
-        },
+        AutoPassSession::new(
+            PlayerId(0),
+            AutoPassMode::UntilTurnBoundary {
+                until: TurnBoundary::EndOfCurrentTurn,
+                policy: TurnPassPolicy::UntilResponse,
+                stack_baseline: Some(Default::default()),
+            },
+        ),
     );
     state.phase_stops.insert(
         PlayerId(0),
@@ -638,9 +762,14 @@ fn declare_attackers_opponents_turns_stop_does_not_pause_on_own_turn() {
     };
     state.auto_pass.insert(
         PlayerId(0),
-        AutoPassMode::UntilTurnBoundary {
-            until: TurnBoundary::EndOfCurrentTurn,
-        },
+        AutoPassSession::new(
+            PlayerId(0),
+            AutoPassMode::UntilTurnBoundary {
+                until: TurnBoundary::EndOfCurrentTurn,
+                policy: TurnPassPolicy::UntilResponse,
+                stack_baseline: Some(Default::default()),
+            },
+        ),
     );
     state.phase_stops.insert(
         PlayerId(0),
@@ -769,9 +898,12 @@ fn until_stack_empty_non_requester_own_stack_shortcut_does_not_hide_action() {
     state.priority_player = PlayerId(1);
     state.auto_pass.insert(
         PlayerId(0),
-        AutoPassMode::UntilStackEmpty {
-            initial_stack_len: 1,
-        },
+        AutoPassSession::new(
+            PlayerId(0),
+            AutoPassMode::UntilStackEmpty {
+                initial_stack_len: 1,
+            },
+        ),
     );
 
     let mut result = ActionResult {
@@ -1026,4 +1158,403 @@ fn loop_gate_probes_all_living_players_not_just_current_holder() {
         "the current-holder-only check sees nothing for P0 — its negation would \
              wrongly clear, proving the all-players probe is load-bearing"
     );
+}
+
+#[test]
+fn stack_recast_mints_a_fresh_commitment_after_eager_prune() {
+    let mut state = priority_state();
+    push_simple_stack_entry(&mut state, 70_000, PlayerId(0));
+    assert!(state.reconcile_stack_commitments());
+    let first = state.stack_commitments[&ObjectId(70_000)];
+
+    let departed = state.stack.pop_back().unwrap();
+    state.prune_stack_commitment(departed.id);
+    push_simple_stack_entry(&mut state, 70_000, PlayerId(0));
+    assert!(state.reconcile_stack_commitments());
+    let recast = state.stack_commitments[&ObjectId(70_000)];
+
+    assert_ne!(
+        first, recast,
+        "a recast occurrence must not reuse its old identity"
+    );
+}
+
+#[test]
+fn until_response_ignores_baseline_and_detects_buried_opponent_response() {
+    let mut state = priority_state();
+    push_simple_stack_entry(&mut state, 71_000, PlayerId(1));
+    let baseline_session = turn_session(&mut state, PlayerId(0), TurnPassPolicy::UntilResponse);
+    state.auto_pass.insert(PlayerId(0), baseline_session);
+    assert!(is_pass(&priority_auto_pass_decision(
+        &mut state,
+        PlayerId(0)
+    )));
+
+    push_simple_stack_entry(&mut state, 71_001, PlayerId(1));
+    push_simple_stack_entry(&mut state, 71_002, PlayerId(0));
+    assert!(is_finish(&priority_auto_pass_decision(
+        &mut state,
+        PlayerId(0)
+    )));
+}
+
+#[test]
+fn pass_turn_ignores_new_opponent_stack_activity() {
+    let mut state = priority_state();
+    let session = turn_session(&mut state, PlayerId(0), TurnPassPolicy::PassTurn);
+    state.auto_pass.insert(PlayerId(0), session);
+    push_simple_stack_entry(&mut state, 72_000, PlayerId(1));
+    assert!(is_pass(&priority_auto_pass_decision(
+        &mut state,
+        PlayerId(0)
+    )));
+}
+
+#[test]
+fn missing_baseline_fails_closed_but_some_empty_is_valid() {
+    let mut missing = priority_state();
+    missing.auto_pass.insert(
+        PlayerId(0),
+        AutoPassSession::new(
+            PlayerId(0),
+            AutoPassMode::UntilTurnBoundary {
+                until: TurnBoundary::EndOfCurrentTurn,
+                policy: TurnPassPolicy::UntilResponse,
+                stack_baseline: None,
+            },
+        ),
+    );
+    assert!(is_finish(&priority_auto_pass_decision(
+        &mut missing,
+        PlayerId(0)
+    )));
+
+    let mut empty = priority_state();
+    let session = turn_session(&mut empty, PlayerId(0), TurnPassPolicy::UntilResponse);
+    empty.auto_pass.insert(PlayerId(0), session);
+    assert!(is_pass(&priority_auto_pass_decision(
+        &mut empty,
+        PlayerId(0)
+    )));
+}
+
+#[test]
+fn normalize_for_loop_canonicalizes_commitments_and_baselines() {
+    let mut state = priority_state();
+    push_simple_stack_entry(&mut state, 73_000, PlayerId(0));
+    push_simple_stack_entry(&mut state, 73_001, PlayerId(1));
+    state.stack_commitments.insert(
+        ObjectId(73_000),
+        crate::types::identifiers::StackCommitId(40),
+    );
+    state.stack_commitments.insert(
+        ObjectId(73_001),
+        crate::types::identifiers::StackCommitId(90),
+    );
+    state.next_stack_commit_id = 91;
+    state.auto_pass.insert(
+        PlayerId(0),
+        AutoPassSession::new(
+            PlayerId(0),
+            AutoPassMode::UntilTurnBoundary {
+                until: TurnBoundary::EndOfCurrentTurn,
+                policy: TurnPassPolicy::UntilResponse,
+                stack_baseline: Some(
+                    [
+                        crate::types::identifiers::StackCommitId(40),
+                        crate::types::identifiers::StackCommitId(999),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+            },
+        ),
+    );
+
+    let normalized = state.normalize_for_loop();
+    assert_eq!(normalized.next_stack_commit_id, 2);
+    assert_eq!(
+        normalized.stack_commitments[&ObjectId(73_000)],
+        crate::types::identifiers::StackCommitId(0)
+    );
+    let AutoPassMode::UntilTurnBoundary {
+        stack_baseline: Some(baseline),
+        ..
+    } = &normalized.auto_pass[&PlayerId(0)].mode
+    else {
+        panic!("expected canonical turn session")
+    };
+    assert_eq!(
+        baseline.iter().copied().collect::<Vec<_>>(),
+        vec![crate::types::identifiers::StackCommitId(0)]
+    );
+}
+
+#[test]
+fn nonpriority_prompt_cancels_only_its_authenticated_requester() {
+    let mut state = priority_state();
+    let p0 = turn_session(&mut state, PlayerId(0), TurnPassPolicy::PassTurn);
+    let p1 = turn_session(&mut state, PlayerId(1), TurnPassPolicy::PassTurn);
+    state.auto_pass.insert(PlayerId(0), p0);
+    state.auto_pass.insert(PlayerId(1), p1);
+    state.waiting_for = WaitingFor::ScryChoice {
+        player: PlayerId(0),
+        cards: vec![],
+    };
+    let mut result = ActionResult {
+        events: vec![],
+        waiting_for: state.waiting_for.clone(),
+        log_entries: vec![],
+    };
+    run_auto_pass_loop(&mut state, &mut result);
+    assert!(!state.auto_pass.contains_key(&PlayerId(0)));
+    assert!(state.auto_pass.contains_key(&PlayerId(1)));
+}
+
+#[test]
+fn one_shot_consumes_only_after_successful_priority_rules_decision() {
+    let mut state = priority_state();
+    state.phase_stops.insert(
+        PlayerId(0),
+        vec![one_shot_stop(
+            Phase::PreCombatMain,
+            PhaseStopScope::AllTurns,
+        )],
+    );
+
+    let rejected = apply(&mut state, PlayerId(1), GameAction::PassPriority);
+    assert!(rejected.is_err());
+    assert!(state.phase_stop_hit(PlayerId(0)));
+
+    apply(&mut state, PlayerId(0), GameAction::PassPriority).unwrap();
+    assert!(!state.phase_stop_hit(PlayerId(0)));
+}
+
+#[test]
+fn full_control_cancels_requester_session_and_suppresses_recommendation() {
+    let mut state = priority_state();
+    let session = turn_session(&mut state, PlayerId(0), TurnPassPolicy::PassTurn);
+    state.auto_pass.insert(PlayerId(0), session);
+    apply(
+        &mut state,
+        PlayerId(0),
+        GameAction::SetFullControl {
+            mode: FullControlMode::Locked,
+        },
+    )
+    .unwrap();
+    assert!(!state.auto_pass.contains_key(&PlayerId(0)));
+    assert!(!crate::ai_support::auto_pass_recommended(
+        &state,
+        &[GameAction::PassPriority]
+    ));
+}
+
+#[test]
+fn action_automation_classification_is_exact_for_control_actions() {
+    use crate::types::actions::ActionAutomationClass;
+
+    assert_eq!(
+        GameAction::PassPriority.automation_class(),
+        ActionAutomationClass::RulesDecision
+    );
+    assert_eq!(
+        GameAction::SetAutoPass {
+            mode: AutoPassRequest::UntilStackEmpty,
+        }
+        .automation_class(),
+        ActionAutomationClass::PriorityAutomationIntent
+    );
+    for action in [
+        GameAction::CancelAutoPass,
+        GameAction::SetFullControl {
+            mode: FullControlMode::Held,
+        },
+        GameAction::SetPhaseStops { stops: vec![] },
+        GameAction::ReorderHand { order: vec![] },
+    ] {
+        assert_eq!(
+            action.automation_class(),
+            ActionAutomationClass::OutOfBandPreference
+        );
+    }
+}
+
+#[test]
+fn malformed_duplicate_stack_rejects_set_auto_pass() {
+    let mut state = priority_state();
+    push_simple_stack_entry(&mut state, 74_000, PlayerId(0));
+    push_simple_stack_entry(&mut state, 74_000, PlayerId(0));
+    let result = apply(
+        &mut state,
+        PlayerId(0),
+        GameAction::SetAutoPass {
+            mode: AutoPassRequest::UntilStackEmpty,
+        },
+    );
+    assert!(result.is_err());
+    assert!(state.auto_pass.is_empty());
+}
+
+#[test]
+fn provisional_stack_entry_is_committed_only_when_priority_is_exposed() {
+    let mut state = priority_state();
+    push_simple_stack_entry(&mut state, 75_000, PlayerId(0));
+    state.waiting_for = WaitingFor::ScryChoice {
+        player: PlayerId(0),
+        cards: vec![],
+    };
+    finalize_rules_state(&mut state);
+    assert!(state.stack_commitments.is_empty());
+
+    state.waiting_for = WaitingFor::Priority {
+        player: PlayerId(0),
+    };
+    finalize_rules_state(&mut state);
+    assert!(state.stack_commitments.contains_key(&ObjectId(75_000)));
+}
+
+#[test]
+fn one_shot_is_not_consumed_by_intent_preference_or_nonpriority_rules() {
+    let mut state = priority_state();
+    let stop = one_shot_stop(Phase::PreCombatMain, PhaseStopScope::AllTurns);
+    state.phase_stops.insert(PlayerId(0), vec![stop]);
+    apply(
+        &mut state,
+        PlayerId(0),
+        GameAction::SetAutoPass {
+            mode: AutoPassRequest::UntilStackEmpty,
+        },
+    )
+    .unwrap();
+    assert_eq!(state.phase_stops[&PlayerId(0)], vec![stop]);
+
+    apply(
+        &mut state,
+        PlayerId(0),
+        GameAction::SetFullControl {
+            mode: FullControlMode::Held,
+        },
+    )
+    .unwrap();
+    assert_eq!(state.phase_stops[&PlayerId(0)], vec![stop]);
+
+    state.waiting_for = WaitingFor::ScryChoice {
+        player: PlayerId(0),
+        cards: vec![],
+    };
+    apply(
+        &mut state,
+        PlayerId(0),
+        GameAction::SelectCards { cards: vec![] },
+    )
+    .unwrap();
+    assert_eq!(state.phase_stops[&PlayerId(0)], vec![stop]);
+}
+
+#[test]
+fn yielded_new_opponent_occurrence_does_not_interrupt_until_response() {
+    let mut state = priority_state();
+    let session = turn_session(&mut state, PlayerId(0), TurnPassPolicy::UntilResponse);
+    state.auto_pass.insert(PlayerId(0), session);
+    let source = ObjectId(76_000);
+    push_yieldable_trigger(&mut state, ObjectId(76_001), source, PlayerId(1));
+    state.add_priority_yield(
+        PlayerId(0),
+        YieldTarget::ThisObject {
+            source_id: source,
+            incarnation: None,
+            trigger_description: None,
+        },
+    );
+    assert!(is_pass(&priority_auto_pass_decision(
+        &mut state,
+        PlayerId(0)
+    )));
+}
+
+#[test]
+fn requester_authority_change_cancels_semantic_seat_session() {
+    let mut state = priority_state();
+    state.turn_decision_controller = Some(PlayerId(1));
+    state.auto_pass.insert(
+        PlayerId(0),
+        AutoPassSession::new(
+            PlayerId(1),
+            AutoPassMode::UntilTurnBoundary {
+                until: TurnBoundary::EndOfCurrentTurn,
+                policy: TurnPassPolicy::PassTurn,
+                stack_baseline: Some(Default::default()),
+            },
+        ),
+    );
+    assert!(is_pass(&priority_auto_pass_decision(
+        &mut state,
+        PlayerId(0)
+    )));
+    state.turn_decision_controller = None;
+    assert!(is_finish(&priority_auto_pass_decision(
+        &mut state,
+        PlayerId(0)
+    )));
+}
+
+#[test]
+fn controlled_turn_deliberate_action_cancels_semantic_seat_session() {
+    let mut state = priority_state();
+    state.turn_decision_controller = Some(PlayerId(1));
+    state.priority_player = PlayerId(1);
+    let source_id = add_non_mana_activated_artifact(&mut state, PlayerId(0));
+    let session = turn_session(&mut state, PlayerId(1), TurnPassPolicy::UntilResponse);
+    state.auto_pass.insert(PlayerId(0), session);
+    assert_eq!(
+        state
+            .auto_pass
+            .get(&PlayerId(0))
+            .and_then(|session| session.requested_by),
+        Some(PlayerId(1)),
+        "turn controller arms the semantic active-player seat"
+    );
+
+    apply(
+        &mut state,
+        PlayerId(1),
+        GameAction::ActivateAbility {
+            source_id,
+            ability_index: 0,
+        },
+    )
+    .unwrap();
+    assert!(
+        state
+            .auto_pass
+            .values()
+            .all(|session| session.requested_by != Some(PlayerId(1))),
+        "the controller's deliberate action cancels the session keyed by the controlled seat"
+    );
+}
+
+#[test]
+fn shared_team_turns_reject_product_automation_and_recommendation() {
+    let mut state = GameState::new(
+        crate::types::format::FormatConfig::two_headed_giant(),
+        4,
+        42,
+    );
+    state.waiting_for = WaitingFor::Priority {
+        player: PlayerId(0),
+    };
+    state.priority_player = PlayerId(0);
+    assert!(apply(
+        &mut state,
+        PlayerId(0),
+        GameAction::SetAutoPass {
+            mode: AutoPassRequest::UntilStackEmpty,
+        },
+    )
+    .is_err());
+    assert!(!crate::ai_support::auto_pass_recommended(
+        &state,
+        &[GameAction::PassPriority]
+    ));
 }

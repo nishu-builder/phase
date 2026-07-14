@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 /// A turn consists of five phases: beginning, precombat main, combat,
 /// postcombat main, and ending. The beginning, combat, and ending phases
 /// are further broken down into steps.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 pub enum Phase {
     // --- Beginning phase (CR 501.1): untap, upkeep, draw ---
     /// CR 502: Untap step. No player receives priority (CR 502.4).
@@ -79,7 +81,9 @@ impl Phase {
 /// turns a stop fires, by comparing the stop's owner against the active player.
 ///
 /// CR 102.1: The active player is the player whose turn it is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
 pub enum PhaseStopScope {
     /// Fire on every turn (legacy behavior; the migration default).
     #[default]
@@ -90,16 +94,31 @@ pub enum PhaseStopScope {
     OpponentsTurns,
 }
 
+/// Whether a phase stop remains after it is honored.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
+pub enum PhaseStopRetention {
+    /// Legacy behavior: the stop remains until the player changes it.
+    #[default]
+    Persistent,
+    /// Arena-style stop: consume after the player's next successful rules
+    /// decision from priority in the stopped phase.
+    OneShot,
+}
+
 /// A single phase stop: the phase to pause at, plus the turn-direction scope.
 ///
 /// Backward compatibility: older persisted/serialized stops were a bare `Phase`
 /// string. `#[serde(from = "PhaseStopCompat")]` accepts both the legacy bare
 /// string (→ `AllTurns`) and the new `{ phase, scope }` object form.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(from = "PhaseStopCompat")]
 pub struct PhaseStop {
     pub phase: Phase,
     pub scope: PhaseStopScope,
+    #[serde(default)]
+    pub retention: PhaseStopRetention,
 }
 
 impl PhaseStop {
@@ -123,6 +142,8 @@ enum PhaseStopCompat {
         phase: Phase,
         #[serde(default)]
         scope: PhaseStopScope,
+        #[serde(default)]
+        retention: PhaseStopRetention,
     },
     Bare(Phase),
 }
@@ -130,10 +151,19 @@ enum PhaseStopCompat {
 impl From<PhaseStopCompat> for PhaseStop {
     fn from(compat: PhaseStopCompat) -> Self {
         match compat {
-            PhaseStopCompat::Scoped { phase, scope } => PhaseStop { phase, scope },
+            PhaseStopCompat::Scoped {
+                phase,
+                scope,
+                retention,
+            } => PhaseStop {
+                phase,
+                scope,
+                retention,
+            },
             PhaseStopCompat::Bare(phase) => PhaseStop {
                 phase,
                 scope: PhaseStopScope::AllTurns,
+                retention: PhaseStopRetention::Persistent,
             },
         }
     }
@@ -199,6 +229,7 @@ mod tests {
             PhaseStop {
                 phase: Phase::PreCombatMain,
                 scope: PhaseStopScope::AllTurns,
+                retention: crate::types::phase::PhaseStopRetention::Persistent,
             }
         );
     }
@@ -208,6 +239,7 @@ mod tests {
         let stop = PhaseStop {
             phase: Phase::DeclareBlockers,
             scope: PhaseStopScope::OpponentsTurns,
+            retention: crate::types::phase::PhaseStopRetention::Persistent,
         };
         let serialized = serde_json::to_string(&stop).unwrap();
         // Serialize always emits the scoped object form, never a bare string.
@@ -224,6 +256,7 @@ mod tests {
             PhaseStop {
                 phase: Phase::Upkeep,
                 scope: PhaseStopScope::AllTurns,
+                retention: crate::types::phase::PhaseStopRetention::Persistent,
             }
         );
     }
@@ -237,6 +270,7 @@ mod tests {
         let all = PhaseStop {
             phase: Phase::Upkeep,
             scope: PhaseStopScope::AllTurns,
+            retention: crate::types::phase::PhaseStopRetention::Persistent,
         };
         assert!(all.applies(owner, same));
         assert!(all.applies(owner, other));
@@ -244,6 +278,7 @@ mod tests {
         let own = PhaseStop {
             phase: Phase::Upkeep,
             scope: PhaseStopScope::OwnTurn,
+            retention: crate::types::phase::PhaseStopRetention::Persistent,
         };
         assert!(own.applies(owner, same));
         assert!(!own.applies(owner, other));
@@ -251,6 +286,7 @@ mod tests {
         let opp = PhaseStop {
             phase: Phase::Upkeep,
             scope: PhaseStopScope::OpponentsTurns,
+            retention: crate::types::phase::PhaseStopRetention::Persistent,
         };
         assert!(!opp.applies(owner, same));
         assert!(opp.applies(owner, other));

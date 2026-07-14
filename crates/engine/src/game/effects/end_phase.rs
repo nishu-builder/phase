@@ -26,6 +26,7 @@ pub(super) fn exile_nonresolving_stack_objects(
     events: &mut Vec<GameEvent>,
 ) -> bool {
     while let Some(entry) = state.stack.pop_back() {
+        state.prune_stack_commitment(entry.id);
         state.stack_paid_facts.remove(&entry.id);
         state.stack_trigger_event_batches.remove(&entry.id);
         if matches!(entry.kind, StackEntryKind::Spell { .. }) {

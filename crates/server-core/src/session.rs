@@ -631,6 +631,7 @@ impl GameSession {
         let fresh_seed: u64 = rand::rng().random();
         state.rng_seed = fresh_seed;
         state.rng = rand_chacha::ChaCha20Rng::seed_from_u64(fresh_seed);
+        state.restore_priority_automation();
         finalize_public_state(&mut state);
 
         let ai_seats: HashSet<PlayerId> = ps.ai_seats.iter().map(|&s| PlayerId(s)).collect();
@@ -1057,31 +1058,16 @@ impl SessionManager {
             _ => {}
         }
 
-        // CancelAutoPass: any valid player can cancel their own flag regardless of whose turn it is.
-        // This allows canceling UntilEndOfTurn while the opponent has priority.
-        if matches!(action, GameAction::CancelAutoPass) {
-            session.state.auto_pass.remove(&player);
-            let (new_legal_actions, spell_costs, by_object) =
-                engine_legal_actions_full(&session.state);
-            let auto_pass = auto_pass_recommended(&session.state, &new_legal_actions);
-            return Ok((
-                session.state.clone(),
-                vec![],
-                new_legal_actions,
-                vec![],
-                auto_pass,
-                spell_costs,
-                by_object,
-            ));
-        }
-
-        // SetPhaseStops: per-player preference keyed to the authenticated player,
-        // not the priority holder. Bypasses the turn/legal-action prechecks (any
-        // player may adjust their own stops at any time) and delegates the
-        // mutation to the engine (single authority — the write handler keys by
-        // `actor`, i.e. the authenticated player). Not an undo point → no
-        // takeback snapshot. CR 102.1 (scope resolves against the active player).
-        if matches!(action, GameAction::SetPhaseStops { .. }) {
+        // Priority controls are keyed to the authenticated player, not the
+        // priority holder. Bypass the turn/legal-action prechecks and delegate
+        // cancellation, stops, and Full Control to the engine as their single
+        // authority. These preferences are not undo points.
+        if matches!(
+            action,
+            GameAction::CancelAutoPass
+                | GameAction::SetPhaseStops { .. }
+                | GameAction::SetFullControl { .. }
+        ) {
             let result = apply(&mut session.state, player, action).map_err(|e| {
                 warn!(game = %game_code, player = ?player, error = %e, reason = "engine_error", "action rejected");
                 format!("Engine error: {}", e)
@@ -1470,9 +1456,9 @@ mod tests {
     use engine::game::deck_loading::DeckEntry;
     use engine::types::card::CardFace;
     use engine::types::card_type::CardType;
-    use engine::types::game_state::WaitingFor;
+    use engine::types::game_state::{AutoPassMode, AutoPassSession, FullControlMode, WaitingFor};
     use engine::types::mana::ManaCost;
-    use engine::types::phase::{Phase, PhaseStop, PhaseStopScope};
+    use engine::types::phase::{Phase, PhaseStop, PhaseStopRetention, PhaseStopScope};
     use seat_reducer::types::SeatMutation;
 
     fn make_deck() -> PlayerDeckPayload {
@@ -1982,6 +1968,7 @@ mod tests {
         let stops = vec![PhaseStop {
             phase: Phase::DeclareBlockers,
             scope: PhaseStopScope::OpponentsTurns,
+            retention: PhaseStopRetention::Persistent,
         }];
         let result = mgr.handle_action(
             &code,
@@ -2006,6 +1993,84 @@ mod tests {
             !state.phase_stops.contains_key(&priority_player),
             "the priority holder's entry must remain untouched"
         );
+    }
+
+    #[test]
+    fn controlled_turn_cancel_auto_pass_removes_semantic_seat_session() {
+        let (mut mgr, code, _token0, token1) = setup_two_player_game();
+        {
+            let state = &mut mgr.sessions.get_mut(&code).unwrap().state;
+            state.active_player = PlayerId(0);
+            state.waiting_for = WaitingFor::Priority {
+                player: PlayerId(0),
+            };
+            state.turn_decision_controller = Some(PlayerId(1));
+            state.priority_player = PlayerId(1);
+            state.auto_pass.insert(
+                PlayerId(0),
+                AutoPassSession::new(
+                    PlayerId(1),
+                    AutoPassMode::UntilStackEmpty {
+                        initial_stack_len: 1,
+                    },
+                ),
+            );
+        }
+
+        mgr.handle_action(&code, &token1, GameAction::CancelAutoPass)
+            .unwrap();
+
+        let state = &mgr.sessions.get(&code).unwrap().state;
+        assert!(!state.auto_pass.contains_key(&PlayerId(0)));
+    }
+
+    #[test]
+    fn nonpriority_player_can_release_held_full_control() {
+        let (mut mgr, code, token0, token1) = setup_two_player_game();
+        let (non_priority_player, non_priority_token) = {
+            let state = &mgr.sessions.get(&code).unwrap().state;
+            match &state.waiting_for {
+                WaitingFor::Priority {
+                    player: PlayerId(0),
+                } => (PlayerId(1), token1),
+                WaitingFor::Priority { .. } => (PlayerId(0), token0),
+                other => panic!("expected Priority, got {other:?}"),
+            }
+        };
+
+        mgr.handle_action(
+            &code,
+            &non_priority_token,
+            GameAction::SetFullControl {
+                mode: FullControlMode::Held,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            mgr.sessions
+                .get(&code)
+                .unwrap()
+                .state
+                .full_control
+                .get(&non_priority_player),
+            Some(&FullControlMode::Held)
+        );
+
+        mgr.handle_action(
+            &code,
+            &non_priority_token,
+            GameAction::SetFullControl {
+                mode: FullControlMode::Off,
+            },
+        )
+        .unwrap();
+        assert!(!mgr
+            .sessions
+            .get(&code)
+            .unwrap()
+            .state
+            .full_control
+            .contains_key(&non_priority_player));
     }
 
     /// `ReorderHand` succeeds even when the sender is not the priority holder.

@@ -7618,6 +7618,7 @@ fn handle_resolution_cast_rejection(
     // zone move in `finalize_cast_with_phyrexian_choices`.
     if let Some(pos) = state.stack.iter().rposition(|entry| entry.id == object_id) {
         state.stack.remove(pos);
+        state.prune_stack_commitment(object_id);
     }
 
     match reject_action {

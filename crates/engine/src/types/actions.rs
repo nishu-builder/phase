@@ -4,8 +4,8 @@ use super::ability::{LibraryPosition, TargetRef};
 use super::counter::CounterType;
 use super::game_state::{
     AutoMayChoice, AutoPassRequest, CastPaymentMode, CombatDamageAssignmentMode, CounterCostChoice,
-    CounterMoveChoice, CounterRemoveChoice, MayTriggerAutoChoiceKey, ShardChoice, YieldScope,
-    YieldTarget,
+    CounterMoveChoice, CounterRemoveChoice, FullControlMode, MayTriggerAutoChoiceKey, ShardChoice,
+    YieldScope, YieldTarget,
 };
 use super::identifiers::{CardId, ObjectId};
 use super::keywords::Keyword;
@@ -612,6 +612,11 @@ pub enum GameAction {
     },
     /// Cancel any active auto-pass for the acting player.
     CancelAutoPass,
+    /// Set the actor's Arena-style full-control preference. This is private,
+    /// actor-scoped preference state and is legal in any `WaitingFor` state.
+    SetFullControl {
+        mode: FullControlMode,
+    },
     /// Replace the acting player's phase-stop preference list. Phase stops
     /// interrupt an `UntilTurnBoundary` auto-pass session and prevent the engine
     /// from auto-submitting empty blocker declarations during the named phases.
@@ -815,6 +820,17 @@ pub enum GameAction {
     /// Restores ordinary priority instead of forcing a proposal. Carries no payload
     /// (no template/count/response — it is the absence of a proposal).
     DeclineShortcut,
+}
+
+/// Whether an action participates in the engine's product priority drive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionAutomationClass {
+    /// An ordinary in-band game-rules decision.
+    RulesDecision,
+    /// An in-band request to arm product automation.
+    PriorityAutomationIntent,
+    /// Actor-scoped preference state; never advances rules or automation.
+    OutOfBandPreference,
 }
 
 /// CR 117.3d: The mutation a `GameAction::SetPriorityYield` performs on the
@@ -1353,6 +1369,11 @@ fn default_one() -> u32 {
 }
 
 impl GameAction {
+    /// Engine-owned action classification for automation dispatch.
+    pub fn automation_class(&self) -> ActionAutomationClass {
+        self.source_and_automation_class().1
+    }
+
     /// Returns the enum variant name as a static string (e.g., `"CastSpell"`, `"PassPriority"`).
     /// Useful for structured logging without the full `Debug` representation.
     pub fn variant_name(&self) -> &'static str {
@@ -1393,48 +1414,67 @@ impl GameAction {
     /// EXHAUSTIVE: every variant must be classified. Adding a new variant
     /// without updating this method is a compile-time error.
     pub fn source_object(&self) -> Option<ObjectId> {
+        self.source_and_automation_class().0
+    }
+
+    /// One wildcard-free authority for both public action classifications.
+    /// A future action cannot compile until both its source and automation
+    /// semantics are chosen explicitly.
+    fn source_and_automation_class(&self) -> (Option<ObjectId>, ActionAutomationClass) {
         match self {
-            GameAction::PlayLand { object_id, .. } => Some(*object_id),
-            GameAction::CastSpell { object_id, .. } => Some(*object_id),
-            GameAction::Foretell { object_id, .. } => Some(*object_id),
-            GameAction::CastSpellAsSneak { hand_object, .. } => Some(*hand_object),
-            GameAction::CastSpellAsWebSlinging { hand_object, .. } => Some(*hand_object),
+            GameAction::PlayLand { object_id, .. } => (Some(*object_id), ActionAutomationClass::RulesDecision),
+            GameAction::CastSpell { object_id, .. } => (Some(*object_id), ActionAutomationClass::RulesDecision),
+            GameAction::Foretell { object_id, .. } => (Some(*object_id), ActionAutomationClass::RulesDecision),
+            GameAction::CastSpellAsSneak { hand_object, .. } => (Some(*hand_object), ActionAutomationClass::RulesDecision),
+            GameAction::CastSpellAsWebSlinging { hand_object, .. } => (Some(*hand_object), ActionAutomationClass::RulesDecision),
             GameAction::ActivateNinjutsu {
                 ninjutsu_object_id, ..
-            } => Some(*ninjutsu_object_id),
+            } => (Some(*ninjutsu_object_id), ActionAutomationClass::RulesDecision),
             GameAction::CastSpellForFree { object_id, .. }
             | GameAction::CastSpellAsMiracle { object_id, .. }
-            | GameAction::CastSpellAsMadness { object_id, .. } => Some(*object_id),
-            GameAction::ActivateAbility { source_id, .. } => Some(*source_id),
-            GameAction::TapLandForMana { object_id } => Some(*object_id),
-            GameAction::UntapLandForMana { object_id } => Some(*object_id),
+            | GameAction::CastSpellAsMadness { object_id, .. } => (Some(*object_id), ActionAutomationClass::RulesDecision),
+            GameAction::ActivateAbility { source_id, .. } => (Some(*source_id), ActionAutomationClass::RulesDecision),
+            GameAction::TapLandForMana { object_id } => (Some(*object_id), ActionAutomationClass::RulesDecision),
+            GameAction::UntapLandForMana { object_id } => (Some(*object_id), ActionAutomationClass::RulesDecision),
             // CR 118.3a: act on a pool pip, not a battlefield object.
-            GameAction::SpendPoolMana { .. } | GameAction::UnspendPoolMana { .. } => None,
-            GameAction::Equip { equipment_id, .. } => Some(*equipment_id),
-            GameAction::CrewVehicle { vehicle_id, .. } => Some(*vehicle_id),
-            GameAction::ActivateStation { spacecraft_id, .. } => Some(*spacecraft_id),
-            GameAction::SaddleMount { mount_id, .. } => Some(*mount_id),
-            GameAction::Transform { object_id } => Some(*object_id),
-            GameAction::UnlockRoomDoor { object_id, .. } => Some(*object_id),
-            GameAction::ChooseRoomDoor { object_id, .. } => Some(*object_id),
-            GameAction::PlayFaceDown { object_id, .. } => Some(*object_id),
-            GameAction::TurnFaceUp { object_id } => Some(*object_id),
-            GameAction::ChooseRingBearer { target } => Some(*target),
-            GameAction::ChoosePair { partner } => *partner,
-            GameAction::ChooseDamageSource { source } => Some(*source),
-            GameAction::ChooseUntap { object_id, .. } => Some(*object_id),
-            GameAction::ChooseEnlist { target } => *target,
-            GameAction::TapForConvoke { object_id, .. } => Some(*object_id),
-            GameAction::ChooseLegend { keep } => Some(*keep),
-            GameAction::CastPreparedCopy { source } => Some(*source),
-            GameAction::CastParadigmCopy { source } => Some(*source),
+            GameAction::SpendPoolMana { .. } | GameAction::UnspendPoolMana { .. } => (None, ActionAutomationClass::RulesDecision),
+            GameAction::Equip { equipment_id, .. } => (Some(*equipment_id), ActionAutomationClass::RulesDecision),
+            GameAction::CrewVehicle { vehicle_id, .. } => (Some(*vehicle_id), ActionAutomationClass::RulesDecision),
+            GameAction::ActivateStation { spacecraft_id, .. } => (Some(*spacecraft_id), ActionAutomationClass::RulesDecision),
+            GameAction::SaddleMount { mount_id, .. } => (Some(*mount_id), ActionAutomationClass::RulesDecision),
+            GameAction::Transform { object_id } => (Some(*object_id), ActionAutomationClass::RulesDecision),
+            GameAction::UnlockRoomDoor { object_id, .. } => (Some(*object_id), ActionAutomationClass::RulesDecision),
+            GameAction::ChooseRoomDoor { object_id, .. } => (Some(*object_id), ActionAutomationClass::RulesDecision),
+            GameAction::PlayFaceDown { object_id, .. } => (Some(*object_id), ActionAutomationClass::RulesDecision),
+            GameAction::TurnFaceUp { object_id } => (Some(*object_id), ActionAutomationClass::RulesDecision),
+            GameAction::ChooseRingBearer { target } => (Some(*target), ActionAutomationClass::RulesDecision),
+            GameAction::ChoosePair { partner } => (*partner, ActionAutomationClass::RulesDecision),
+            GameAction::ChooseDamageSource { source } => (Some(*source), ActionAutomationClass::RulesDecision),
+            GameAction::ChooseUntap { object_id, .. } => (Some(*object_id), ActionAutomationClass::RulesDecision),
+            GameAction::ChooseEnlist { target } => (*target, ActionAutomationClass::RulesDecision),
+            GameAction::TapForConvoke { object_id, .. } => (Some(*object_id), ActionAutomationClass::RulesDecision),
+            GameAction::ChooseLegend { keep } => (Some(*keep), ActionAutomationClass::RulesDecision),
+            GameAction::CastPreparedCopy { source } => (Some(*source), ActionAutomationClass::RulesDecision),
+            GameAction::CastParadigmCopy { source } => (Some(*source), ActionAutomationClass::RulesDecision),
+            GameAction::SetAutoPass { .. } => (
+                None,
+                ActionAutomationClass::PriorityAutomationIntent,
+            ),
+            GameAction::CancelAutoPass
+            | GameAction::SetFullControl { .. }
+            | GameAction::SetPhaseStops { .. }
+            | GameAction::SetPriorityYield { .. }
+            | GameAction::SetMayTriggerAutoChoice { .. }
+            | GameAction::SetTriggerOrderTemplate { .. }
+            | GameAction::ReorderHand { .. } => {
+                (None, ActionAutomationClass::OutOfBandPreference)
+            }
             // Actions with no per-permanent anchor.
             GameAction::PassPriority
             | GameAction::ChooseExert { .. }
             | GameAction::DeclareAttackers { .. }
             | GameAction::DeclareBlockers { .. }
             | GameAction::MulliganDecision { .. }
-            | GameAction::ReorderHand { .. }
             | GameAction::SelectCards { .. }
             | GameAction::ChooseRemoveCounterCostDistribution { .. }
             | GameAction::SelectCoinFlips { .. }
@@ -1487,12 +1527,6 @@ impl GameAction {
             | GameAction::ChooseAssistPlayer { .. }
             | GameAction::CommitAssistPayment { .. }
             | GameAction::ChooseBattleProtector { .. }
-            | GameAction::SetAutoPass { .. }
-            | GameAction::CancelAutoPass
-            | GameAction::SetPhaseStops { .. }
-            | GameAction::SetPriorityYield { .. }
-            | GameAction::SetMayTriggerAutoChoice { .. }
-            | GameAction::SetTriggerOrderTemplate { .. }
             | GameAction::AssignCombatDamage { .. }
             | GameAction::AssignBlockerDamage { .. }
             | GameAction::DistributeAmong { .. }
@@ -1517,7 +1551,7 @@ impl GameAction {
             | GameAction::DeclareShortcut { .. }
             | GameAction::RespondToShortcut { .. }
             | GameAction::DeclineShortcut
-            | GameAction::ChooseActivationCostBranch { .. } => None,
+            | GameAction::ChooseActivationCostBranch { .. } => (None, ActionAutomationClass::RulesDecision),
         }
     }
 }

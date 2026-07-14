@@ -22,7 +22,7 @@ use super::card_type::{CoreType, Supertype};
 use super::counter::{counter_map_serde, CounterMatch, CounterType};
 use super::events::{GameEvent, PlayerActionKind};
 use super::format::FormatConfig;
-use super::identifiers::{CardId, ObjectId, ObjectIncarnationRef, TrackedSetId};
+use super::identifiers::{CardId, ObjectId, ObjectIncarnationRef, StackCommitId, TrackedSetId};
 use super::keywords::{Keyword, KeywordKind};
 use super::mana::{ManaColor, ManaCost, ManaPipId, ManaType, ManaUnit, StepEndManaAction};
 use super::match_config::{MatchConfig, MatchPhase, MatchScore};
@@ -5839,6 +5839,27 @@ pub enum TurnBoundary {
     MyNextTurnStart,
 }
 
+/// How an armed turn-boundary pass treats later stack activity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum TurnPassPolicy {
+    /// Stop when an opponent commits a new, non-yielded stack object.
+    #[default]
+    UntilResponse,
+    /// Continue through stack activity until a stop, prompt, or turn boundary.
+    PassTurn,
+}
+
+/// Arena-style full-control preference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum FullControlMode {
+    #[default]
+    Off,
+    /// Held while the client keeps the full-control chord depressed.
+    Held,
+    /// Latched until explicitly switched off.
+    Locked,
+}
+
 /// What the frontend requests for auto-pass (no internal state).
 ///
 /// Phase stops that should interrupt a turn-boundary session are a separate
@@ -5857,11 +5878,13 @@ pub enum AutoPassRequest {
     UntilTurnBoundary {
         #[serde(default)]
         until: TurnBoundary,
+        #[serde(default)]
+        policy: TurnPassPolicy,
     },
 }
 
 /// What the engine stores for auto-pass (includes captured state).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum AutoPassMode {
     /// Auto-pass while stack is non-empty. Clears when stack empties or grows
@@ -5882,7 +5905,57 @@ pub enum AutoPassMode {
     UntilTurnBoundary {
         #[serde(default)]
         until: TurnBoundary,
+        #[serde(default)]
+        policy: TurnPassPolicy,
+        /// Snapshot of stack occurrences present when the session was armed.
+        /// `None` is an invalid legacy/malformed session; `Some(empty)` is a
+        /// valid baseline captured with an empty stack.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stack_baseline: Option<BTreeSet<StackCommitId>>,
     },
+}
+
+/// Stored, semantic-seat-keyed priority automation session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "AutoPassSessionCompat")]
+pub struct AutoPassSession {
+    /// Authenticated submitter that armed the semantic seat's session.
+    /// `None` exists only for legacy saves and fails closed on restore/drive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_by: Option<PlayerId>,
+    pub mode: AutoPassMode,
+}
+
+impl AutoPassSession {
+    pub fn new(requested_by: PlayerId, mode: AutoPassMode) -> Self {
+        Self {
+            requested_by: Some(requested_by),
+            mode,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AutoPassSessionCompat {
+    Session {
+        #[serde(default)]
+        requested_by: Option<PlayerId>,
+        mode: AutoPassMode,
+    },
+    Legacy(AutoPassMode),
+}
+
+impl From<AutoPassSessionCompat> for AutoPassSession {
+    fn from(value: AutoPassSessionCompat) -> Self {
+        match value {
+            AutoPassSessionCompat::Session { requested_by, mode } => Self { requested_by, mode },
+            AutoPassSessionCompat::Legacy(mode) => Self {
+                requested_by: None,
+                mode,
+            },
+        }
+    }
 }
 
 /// CR 732.2a: user-controllable gate for the live combo (infinite-loop) detector.
@@ -6781,6 +6854,12 @@ pub struct GameState {
     // Shared zones
     pub battlefield: im::Vector<ObjectId>,
     pub stack: im::Vector<StackEntry>,
+    /// Private engine identity for each live occurrence on the stack.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub stack_commitments: BTreeMap<ObjectId, StackCommitId>,
+    /// Next occurrence id minted by [`GameState::reconcile_stack_commitments`].
+    #[serde(default)]
+    pub next_stack_commit_id: u64,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub stack_paid_facts: HashMap<ObjectId, StackPaidSnapshot>,
     pub exile: im::Vector<ObjectId>,
@@ -7329,7 +7408,11 @@ pub struct GameState {
     pub priority_passes: BTreeSet<PlayerId>,
     /// Per-player auto-pass flags. When set, the engine auto-passes for this player.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub auto_pass: HashMap<PlayerId, AutoPassMode>,
+    pub auto_pass: HashMap<PlayerId, AutoPassSession>,
+
+    /// Per-player private full-control preference.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub full_control: HashMap<PlayerId, FullControlMode>,
 
     /// Per-player phase-stop preferences. While a player's `UntilTurnBoundary`
     /// auto-pass session is active, the engine will interrupt auto-pass whenever
@@ -9515,6 +9598,133 @@ impl GameState {
         })
     }
 
+    /// Return the applicable stop for `player`, if any. Keeping this typed
+    /// lookup in the engine lets automation and recommendation share exactly
+    /// the same scope semantics.
+    pub fn applicable_phase_stop(&self, player: PlayerId) -> Option<PhaseStop> {
+        self.phase_stops.get(&player).and_then(|stops| {
+            stops
+                .iter()
+                .copied()
+                .find(|stop| stop.phase == self.phase && stop.applies(player, self.active_player))
+        })
+    }
+
+    /// Whether the player has either held or locked full control.
+    pub fn full_control_active(&self, player: PlayerId) -> bool {
+        matches!(
+            self.full_control.get(&player),
+            Some(FullControlMode::Held | FullControlMode::Locked)
+        )
+    }
+
+    /// Reconcile the private occurrence-id side map with the authoritative
+    /// stack. Existing occurrences retain their id; newly-visible occurrences
+    /// are minted bottom-to-top. Duplicate stack ids, duplicate commitment ids,
+    /// and counter overflow fail closed by cancelling product automation and
+    /// rebuilding a safe canonical map.
+    pub fn reconcile_stack_commitments(&mut self) -> bool {
+        let commitments_valid = self.prune_and_validate_stack_commitments();
+
+        for entry in &self.stack {
+            if self.stack_commitments.contains_key(&entry.id) {
+                continue;
+            }
+            let Some(next) = self.next_stack_commit_id.checked_add(1) else {
+                self.auto_pass.clear();
+                self.stack_commitments.clear();
+                self.next_stack_commit_id = 0;
+                return false;
+            };
+            self.stack_commitments
+                .insert(entry.id, StackCommitId(self.next_stack_commit_id));
+            self.next_stack_commit_id = next;
+        }
+
+        commitments_valid
+    }
+
+    /// Prune departed occurrences and validate persisted identity without
+    /// making a non-priority prompt expose a new stack occurrence identity.
+    fn prune_and_validate_stack_commitments(&mut self) -> bool {
+        let mut live_ids = BTreeSet::new();
+        let unique_stack_ids = self.stack.iter().all(|entry| live_ids.insert(entry.id));
+        self.stack_commitments
+            .retain(|object_id, _| live_ids.contains(object_id));
+
+        let mut commitment_ids = BTreeSet::new();
+        let unique_commitments = self
+            .stack_commitments
+            .values()
+            .all(|commitment| commitment_ids.insert(*commitment));
+        let counter_valid = self
+            .stack_commitments
+            .values()
+            .max()
+            .is_none_or(|max| self.next_stack_commit_id > max.0);
+
+        if !unique_stack_ids || !unique_commitments || !counter_valid {
+            self.auto_pass.clear();
+            self.stack_commitments.clear();
+            self.next_stack_commit_id = 0;
+        }
+
+        unique_stack_ids && unique_commitments && counter_valid
+    }
+
+    /// Eagerly prune a departed occurrence. Reconciliation remains the final
+    /// authority and will repair callers that create stack entries directly.
+    pub(crate) fn prune_stack_commitment(&mut self, object_id: ObjectId) {
+        self.stack_commitments.remove(&object_id);
+    }
+
+    /// Restore-time migration/validation for private priority automation.
+    /// Call after deserializing an authoritative state and before exposing it.
+    pub fn restore_priority_automation(&mut self) {
+        self.full_control
+            .retain(|_, mode| *mode != FullControlMode::Held);
+        if matches!(self.waiting_for, WaitingFor::Priority { .. }) {
+            self.reconcile_stack_commitments();
+        } else {
+            self.prune_and_validate_stack_commitments();
+        }
+        if self.format_config.topology().has_shared_team_turns() {
+            self.auto_pass.clear();
+            return;
+        }
+        let live_commitments: BTreeSet<_> = self.stack_commitments.values().copied().collect();
+        for session in self.auto_pass.values_mut() {
+            if let AutoPassMode::UntilTurnBoundary {
+                stack_baseline: Some(baseline),
+                ..
+            } = &mut session.mode
+            {
+                baseline.retain(|commitment| live_commitments.contains(commitment));
+            }
+        }
+        let valid_seats: BTreeSet<_> = self
+            .auto_pass
+            .iter()
+            .filter_map(|(semantic_seat, session)| {
+                let requester = session.requested_by?;
+                if crate::game::turn_control::authorized_submitter_for_player(self, *semantic_seat)
+                    != requester
+                {
+                    return None;
+                }
+                let valid = match &session.mode {
+                    AutoPassMode::UntilStackEmpty { .. } => true,
+                    AutoPassMode::UntilTurnBoundary { stack_baseline, .. } => {
+                        stack_baseline.is_some()
+                    }
+                };
+                valid.then_some(*semantic_seat)
+            })
+            .collect();
+        self.auto_pass
+            .retain(|semantic_seat, _| valid_seats.contains(semantic_seat));
+    }
+
     /// CR 730.2: True if `object_id` is an absorbed (non-surviving) component of
     /// some merged permanent. Such a component is part of one battlefield object
     /// (the merged permanent, identified by the surviving target's `ObjectId`) and
@@ -9654,6 +9864,8 @@ impl GameState {
             active_payment_pins: Vec::new(),
             battlefield: im::Vector::new(),
             stack: im::Vector::new(),
+            stack_commitments: BTreeMap::new(),
+            next_stack_commit_id: 0,
             stack_paid_facts: HashMap::new(),
             exile: im::Vector::new(),
             command_zone: im::Vector::new(),
@@ -9739,6 +9951,7 @@ impl GameState {
             commander_damage: Vec::new(),
             priority_passes: BTreeSet::new(),
             auto_pass: HashMap::new(),
+            full_control: HashMap::new(),
             phase_stops: HashMap::new(),
             lands_tapped_for_mana: HashMap::new(),
             prepaid_mulligan_bottoms: HashMap::new(),
@@ -10437,6 +10650,32 @@ impl GameState {
         clone.state_revision = 0;
         clone.next_timestamp = 0;
         clone.next_object_id = 0;
+        // Priority automation occurrences are identities, not rules state.
+        // Canonically renumber the live stack bottom-to-top and rewrite every
+        // active baseline through the same map. `None` remains invalid while a
+        // valid empty baseline remains `Some(empty)`.
+        let mut commitment_translation = BTreeMap::new();
+        clone.stack_commitments.clear();
+        for (index, entry) in clone.stack.iter().enumerate() {
+            let canonical = StackCommitId(index as u64);
+            if let Some(old) = self.stack_commitments.get(&entry.id) {
+                commitment_translation.insert(*old, canonical);
+            }
+            clone.stack_commitments.insert(entry.id, canonical);
+        }
+        clone.next_stack_commit_id = clone.stack.len() as u64;
+        for session in clone.auto_pass.values_mut() {
+            if let AutoPassMode::UntilTurnBoundary {
+                stack_baseline: Some(baseline),
+                ..
+            } = &mut session.mode
+            {
+                *baseline = baseline
+                    .iter()
+                    .filter_map(|old| commitment_translation.get(old).copied())
+                    .collect();
+            }
+        }
         // CR 104.4b: pip-id counter is a volatile monotonic field; zero it (like
         // next_object_id) so two otherwise-identical loop states compare equal.
         clone.next_pip_id = 0;
@@ -10654,6 +10893,8 @@ fn _gamestate_partition_is_total(s: &GameState) {
         active_payment_pins: _,
         battlefield: _,
         stack: _,
+        stack_commitments: _,
+        next_stack_commit_id: _,
         stack_paid_facts: _,
         exile: _,
         command_zone: _,
@@ -10735,6 +10976,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         commander_damage: _,
         priority_passes: _,
         auto_pass: _,
+        full_control: _,
         phase_stops: _,
         lands_tapped_for_mana: _,
         prepaid_mulligan_bottoms: _,
@@ -10968,6 +11210,8 @@ impl PartialEq for GameState {
             && self.next_pip_id == other.next_pip_id
             && self.battlefield == other.battlefield
             && self.stack == other.stack
+            && self.stack_commitments == other.stack_commitments
+            && self.next_stack_commit_id == other.next_stack_commit_id
             && self.stack_paid_facts == other.stack_paid_facts
             && self.exile == other.exile
             && self.command_zone == other.command_zone
@@ -11037,6 +11281,7 @@ impl PartialEq for GameState {
             && self.commander_damage == other.commander_damage
             && self.priority_passes == other.priority_passes
             && self.auto_pass == other.auto_pass
+            && self.full_control == other.full_control
             && self.phase_stops == other.phase_stops
             && self.lands_tapped_for_mana == other.lands_tapped_for_mana
             && self.match_config == other.match_config
@@ -11388,7 +11633,9 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<AutoPassMode>(r#"{"type":"UntilEndOfTurn"}"#).unwrap(),
             AutoPassMode::UntilTurnBoundary {
-                until: TurnBoundary::EndOfCurrentTurn
+                until: TurnBoundary::EndOfCurrentTurn,
+                policy: TurnPassPolicy::UntilResponse,
+                stack_baseline: None,
             }
         );
         assert_eq!(
@@ -11409,11 +11656,13 @@ mod tests {
     fn auto_pass_mode_roundtrips_both_boundaries() {
         let my_next = AutoPassMode::UntilTurnBoundary {
             until: TurnBoundary::MyNextTurnStart,
+            policy: TurnPassPolicy::UntilResponse,
+            stack_baseline: Some(Default::default()),
         };
         let json = serde_json::to_string(&my_next).unwrap();
         assert_eq!(
             json,
-            r#"{"type":"UntilTurnBoundary","until":"MyNextTurnStart"}"#
+            r#"{"type":"UntilTurnBoundary","until":"MyNextTurnStart","policy":"UntilResponse","stack_baseline":[]}"#
         );
         assert_eq!(
             serde_json::from_str::<AutoPassMode>(&json).unwrap(),
@@ -11422,10 +11671,12 @@ mod tests {
 
         let eot = AutoPassMode::UntilTurnBoundary {
             until: TurnBoundary::EndOfCurrentTurn,
+            policy: TurnPassPolicy::UntilResponse,
+            stack_baseline: Some(Default::default()),
         };
         assert_eq!(
             serde_json::to_string(&eot).unwrap(),
-            r#"{"type":"UntilTurnBoundary","until":"EndOfCurrentTurn"}"#
+            r#"{"type":"UntilTurnBoundary","until":"EndOfCurrentTurn","policy":"UntilResponse","stack_baseline":[]}"#
         );
     }
 
@@ -11436,8 +11687,117 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<AutoPassRequest>(r#"{"type":"UntilEndOfTurn"}"#).unwrap(),
             AutoPassRequest::UntilTurnBoundary {
-                until: TurnBoundary::EndOfCurrentTurn
+                until: TurnBoundary::EndOfCurrentTurn,
+                policy: TurnPassPolicy::UntilResponse,
             }
+        );
+    }
+
+    #[test]
+    fn restore_priority_automation_intersects_departed_baseline_and_drops_legacy_requester() {
+        let mut state = GameState::new_two_player(42);
+        for id in [ObjectId(81), ObjectId(82)] {
+            state.stack.push_back(StackEntry {
+                id,
+                source_id: id,
+                controller: PlayerId(0),
+                kind: StackEntryKind::KeywordAction {
+                    action: KeywordAction::Crew {
+                        vehicle_id: id,
+                        paid_creature_ids: vec![],
+                    },
+                },
+            });
+        }
+        assert!(state.reconcile_stack_commitments());
+        let baseline: BTreeSet<_> = state.stack_commitments.values().copied().collect();
+        state.auto_pass.insert(
+            PlayerId(0),
+            AutoPassSession::new(
+                PlayerId(0),
+                AutoPassMode::UntilTurnBoundary {
+                    until: TurnBoundary::EndOfCurrentTurn,
+                    policy: TurnPassPolicy::UntilResponse,
+                    stack_baseline: Some(baseline),
+                },
+            ),
+        );
+        state.auto_pass.insert(
+            PlayerId(1),
+            AutoPassSession {
+                requested_by: None,
+                mode: AutoPassMode::UntilStackEmpty {
+                    initial_stack_len: 2,
+                },
+            },
+        );
+
+        let departed = state.stack.pop_back().unwrap();
+        state.prune_stack_commitment(departed.id);
+        state.restore_priority_automation();
+
+        let AutoPassMode::UntilTurnBoundary {
+            stack_baseline: Some(restored),
+            ..
+        } = &state.auto_pass[&PlayerId(0)].mode
+        else {
+            panic!("expected restored turn session")
+        };
+        assert_eq!(restored.len(), 1);
+        assert!(!state.auto_pass.contains_key(&PlayerId(1)));
+    }
+
+    #[test]
+    fn nonpriority_restore_prunes_without_minting_stack_commitments() {
+        let mut state = GameState::new_two_player(42);
+        let live_id = ObjectId(91);
+        state.stack.push_back(StackEntry {
+            id: live_id,
+            source_id: live_id,
+            controller: PlayerId(0),
+            kind: StackEntryKind::KeywordAction {
+                action: KeywordAction::Crew {
+                    vehicle_id: live_id,
+                    paid_creature_ids: vec![],
+                },
+            },
+        });
+        state
+            .stack_commitments
+            .insert(ObjectId(92), StackCommitId(0));
+        state.next_stack_commit_id = 1;
+        state.waiting_for = WaitingFor::ScryChoice {
+            player: PlayerId(0),
+            cards: vec![],
+        };
+
+        let json = serde_json::to_string(&state).unwrap();
+        let mut restored: GameState = serde_json::from_str(&json).unwrap();
+        restored.restore_priority_automation();
+
+        assert!(restored.stack_commitments.is_empty());
+        assert_eq!(restored.next_stack_commit_id, 1);
+        assert_eq!(restored.stack.back().map(|entry| entry.id), Some(live_id));
+    }
+
+    #[test]
+    fn restore_clears_held_full_control_but_retains_locked() {
+        let mut state = GameState::new_two_player(42);
+        state
+            .full_control
+            .insert(PlayerId(0), FullControlMode::Held);
+        state
+            .full_control
+            .insert(PlayerId(1), FullControlMode::Locked);
+
+        let json = serde_json::to_string(&state).unwrap();
+        let mut restored: GameState = serde_json::from_str(&json).unwrap();
+        restored.restore_priority_automation();
+
+        assert!(!restored.full_control.contains_key(&PlayerId(0)));
+        assert_eq!(
+            restored.full_control.get(&PlayerId(1)),
+            Some(&FullControlMode::Locked)
         );
     }
 

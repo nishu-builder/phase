@@ -400,7 +400,16 @@ fn do_eliminate(
     crate::game::planechase::preserve_phenomenon_stack_abilities_for_handoff(state, planar_handoff);
 
     // CR 800.4a: Remove spells they control from the stack
+    let removed_stack_ids: Vec<_> = state
+        .stack
+        .iter()
+        .filter(|entry| entry.controller == player)
+        .map(|entry| entry.id)
+        .collect();
     state.stack.retain(|entry| entry.controller != player);
+    for object_id in removed_stack_ids {
+        state.prune_stack_commitment(object_id);
+    }
 
     // CR 800.4a + CR 800.4b: A control-another-player effect (CR 723, e.g.
     // Mindslaver / Secret of Bloodbending) ends when EITHER party leaves the

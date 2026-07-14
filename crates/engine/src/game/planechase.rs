@@ -620,9 +620,18 @@ pub fn finish_player_left_game_handoff(
     }
     // CR 901.10a: if a plane leaves while a planeswalking ability is on the
     // stack, that ability ceases to exist.
+    let removed_stack_ids: Vec<_> = state
+        .stack
+        .iter()
+        .filter(|entry| entry.source_id.0 >= PLANAR_ABILITY_SENTINEL_BASE)
+        .map(|entry| entry.id)
+        .collect();
     state
         .stack
         .retain(|entry| entry.source_id.0 < PLANAR_ABILITY_SENTINEL_BASE);
+    for object_id in removed_stack_ids {
+        state.prune_stack_commitment(object_id);
+    }
 
     let Some(to_id) = state.planar_deck.pop_front() else {
         restamp_planar_objects_to_controller(state);
