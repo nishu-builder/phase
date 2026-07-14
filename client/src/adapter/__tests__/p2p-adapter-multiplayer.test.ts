@@ -57,12 +57,7 @@ const mocks = vi.hoisted(() => {
     submitAction: vi.fn(async (_action: unknown) => ({ events: [] })),
     getState,
     getLegalActions,
-    /**
-     * Reads through the SAME `getState`/`getLegalActions` mocks the tests
-     * script with `mockResolvedValueOnce`, so a host AI-loop iteration consumes
-     * exactly the two `getState` values it always did (loop-top read + the
-     * post-submit pair read) and every scripted sequence still lines up.
-     */
+    /** Legacy unscoped snapshot retained to detect accidental host calls. */
     getSnapshot: vi.fn(async () => ({
       state: await getState(),
       legalResult: await getLegalActions(),
@@ -382,6 +377,84 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
     expect(mockSetMultiplayerMode).toHaveBeenCalledWith(true);
   });
 
+  it("scopes mixed-mulligan host reads and submissions to authenticated seat zero", async () => {
+    const hostCardId = 401;
+    const guestCardId = 502;
+    const guestSerumPowderId = 777;
+    const hostAction = {
+      type: "SelectCards",
+      data: { cards: [hostCardId] },
+    } as unknown as GameAction;
+    const mixedState = {
+      waiting_for: {
+        type: "MulliganDecision",
+        data: {
+          pending: [
+            {
+              player: 0,
+              mulligan_count: 1,
+              phase: { type: "BottomCards", count: 1, then: { type: "Keep" } },
+            },
+            { player: 1, mulligan_count: 0, phase: { type: "Declare" } },
+          ],
+          free_first_mulligan: false,
+        },
+      },
+      players: [{ hand: [hostCardId] }, { hand: [guestCardId, guestSerumPowderId] }],
+      objects: {},
+    } as unknown as GameState;
+    const hostProjection = {
+      state: {
+        ...mixedState,
+        players: [{ hand: [hostCardId] }, { hand: [] }],
+      },
+      actions: [hostAction],
+      autoPassRecommended: false,
+      spellCosts: {},
+      legalActionsByObject: {},
+    };
+
+    (mocks.getLegalActionsForViewer as unknown as {
+      mockImplementationOnce: (fn: (viewer: number) => Promise<unknown>) => void;
+    }).mockImplementationOnce(async (viewer) => {
+      expect(viewer).toBe(0);
+      return {
+        actions: [hostAction],
+        autoPassRecommended: false,
+        spellCosts: {},
+        legalActionsByObject: {},
+      };
+    });
+    (mocks.getViewerSnapshot as unknown as {
+      mockImplementationOnce: (fn: (viewer: number) => Promise<unknown>) => void;
+    }).mockImplementationOnce(async (viewer) => {
+      expect(viewer).toBe(0);
+      return hostProjection;
+    });
+
+    const { adapter } = makeHost(2);
+    await adapter.initialize();
+
+    const legalResult = await adapter.getLegalActions();
+    const snapshot = await adapter.getSnapshot();
+    expect(legalResult.actions).toEqual([hostAction]);
+    expect(snapshot.legalResult.actions).toEqual([hostAction]);
+    expect(mocks.getLegalActionsForViewer).toHaveBeenCalledWith(0);
+    expect(mocks.getViewerSnapshot).toHaveBeenCalledWith(0);
+    expect(mocks.getLegalActions).not.toHaveBeenCalled();
+    expect(mocks.getSnapshot).not.toHaveBeenCalled();
+
+    const advertised = JSON.stringify({ legalResult, snapshot });
+    expect(advertised).not.toContain(String(guestCardId));
+    expect(advertised).not.toContain(String(guestSerumPowderId));
+    expect(advertised).not.toContain("UseSerumPowder");
+
+    for (const action of legalResult.actions) {
+      await adapter.submitAction(action, 0);
+    }
+    expect(mockSubmitAction).toHaveBeenCalledWith(hostAction, 0);
+  });
+
   it("projects team metadata from wire SeatView into player slots", () => {
     const slots = playerSlotsFromSeatView({
       seats: [
@@ -554,9 +627,6 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
       })
       .mockResolvedValueOnce({
         waiting_for: { type: "Priority", data: { player: 0 } },
-      })
-      .mockResolvedValueOnce({
-        waiting_for: { type: "Priority", data: { player: 0 } },
       });
     mockGetAiAction.mockResolvedValueOnce({
       type: "MulliganDecision",
@@ -615,10 +685,6 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
       .mockResolvedValueOnce({
         waiting_for: { type: "Priority", data: { player: 0 } },
         priority_player: 1,
-      })
-      .mockResolvedValueOnce({
-        waiting_for: { type: "Priority", data: { player: 0 } },
-        priority_player: 0,
       })
       .mockResolvedValueOnce({
         waiting_for: { type: "Priority", data: { player: 0 } },

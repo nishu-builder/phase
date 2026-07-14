@@ -34,7 +34,9 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use crate::game::combat::AttackTarget;
-use crate::game::engine::{apply_as_current_for_simulation, SimulationProbeGuard};
+use crate::game::engine::{
+    apply_as_current_for_simulation, apply_for_simulation, SimulationProbeGuard,
+};
 use crate::game::functioning_abilities::game_functioning_statics;
 use crate::game::{casting, keywords, turn_control};
 use crate::types::ability::{
@@ -118,7 +120,8 @@ impl CandidateFilter for BasicLegalityFilter {
     }
 
     fn accept(&self, state: &GameState, candidate: &CandidateAction) -> bool {
-        !super::cheap_reject_candidate(state, &candidate.action)
+        candidate_actor_is_authorized(state, candidate)
+            && !super::cheap_reject_candidate(state, &candidate.action)
     }
 }
 
@@ -138,6 +141,9 @@ impl CandidateFilter for SimulationFilter {
     }
 
     fn accept(&self, state: &GameState, candidate: &CandidateAction) -> bool {
+        if !candidate_actor_is_authorized(state, candidate) {
+            return false;
+        }
         if super::structurally_valid_tap_for_convoke_payment(state, &candidate.action) {
             return true;
         }
@@ -156,6 +162,9 @@ impl CandidateFilter for SimulationFilter {
         candidate: &CandidateAction,
         probe: Option<&casting::PriorityCastProbe>,
     ) -> bool {
+        if !candidate_actor_is_authorized(state, candidate) {
+            return false;
+        }
         if super::structurally_valid_tap_for_convoke_payment(state, &candidate.action) {
             return true;
         }
@@ -181,8 +190,18 @@ impl SimulationFilter {
         let _probe = SimulationProbeGuard::enter();
         // Legality-only probe (#4479): `sim` is discarded, so skip display derivation
         // (the O(N^2) mana-availability board sweep on go-wide token boards).
-        apply_as_current_for_simulation(&mut sim, candidate.action.clone()).is_ok()
+        match candidate.metadata.actor {
+            Some(actor) => apply_for_simulation(&mut sim, actor, candidate.action.clone()).is_ok(),
+            None => apply_as_current_for_simulation(&mut sim, candidate.action.clone()).is_ok(),
+        }
     }
+}
+
+fn candidate_actor_is_authorized(state: &GameState, candidate: &CandidateAction) -> bool {
+    candidate
+        .metadata
+        .actor
+        .is_none_or(|actor| turn_control::is_authorized_submitter(state, actor))
 }
 
 fn structurally_valid_priority_activation(state: &GameState, action: &GameAction) -> bool {
@@ -281,7 +300,8 @@ impl FilterPipeline {
     }
 
     pub fn accepts(&self, state: &GameState, candidate: &CandidateAction) -> bool {
-        self.filters.iter().all(|f| f.accept(state, candidate))
+        candidate_actor_is_authorized(state, candidate)
+            && self.filters.iter().all(|f| f.accept(state, candidate))
     }
 
     pub fn accepts_with_probe(
@@ -290,9 +310,11 @@ impl FilterPipeline {
         candidate: &CandidateAction,
         probe: Option<&casting::PriorityCastProbe>,
     ) -> bool {
-        self.filters
-            .iter()
-            .all(|f| f.accept_with_probe(state, candidate, probe))
+        candidate_actor_is_authorized(state, candidate)
+            && self
+                .filters
+                .iter()
+                .all(|f| f.accept_with_probe(state, candidate, probe))
     }
 
     /// Apply the pipeline to an iterator of candidates.
@@ -330,6 +352,9 @@ impl FilterPipeline {
         candidates
             .into_iter()
             .filter(|c| {
+                if !candidate_actor_is_authorized(state, c) {
+                    return false;
+                }
                 if !self.cheap_filters_accept_with_probe(state, c, probe) {
                     return false;
                 }
@@ -1318,6 +1343,7 @@ mod tests {
     use crate::types::phase::Phase;
     use crate::types::player::PlayerId;
     use crate::types::zones::Zone;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn make_object(state: &mut GameState, card_id: u64, owner: u8, name: &str) -> ObjectId {
         create_object(
@@ -1400,11 +1426,80 @@ mod tests {
         );
 
         crate::game::perf_counters::reset();
-        assert!(SimulationFilter.accept(&state, &cand_with_actor(action, PlayerId(1))));
+        assert!(SimulationFilter.accept(&state, &cand_with_actor(action.clone(), PlayerId(0))));
         let clones = crate::game::perf_counters::snapshot().state_clone_for_legality;
         assert_eq!(
             clones, 0,
             "structural CastSpell fast path must avoid legality clones; got {clones}"
+        );
+
+        assert!(!SimulationFilter.accept(&state, &cand_with_actor(action, PlayerId(1))));
+        let clones = crate::game::perf_counters::snapshot().state_clone_for_legality;
+        assert_eq!(
+            clones, 0,
+            "wrong-actor candidate must be rejected before the structural fast path or clone"
+        );
+    }
+
+    struct CountingExpensiveFilter(Arc<AtomicUsize>);
+
+    impl CandidateFilter for CountingExpensiveFilter {
+        fn name(&self) -> &'static str {
+            "CountingExpensive"
+        }
+
+        fn cost(&self) -> FilterCost {
+            FilterCost::Expensive
+        }
+
+        fn accept(&self, _state: &GameState, _candidate: &CandidateAction) -> bool {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+    }
+
+    #[test]
+    fn pipeline_authorizes_actor_before_equivalence_memo_lookup() {
+        let mut state = GameState::new_two_player(42);
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+        let source = make_object(&mut state, 100, 0, "Squirrel");
+        let action = GameAction::ActivateAbility {
+            source_id: source,
+            ability_index: 0,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let pipeline =
+            FilterPipeline::new(vec![Box::new(CountingExpensiveFilter(Arc::clone(&calls)))]);
+        let actorless = CandidateAction {
+            action: action.clone(),
+            metadata: ActionMetadata {
+                actor: None,
+                tactical_class: TacticalClass::Ability,
+            },
+        };
+
+        let accepted = pipeline.apply(
+            &state,
+            vec![
+                cand_with_actor(action.clone(), PlayerId(0)),
+                cand_with_actor(action, PlayerId(1)),
+                actorless,
+            ],
+        );
+
+        assert_eq!(
+            accepted.len(),
+            2,
+            "authorized and actor-less candidates pass"
+        );
+        assert_eq!(accepted[0].metadata.actor, Some(PlayerId(0)));
+        assert_eq!(accepted[1].metadata.actor, None);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "authorized candidate populates the memo, wrong actor never reads it, and actor-less compatibility reuses it"
         );
     }
 

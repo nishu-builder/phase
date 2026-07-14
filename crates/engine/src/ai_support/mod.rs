@@ -1537,8 +1537,19 @@ pub fn flat_priority_actions_with_probe(
     state: &GameState,
     probe: Option<&crate::game::casting::PriorityCastProbe>,
 ) -> Vec<GameAction> {
+    flat_priority_actions_for_viewer_with_probe(state, probe, None)
+}
+
+fn flat_priority_actions_for_viewer_with_probe(
+    state: &GameState,
+    probe: Option<&crate::game::casting::PriorityCastProbe>,
+    viewer: Option<PlayerId>,
+) -> Vec<GameAction> {
     validated_candidate_actions_with_probe(state, probe)
         .into_iter()
+        .filter(|candidate| {
+            viewer.is_none_or(|viewer| candidate.metadata.actor.is_none_or(|actor| actor == viewer))
+        })
         .map(|candidate| candidate.action)
         .filter(|action| !action.is_mana_ability())
         .collect()
@@ -1552,6 +1563,10 @@ pub fn flat_priority_actions_with_probe(
 /// flat `actions` list; auto-pass consumes the flat list, while board
 /// interaction consumes the grouped map.
 pub fn legal_actions_full(state: &GameState) -> LegalActionsFull {
+    legal_actions_full_for_viewer(state, None)
+}
+
+fn legal_actions_full_for_viewer(state: &GameState, viewer: Option<PlayerId>) -> LegalActionsFull {
     let priority_probe_storage;
     let flushed_storage;
     let (state, priority_probe) = match &state.waiting_for {
@@ -1580,7 +1595,9 @@ pub fn legal_actions_full(state: &GameState) -> LegalActionsFull {
     };
 
     let actions: Vec<GameAction> = target_selection_actions_without_simulation(state)
-        .unwrap_or_else(|| flat_priority_actions_with_probe(state, priority_probe));
+        .unwrap_or_else(|| {
+            flat_priority_actions_for_viewer_with_probe(state, priority_probe, viewer)
+        });
 
     // Build spell costs map. The frontend display layer needs the
     // engine-effective cost (after Affinity / ReduceCost / commander tax / etc.)
@@ -1674,7 +1691,7 @@ pub fn legal_actions_for_viewer(state: &GameState, viewer: PlayerId) -> LegalAct
     // controlled turn for them). Coincides with `acting_players().contains`
     // whenever no turn-control effect is active.
     if crate::game::turn_control::is_authorized_submitter(state, viewer) {
-        legal_actions_full(state)
+        legal_actions_full_for_viewer(state, Some(viewer))
     } else {
         (Vec::new(), HashMap::new(), HashMap::new())
     }
@@ -1709,11 +1726,13 @@ pub fn stuck_decision_diagnostic(state: &GameState) -> Option<StuckDecisionDiagn
     if submitters.is_empty() {
         return None;
     }
-    // Every authorized submitter resolves to the same global legal-action set
-    // (`legal_actions_for_viewer` returns `legal_actions_full` for any of them),
-    // so compute the emptiness once rather than per submitter. When empty, no
-    // submitter can act and all submitter seats are stuck.
-    if !legal_actions_full(state).0.is_empty() {
+    // Simultaneous decision points expose a distinct actor-scoped action set
+    // to each submitter. The state is wedged only when every one of those
+    // per-viewer projections is empty.
+    if submitters
+        .iter()
+        .any(|&submitter| !legal_actions_for_viewer(state, submitter).0.is_empty())
+    {
         return None;
     }
     Some(StuckDecisionDiagnostic {
@@ -1861,7 +1880,7 @@ mod tests {
         candidate_actions, cheap_reject_candidate, legal_actions, legal_actions_for_viewer,
         legal_actions_full, stuck_decision_diagnostic, validated_candidate_actions,
     };
-    use crate::game::engine::apply_as_current;
+    use crate::game::engine::{apply, apply_as_current};
     use crate::game::mana_sources;
     use crate::game::zones::create_object;
     use crate::parser::oracle::parse_oracle_text;
@@ -1874,9 +1893,9 @@ mod tests {
     use crate::types::actions::GameAction;
     use crate::types::card_type::CoreType;
     use crate::types::game_state::{
-        CastingVariant, ConvokeMode, DistributionUnit, GameState, MulliganDecisionEntry,
-        MulliganDecisionPhase, PendingCast, PendingMulliganAction, StackEntry, StackEntryKind,
-        WaitingFor,
+        CastingVariant, ConvokeMode, DistributionUnit, GameState, MulliganBottomEntry,
+        MulliganDecisionEntry, MulliganDecisionPhase, OpeningHandBottomReason, PendingCast,
+        PendingMulliganAction, StackEntry, StackEntryKind, WaitingFor,
     };
     use crate::types::identifiers::{CardId, ObjectId};
     use crate::types::keywords::{Keyword, KeywordKind};
@@ -2110,6 +2129,238 @@ mod tests {
             controller_actions, full.0,
             "CR 723.5: the controller must receive the controlled player's legal actions"
         );
+    }
+
+    #[test]
+    fn simultaneous_mulligan_actions_are_projected_per_viewer() {
+        use crate::types::actions::MulliganChoice;
+
+        let mut state = GameState::new_two_player(42);
+        state.waiting_for = WaitingFor::MulliganDecision {
+            pending: vec![
+                MulliganDecisionEntry {
+                    player: PlayerId(0),
+                    mulligan_count: 0,
+                    phase: MulliganDecisionPhase::Declare,
+                },
+                MulliganDecisionEntry {
+                    player: PlayerId(1),
+                    mulligan_count: 0,
+                    phase: MulliganDecisionPhase::Declare,
+                },
+            ],
+            free_first_mulligan: false,
+        };
+
+        let global = legal_actions_full(&state).0;
+        assert_eq!(
+            global
+                .iter()
+                .filter(|action| matches!(
+                    action,
+                    GameAction::MulliganDecision {
+                        choice: MulliganChoice::Keep
+                    }
+                ))
+                .count(),
+            2,
+            "the global engine view retains one identical Keep per pending actor"
+        );
+        assert_eq!(
+            global
+                .iter()
+                .filter(|action| matches!(
+                    action,
+                    GameAction::MulliganDecision {
+                        choice: MulliganChoice::Mulligan
+                    }
+                ))
+                .count(),
+            2,
+            "the global engine view retains one identical Mulligan per pending actor"
+        );
+
+        for viewer in [PlayerId(0), PlayerId(1)] {
+            let (actions, costs, grouped) = legal_actions_for_viewer(&state, viewer);
+            assert_eq!(actions.len(), 2, "viewer {viewer:?} sees only their pair");
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|action| matches!(
+                        action,
+                        GameAction::MulliganDecision {
+                            choice: MulliganChoice::Keep
+                        }
+                    ))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|action| matches!(
+                        action,
+                        GameAction::MulliganDecision {
+                            choice: MulliganChoice::Mulligan
+                        }
+                    ))
+                    .count(),
+                1
+            );
+            assert!(costs.is_empty());
+            assert!(grouped.is_empty());
+        }
+    }
+
+    #[test]
+    fn simultaneous_opening_hand_bottom_actions_are_projected_per_viewer() {
+        use crate::types::identifiers::CardId;
+
+        let mut state = GameState::new_two_player(42);
+        let p0_card = create_object(
+            &mut state,
+            CardId(700),
+            PlayerId(0),
+            "P0 card".to_string(),
+            Zone::Hand,
+        );
+        let p1_card = create_object(
+            &mut state,
+            CardId(701),
+            PlayerId(1),
+            "P1 card".to_string(),
+            Zone::Hand,
+        );
+        state.waiting_for = WaitingFor::OpeningHandBottomCards {
+            pending: vec![
+                MulliganBottomEntry {
+                    player: PlayerId(0),
+                    count: 1,
+                },
+                MulliganBottomEntry {
+                    player: PlayerId(1),
+                    count: 1,
+                },
+            ],
+            reason: OpeningHandBottomReason::TinyLeadersMultiCommander,
+        };
+
+        for (viewer, own_card, other_card) in [
+            (PlayerId(0), p0_card, p1_card),
+            (PlayerId(1), p1_card, p0_card),
+        ] {
+            let (actions, costs, grouped) = legal_actions_for_viewer(&state, viewer);
+            assert_eq!(
+                actions,
+                vec![GameAction::SelectCards {
+                    cards: vec![own_card]
+                }],
+                "viewer {viewer:?} sees only their own bottom-card selection"
+            );
+            assert!(!actions.contains(&GameAction::SelectCards {
+                cards: vec![other_card]
+            }));
+            assert!(costs.is_empty());
+            assert!(grouped.is_empty());
+        }
+    }
+
+    #[test]
+    fn seed_4_mixed_mulligan_phases_are_projected_and_applicable_per_viewer() {
+        use crate::types::actions::MulliganChoice;
+
+        let mut state = GameState::new_two_player(4);
+        let p0_card = create_object(
+            &mut state,
+            CardId(704),
+            PlayerId(0),
+            "P0 bottom card".to_string(),
+            Zone::Hand,
+        );
+        let p1_card = create_object(
+            &mut state,
+            CardId(705),
+            PlayerId(1),
+            "P1 hand card".to_string(),
+            Zone::Hand,
+        );
+        state.waiting_for = WaitingFor::MulliganDecision {
+            pending: vec![
+                MulliganDecisionEntry {
+                    player: PlayerId(0),
+                    mulligan_count: 1,
+                    phase: MulliganDecisionPhase::BottomCards {
+                        count: 1,
+                        then: PendingMulliganAction::Keep,
+                    },
+                },
+                MulliganDecisionEntry {
+                    player: PlayerId(1),
+                    mulligan_count: 0,
+                    phase: MulliganDecisionPhase::Declare,
+                },
+            ],
+            free_first_mulligan: false,
+        };
+
+        let (p0_actions, p0_costs, p0_grouped) = legal_actions_for_viewer(&state, PlayerId(0));
+        assert_eq!(
+            p0_actions,
+            vec![GameAction::SelectCards {
+                cards: vec![p0_card]
+            }]
+        );
+        assert!(p0_costs.is_empty());
+        assert!(p0_grouped.is_empty());
+
+        let (p1_actions, p1_costs, p1_grouped) = legal_actions_for_viewer(&state, PlayerId(1));
+        assert_eq!(p1_actions.len(), 2);
+        assert_eq!(
+            p1_actions
+                .iter()
+                .filter(|action| matches!(
+                    action,
+                    GameAction::MulliganDecision {
+                        choice: MulliganChoice::Keep
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            p1_actions
+                .iter()
+                .filter(|action| matches!(
+                    action,
+                    GameAction::MulliganDecision {
+                        choice: MulliganChoice::Mulligan
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert!(
+            !p1_actions.iter().any(|action| {
+                matches!(action, GameAction::SelectCards { cards } if cards.contains(&p0_card))
+            }),
+            "player 1 must not receive player 0's private bottom-card object ID"
+        );
+        assert!(p1_costs.is_empty());
+        assert!(p1_grouped.is_empty());
+
+        assert_ne!(p0_card, p1_card, "fixture hands must be distinct");
+        for (viewer, actions) in [
+            (PlayerId(0), p0_actions.as_slice()),
+            (PlayerId(1), p1_actions.as_slice()),
+        ] {
+            for action in actions {
+                let mut simulation = state.clone();
+                assert!(
+                    apply(&mut simulation, viewer, action.clone()).is_ok(),
+                    "every action advertised to {viewer:?} must apply successfully: {action:?}"
+                );
+            }
+        }
     }
 
     /// Issue #537 cross-player AI test (5c): Animate Dead in player B's hand

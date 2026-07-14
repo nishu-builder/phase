@@ -17,13 +17,17 @@ use axum::routing::{get, post};
 use axum::Router;
 use clap::Parser;
 use engine::ai_support::{
-    auto_pass_recommended as engine_auto_pass, legal_actions_full as engine_legal_actions_full,
+    auto_pass_recommended as engine_auto_pass,
+    legal_actions_for_viewer as engine_legal_actions_for_viewer,
 };
 use engine::database::CardDatabase;
 use engine::game::derived_views::derive_views;
 use engine::game::validate_name_deck_for_format_full;
+use engine::types::actions::GameAction;
 use engine::types::events::GameEvent;
 use engine::types::game_state::GameState;
+use engine::types::identifiers::ObjectId;
+use engine::types::mana::ManaCost;
 use engine::types::player::PlayerId;
 use engine::types::GameLogEntry;
 use http::HeaderValue;
@@ -101,6 +105,33 @@ type SharedDraftSpectators = Arc<
 >;
 /// Spectator senders keyed by game code (live games only).
 type SharedGameSpectators = Arc<Mutex<HashMap<String, Vec<mpsc::UnboundedSender<ServerMessage>>>>>;
+
+type SeatActionProjection = (
+    Vec<GameAction>,
+    bool,
+    HashMap<ObjectId, ManaCost>,
+    HashMap<ObjectId, Vec<GameAction>>,
+);
+
+fn seat_action_projection(
+    state: &GameState,
+    player: PlayerId,
+    include_actions: bool,
+) -> SeatActionProjection {
+    if !include_actions {
+        return (Vec::new(), false, HashMap::new(), HashMap::new());
+    }
+    let (legal_actions, spell_costs, legal_actions_by_object) =
+        engine_legal_actions_for_viewer(state, player);
+    let auto_pass =
+        server_core::is_acting(state, player) && engine_auto_pass(state, &legal_actions);
+    (
+        legal_actions,
+        auto_pass,
+        spell_costs,
+        legal_actions_by_object,
+    )
+}
 
 async fn reserve_lobby_subscriber_slot(
     lobby_subscribers: &SharedLobbySubscribers,
@@ -226,16 +257,15 @@ async fn switch_draft_spectator_slot(
 /// joiners and reconnects pass an empty `Vec` so they never re-see the contest.
 /// The events go to every seat unchanged — the contest is public (no
 /// `visibility.rs` redaction), so this deliberately does NOT apply the
-/// `is_actor` gating used for `legal_actions`.
+/// per-viewer projection used for `legal_actions`.
 fn build_game_started_message(
     session: &GameSession,
     player: PlayerId,
     player_token: Option<String>,
     events: Vec<GameEvent>,
 ) -> ServerMessage {
-    let (legal_actions, spell_costs_all, by_object_all) = engine_legal_actions_full(&session.state);
-    let auto_pass = engine_auto_pass(&session.state, &legal_actions);
-    let is_actor = server_core::is_acting(&session.state, player);
+    let (legal_actions, auto_pass, spell_costs, legal_actions_by_object) =
+        seat_action_projection(&session.state, player, true);
     let filtered = server_core::filter_state_for_player(&session.state, player);
     let opponent_name = engine::game::players::opponents(&session.state, player)
         .first()
@@ -254,18 +284,10 @@ fn build_game_started_message(
         your_player: player,
         opponent_name,
         player_names: session.display_names.clone(),
-        legal_actions: if is_actor { legal_actions } else { Vec::new() },
-        auto_pass_recommended: if is_actor { auto_pass } else { false },
-        spell_costs: if is_actor {
-            spell_costs_all
-        } else {
-            HashMap::new()
-        },
-        legal_actions_by_object: if is_actor {
-            by_object_all
-        } else {
-            HashMap::new()
-        },
+        legal_actions,
+        auto_pass_recommended: auto_pass,
+        spell_costs,
+        legal_actions_by_object,
         derived,
         player_token,
         events: server_core::filter_events_for_player(&events, &session.state, player),
@@ -299,7 +321,7 @@ fn build_state_update_message(
         events,
         legal_actions,
         log_entries,
-        auto_pass,
+        _auto_pass,
         spell_costs,
         legal_actions_by_object,
     ) = result;
@@ -311,31 +333,20 @@ fn build_state_update_message(
         legal_actions_by_object,
         spell_costs,
     })?;
-    let is_actor = raw_state.waiting_for.acting_players().contains(&player);
+    let (player_legal_actions, player_auto_pass, player_spell_costs, player_by_object) =
+        seat_action_projection(raw_state, player, true);
     let filtered = server_core::filter_state_for_player(raw_state, player);
     let derived = derive_views(&filtered, Some(player));
 
     Ok(ServerMessage::StateUpdate {
         state: filtered,
         events: server_core::filter_events_for_player(events, raw_state, player),
-        legal_actions: if is_actor {
-            legal_actions.clone()
-        } else {
-            Vec::new()
-        },
-        auto_pass_recommended: if is_actor { *auto_pass } else { false },
+        legal_actions: player_legal_actions,
+        auto_pass_recommended: player_auto_pass,
         eliminated_players: Vec::new(),
         log_entries: log_entries.clone(),
-        spell_costs: if is_actor {
-            spell_costs.clone()
-        } else {
-            HashMap::new()
-        },
-        legal_actions_by_object: if is_actor {
-            legal_actions_by_object.clone()
-        } else {
-            HashMap::new()
-        },
+        spell_costs: player_spell_costs,
+        legal_actions_by_object: player_by_object,
         derived,
     })
 }
@@ -2793,7 +2804,7 @@ async fn broadcast_takeback_approved(
     snapshot: server_core::BroadcastSnapshot,
     resolved_by: Option<PlayerId>,
 ) {
-    let (raw_state, legal_actions, auto_pass, spell_costs, by_object) = snapshot;
+    let (raw_state, _legal_actions, _auto_pass, _spell_costs, _by_object) = snapshot;
     let filtered_states: Vec<(PlayerId, GameState)> = (0..player_count)
         .map(|i| {
             let pid = PlayerId(i);
@@ -2803,26 +2814,10 @@ async fn broadcast_takeback_approved(
 
     let conns = connections.lock().await;
     if let Some(players) = conns.get(game_code) {
-        let actors = raw_state.waiting_for.acting_players();
         for (pid, pstate) in &filtered_states {
             if let Some(s) = players.get(pid) {
-                let is_actor = actors.contains(pid);
-                let player_legals = if is_actor {
-                    legal_actions.clone()
-                } else {
-                    vec![]
-                };
-                let p_auto_pass = if is_actor { auto_pass } else { false };
-                let p_spell_costs = if is_actor {
-                    spell_costs.clone()
-                } else {
-                    HashMap::new()
-                };
-                let p_by_object = if is_actor {
-                    by_object.clone()
-                } else {
-                    HashMap::new()
-                };
+                let (player_legals, p_auto_pass, p_spell_costs, p_by_object) =
+                    seat_action_projection(&raw_state, *pid, true);
                 let _ = s.send(ServerMessage::StateUpdate {
                     state: pstate.clone(),
                     events: vec![],
@@ -3234,7 +3229,7 @@ async fn handle_client_message(
                         events,
                         legal_actions,
                         log_entries,
-                        auto_pass_rec,
+                        _auto_pass_rec,
                         spell_costs,
                         legal_actions_by_object,
                     ),
@@ -3281,29 +3276,14 @@ async fn handle_client_message(
                         if let Some(players) = conns.get(&game_code) {
                             for (pid, pstate) in &filtered_states {
                                 if let Some(s) = players.get(pid) {
-                                    let actors = raw_state.waiting_for.acting_players();
-                                    let is_actor = actors.contains(pid);
-                                    let player_legals = if ai_results.is_empty() && is_actor {
-                                        legal_actions.clone()
-                                    } else {
-                                        // AI will act next — don't send legal actions yet
-                                        vec![]
-                                    };
-                                    let p_auto_pass = if ai_results.is_empty() && is_actor {
-                                        auto_pass_rec
-                                    } else {
-                                        false
-                                    };
-                                    let p_spell_costs = if ai_results.is_empty() && is_actor {
-                                        spell_costs.clone()
-                                    } else {
-                                        HashMap::new()
-                                    };
-                                    let p_by_object = if ai_results.is_empty() && is_actor {
-                                        legal_actions_by_object.clone()
-                                    } else {
-                                        HashMap::new()
-                                    };
+                                    // AI will act next — don't send legal actions until
+                                    // its final follow-up state is broadcast.
+                                    let (player_legals, p_auto_pass, p_spell_costs, p_by_object) =
+                                        seat_action_projection(
+                                            &raw_state,
+                                            *pid,
+                                            ai_results.is_empty(),
+                                        );
                                     let _ = s.send(ServerMessage::StateUpdate {
                                         state: pstate.clone(),
                                         events: server_core::filter_events_for_player(
@@ -3353,7 +3333,7 @@ async fn handle_client_message(
                             ai_events,
                             ai_legal,
                             ai_log_entries,
-                            ai_auto_pass,
+                            _ai_auto_pass,
                             ai_spell_costs,
                             ai_by_object,
                         ) = result;
@@ -3379,32 +3359,12 @@ async fn handle_client_message(
                             })
                             .collect();
 
-                        let ai_actors = ai_raw_state.waiting_for.acting_players();
                         let conns = connections.lock().await;
                         if let Some(players) = conns.get(&game_code) {
                             for (pid, pstate) in &ai_filtered {
                                 if let Some(s) = players.get(pid) {
-                                    let is_actor = ai_actors.contains(pid);
-                                    let player_legals = if is_last && is_actor {
-                                        ai_legal.clone()
-                                    } else {
-                                        vec![]
-                                    };
-                                    let p_auto_pass = if is_last && is_actor {
-                                        *ai_auto_pass
-                                    } else {
-                                        false
-                                    };
-                                    let p_spell_costs = if is_last && is_actor {
-                                        ai_spell_costs.clone()
-                                    } else {
-                                        HashMap::new()
-                                    };
-                                    let p_by_object = if is_last && is_actor {
-                                        ai_by_object.clone()
-                                    } else {
-                                        HashMap::new()
-                                    };
+                                    let (player_legals, p_auto_pass, p_spell_costs, p_by_object) =
+                                        seat_action_projection(ai_raw_state, *pid, is_last);
                                     let _ = s.send(ServerMessage::StateUpdate {
                                         state: pstate.clone(),
                                         events: server_core::filter_events_for_player(
@@ -5888,6 +5848,137 @@ async fn handle_client_message(
             )
             .await;
         }
+    }
+}
+
+#[cfg(test)]
+mod seat_projection_tests {
+    use super::*;
+    use engine::game::zones::create_object;
+    use engine::types::actions::MulliganChoice;
+    use engine::types::game_state::{
+        MulliganDecisionEntry, MulliganDecisionPhase, PendingMulliganAction, WaitingFor,
+    };
+    use engine::types::identifiers::CardId;
+    use engine::types::zones::Zone;
+
+    #[test]
+    fn seed_4_state_update_builder_projects_mixed_mulligan_phases_per_seat() {
+        let mut state = GameState::new_two_player(4);
+        let p0_card = create_object(
+            &mut state,
+            CardId(704),
+            PlayerId(0),
+            "P0 bottom card".to_string(),
+            Zone::Hand,
+        );
+        let p1_card = create_object(
+            &mut state,
+            CardId(705),
+            PlayerId(1),
+            "P1 hand card".to_string(),
+            Zone::Hand,
+        );
+        state.waiting_for = WaitingFor::MulliganDecision {
+            pending: vec![
+                MulliganDecisionEntry {
+                    player: PlayerId(0),
+                    mulligan_count: 1,
+                    phase: MulliganDecisionPhase::BottomCards {
+                        count: 1,
+                        then: PendingMulliganAction::Keep,
+                    },
+                },
+                MulliganDecisionEntry {
+                    player: PlayerId(1),
+                    mulligan_count: 0,
+                    phase: MulliganDecisionPhase::Declare,
+                },
+            ],
+            free_first_mulligan: false,
+        };
+        let (global_actions, global_costs, global_grouped) =
+            engine::ai_support::legal_actions_full(&state);
+        assert_eq!(
+            global_actions.len(),
+            3,
+            "fixture reaches the mixed global union"
+        );
+        let result: ActionResult = (
+            state,
+            Vec::new(),
+            global_actions,
+            Vec::new(),
+            false,
+            global_costs,
+            global_grouped,
+        );
+
+        let p0_message = build_state_update_message(&result, PlayerId(0))
+            .expect("player 0 state update should satisfy the wire guard");
+        let ServerMessage::StateUpdate {
+            legal_actions: p0_actions,
+            spell_costs: p0_costs,
+            legal_actions_by_object: p0_grouped,
+            ..
+        } = p0_message
+        else {
+            panic!("expected player 0 StateUpdate")
+        };
+        assert_eq!(
+            p0_actions,
+            vec![GameAction::SelectCards {
+                cards: vec![p0_card]
+            }]
+        );
+        assert!(p0_costs.is_empty());
+        assert!(p0_grouped.is_empty());
+
+        let p1_message = build_state_update_message(&result, PlayerId(1))
+            .expect("player 1 state update should satisfy the wire guard");
+        let ServerMessage::StateUpdate {
+            legal_actions: p1_actions,
+            spell_costs: p1_costs,
+            legal_actions_by_object: p1_grouped,
+            ..
+        } = p1_message
+        else {
+            panic!("expected player 1 StateUpdate")
+        };
+        assert_eq!(p1_actions.len(), 2);
+        assert_eq!(
+            p1_actions
+                .iter()
+                .filter(|action| matches!(
+                    action,
+                    GameAction::MulliganDecision {
+                        choice: MulliganChoice::Keep
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            p1_actions
+                .iter()
+                .filter(|action| matches!(
+                    action,
+                    GameAction::MulliganDecision {
+                        choice: MulliganChoice::Mulligan
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert!(
+            !p1_actions.iter().any(|action| {
+                matches!(action, GameAction::SelectCards { cards } if cards.contains(&p0_card))
+            }),
+            "player 1 wire payload must not contain player 0's object ID"
+        );
+        assert!(p1_costs.is_empty());
+        assert!(p1_grouped.is_empty());
+        assert_ne!(p0_card, p1_card, "fixture hands must be distinct");
     }
 }
 

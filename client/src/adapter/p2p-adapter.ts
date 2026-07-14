@@ -134,6 +134,9 @@ type GameRunState = "running" | "paused-disconnect" | "paused-manual";
 /** Default grace window for guest auto-reconnect, in milliseconds. */
 const DEFAULT_GRACE_PERIOD_MS = 30_000;
 
+/** The P2P host is authenticated as seat zero by the room/seat protocol. */
+const HOST_PLAYER_ID: PlayerId = 0;
+
 /**
  * Guest auto-reconnect backoff schedule. Escalates briskly for early
  * attempts (WiFi blip case), then levels at 60s for the long tail.
@@ -743,7 +746,7 @@ export class P2PHostAdapter implements EngineAdapter {
       await this.broadcastStateUpdate(result.events, result.log_entries);
       this.emit({
         type: "stateChanged",
-        snapshot: await this.wasm.getSnapshot(),
+        snapshot: await this.getSnapshot(),
         events: result.events,
         logEntries: result.log_entries,
       });
@@ -1115,16 +1118,16 @@ export class P2PHostAdapter implements EngineAdapter {
   }
 
   async getLegalActions(): Promise<LegalActionsResult> {
-    return this.wasm.getLegalActions();
+    return this.wasm.getLegalActionsForViewer(HOST_PLAYER_ID);
   }
 
-  /** The host owns the engine — delegate to the inner WASM adapter, which
-   *  stamps the seq when the worker response arrives. (The broadcast path
-   *  `getViewerSnapshot` deliberately does NOT consume the counter: guests
-   *  stamp arrival order on their own ordered channel, and `seq` is never
-   *  compared across clients.) */
+  /** The host owns the engine but still reads through its authenticated
+   *  viewer projection. The inner viewer snapshot deliberately has no seq:
+   *  guest broadcasts stamp arrival order on their own channel, while this
+   *  host-facing wrapper stamps the pair for the local store. */
   async getSnapshot(): Promise<EngineSnapshot> {
-    return this.wasm.getSnapshot();
+    const { state, ...legalResult } = await this.wasm.getViewerSnapshot(HOST_PLAYER_ID);
+    return { state, legalResult, seq: nextSnapshotSeq() };
   }
 
   getAiAction(_difficulty: string, _playerId: number): GameAction | null {
@@ -1282,7 +1285,7 @@ export class P2PHostAdapter implements EngineAdapter {
           // Emit local stateChanged so host UI updates for opponent actions.
           this.emit({
             type: "stateChanged",
-            snapshot: await this.wasm.getSnapshot(),
+            snapshot: await this.getSnapshot(),
             events: result.events,
             logEntries: result.log_entries,
           });
@@ -1478,7 +1481,7 @@ export class P2PHostAdapter implements EngineAdapter {
       await this.runAiLoop();
       this.emit({
         type: "stateChanged",
-        snapshot: await this.wasm.getSnapshot(),
+        snapshot: await this.getSnapshot(),
         events: result.events,
         logEntries: result.log_entries,
       });

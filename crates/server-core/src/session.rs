@@ -2,7 +2,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use engine::ai_support::{auto_pass_recommended, legal_actions_full as engine_legal_actions_full};
+use engine::ai_support::{
+    auto_pass_recommended, legal_actions_for_viewer as engine_legal_actions_for_viewer,
+    legal_actions_full as engine_legal_actions_full,
+};
 use engine::database::legality::{validate_cedh_bracket, CedhBracketError};
 use engine::database::CardDatabase;
 use engine::game::deck_loading::{DeckPayload, PlayerDeckPayload};
@@ -1291,7 +1294,7 @@ impl SessionManager {
                     .waiting_for
                     .accepts_freeform_counter_removal());
         if !skip_legality {
-            let (legal_actions, _, _) = engine_legal_actions_full(&session.state);
+            let (legal_actions, _, _) = engine_legal_actions_for_viewer(&session.state, player);
             if !legal_actions.contains(&action) {
                 warn!(game = %game_code, player = ?player, reason = "illegal_action", "action rejected");
                 return Err(format!("Illegal action: {:?}", action));
@@ -1767,6 +1770,91 @@ mod tests {
 
         let result = mgr.handle_action(&code, wrong_token, GameAction::PassPriority);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn simultaneous_bottom_action_from_wrong_seat_fails_viewer_precheck() {
+        use engine::game::zones::create_object;
+        use engine::types::game_state::{MulliganBottomEntry, OpeningHandBottomReason};
+        use engine::types::identifiers::CardId;
+        use engine::types::zones::Zone;
+
+        let mut mgr = SessionManager::new();
+        let (code, token0) = mgr.create_game(make_deck());
+        let (_token1, _) = mgr.join_game(&code, make_deck()).unwrap();
+        let (p0_card, p1_card) = {
+            let session = mgr.sessions.get_mut(&code).unwrap();
+            session.state.players[0].hand.clear();
+            session.state.players[1].hand.clear();
+            let p0_card = create_object(
+                &mut session.state,
+                CardId(900),
+                PlayerId(0),
+                "P0 card".to_string(),
+                Zone::Hand,
+            );
+            let p1_card = create_object(
+                &mut session.state,
+                CardId(901),
+                PlayerId(1),
+                "P1 card".to_string(),
+                Zone::Hand,
+            );
+            session.state.waiting_for = WaitingFor::OpeningHandBottomCards {
+                pending: vec![
+                    MulliganBottomEntry {
+                        player: PlayerId(0),
+                        count: 1,
+                    },
+                    MulliganBottomEntry {
+                        player: PlayerId(1),
+                        count: 1,
+                    },
+                ],
+                reason: OpeningHandBottomReason::TinyLeadersMultiCommander,
+            };
+            (p0_card, p1_card)
+        };
+        let wrong_seat_action = GameAction::SelectCards {
+            cards: vec![p1_card],
+        };
+
+        assert!(
+            engine_legal_actions_full(&mgr.sessions[&code].state)
+                .0
+                .contains(&wrong_seat_action),
+            "the global union contains player 1's structurally valid selection"
+        );
+        assert!(
+            !engine_legal_actions_for_viewer(&mgr.sessions[&code].state, PlayerId(0))
+                .0
+                .contains(&wrong_seat_action),
+            "player 0's projection excludes player 1's selection"
+        );
+
+        let err = mgr
+            .handle_action(&code, &token0, wrong_seat_action)
+            .expect_err("wrong-seat simultaneous action must be rejected");
+        assert!(
+            err.starts_with("Illegal action:"),
+            "viewer-scoped server precheck should reject before engine apply, got {err}"
+        );
+        assert_eq!(
+            mgr.sessions[&code].state.players[0]
+                .hand
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![p0_card]
+        );
+        assert_eq!(
+            mgr.sessions[&code].state.players[1]
+                .hand
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![p1_card]
+        );
     }
 
     #[test]
