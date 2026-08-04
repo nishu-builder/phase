@@ -137,6 +137,15 @@ where
 
 struct NumericHashMapVisitor<K, V>(PhantomData<(K, V)>);
 
+fn cautious_map_capacity<K, V>(hint: Option<usize>) -> usize {
+    const MAX_PREALLOC_BYTES: usize = 1024 * 1024;
+
+    let max_entries = MAX_PREALLOC_BYTES
+        .checked_div(std::mem::size_of::<(K, V)>())
+        .unwrap_or(0);
+    hint.unwrap_or(0).min(max_entries)
+}
+
 impl<'de, K, V> Visitor<'de> for NumericHashMapVisitor<K, V>
 where
     K: Eq + Hash + NumericMapKey,
@@ -152,7 +161,9 @@ where
     where
         A: MapAccess<'de>,
     {
-        let mut values = HashMap::with_capacity(access.size_hint().unwrap_or(0));
+        // A wire-provided size hint is only an optimization. Cap it like Serde's
+        // cautious collection allocation; the map grows normally past this cap.
+        let mut values = HashMap::with_capacity(cautious_map_capacity::<K, V>(access.size_hint()));
         while let Some((NumericKey(key), value)) = access.next_entry()? {
             values.insert(key, value);
         }
@@ -472,10 +483,13 @@ pub(crate) mod test_support {
 mod tests {
     use std::collections::{HashMap, HashSet};
 
+    use serde::de::value::{Error as ValueError, MapAccessDeserializer};
+    use serde::de::{DeserializeSeed, IntoDeserializer, MapAccess};
     use serde::{Deserialize, Serialize};
 
     use super::test_support::ReverseBuildHasher;
     use crate::types::identifiers::ObjectId;
+    use crate::types::player::PlayerId;
 
     type Set = HashSet<u64, ReverseBuildHasher>;
     type Map<V> = HashMap<u64, V, ReverseBuildHasher>;
@@ -643,6 +657,13 @@ mod tests {
             )]
             values: Option<HashMap<ObjectId, String>>,
         },
+        Player {
+            #[serde(
+                serialize_with = "super::hash_map",
+                deserialize_with = "super::deserialize_numeric_hash_map"
+            )]
+            values: HashMap<PlayerId, String>,
+        },
     }
 
     #[test]
@@ -705,6 +726,75 @@ mod tests {
             serde_json::from_str::<ObjectId>(r#""1""#).is_err(),
             "ObjectId values must not become string-permissive"
         );
+
+        let players = BufferedNumericMap::Player {
+            values: HashMap::from([(PlayerId(7), "seven".to_string())]),
+        };
+        let players_value = serde_json::to_value(&players).unwrap();
+        assert_eq!(
+            serde_json::from_value::<BufferedNumericMap>(players_value).unwrap(),
+            players,
+            "a valid PlayerId key must reach the strict numeric-key adapter"
+        );
+
+        let error = serde_json::from_value::<BufferedNumericMap>(serde_json::json!({
+            "type": "Player",
+            "data": {"values": {"256": "out of range"}}
+        }))
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "numeric map key 256 is out of range for engine::types::player::PlayerId"
+        );
+    }
+
+    struct EnormousHintMapAccess {
+        entry: Option<(u64, String)>,
+        value: Option<String>,
+    }
+
+    impl<'de> MapAccess<'de> for EnormousHintMapAccess {
+        type Error = ValueError;
+
+        fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, Self::Error>
+        where
+            K: DeserializeSeed<'de>,
+        {
+            let Some((key, value)) = self.entry.take() else {
+                return Ok(None);
+            };
+            self.value = Some(value);
+            seed.deserialize(key.into_deserializer()).map(Some)
+        }
+
+        fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value, Self::Error>
+        where
+            V: DeserializeSeed<'de>,
+        {
+            seed.deserialize(
+                self.value
+                    .take()
+                    .expect("next_value_seed must follow next_key_seed")
+                    .into_deserializer(),
+            )
+        }
+
+        fn size_hint(&self) -> Option<usize> {
+            Some(usize::MAX)
+        }
+    }
+
+    #[test]
+    fn numeric_map_deserializer_caps_untrusted_size_hints() {
+        let access = EnormousHintMapAccess {
+            entry: Some((7, "seven".to_string())),
+            value: None,
+        };
+
+        let values: HashMap<ObjectId, String> =
+            super::deserialize_numeric_hash_map(MapAccessDeserializer::new(access)).unwrap();
+
+        assert_eq!(values, HashMap::from([(ObjectId(7), "seven".to_string())]));
     }
 
     #[derive(Serialize)]
