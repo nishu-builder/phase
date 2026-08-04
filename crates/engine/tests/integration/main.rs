@@ -824,6 +824,7 @@ mod power_leak_dynamic_prevention;
 mod power_up_keyword;
 mod pr7_trigger_ordering;
 mod precast_copy_shortcut;
+mod prepared_state_serde;
 mod primo_unbounded_fractal_counters;
 mod printed_ability_order;
 mod proliferate_zero_counter;
