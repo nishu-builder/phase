@@ -281,6 +281,28 @@ where
     sequence.end()
 }
 
+pub(crate) fn serialize_sorted_map_entries<'a, K, V, W, F, S>(
+    entries: impl Iterator<Item = (&'a K, &'a V)>,
+    wrap_value: F,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    K: Ord + Serialize + 'a,
+    V: 'a,
+    W: Serialize,
+    F: Fn(&'a V) -> W,
+    S: Serializer,
+{
+    let mut entries: Vec<_> = entries.collect();
+    entries.sort_unstable_by_key(|(key, _)| *key);
+
+    let mut map = serializer.serialize_map(Some(entries.len()))?;
+    for (key, value) in entries {
+        map.serialize_entry(key, &wrap_value(value))?;
+    }
+    map.end()
+}
+
 pub(crate) fn hash_map_of_hash_set<K, V, H1, H2, S>(
     values: &HashMap<K, HashSet<V, H2>, H1>,
     serializer: S,
@@ -290,14 +312,7 @@ where
     V: Ord + Serialize,
     S: Serializer,
 {
-    let mut entries: Vec<_> = values.iter().collect();
-    entries.sort_unstable_by_key(|(key, _)| *key);
-
-    let mut map = serializer.serialize_map(Some(entries.len()))?;
-    for (key, value) in entries {
-        map.serialize_entry(key, &SortedHashSet(value))?;
-    }
-    map.end()
+    serialize_sorted_map_entries(values.iter(), SortedHashSet, serializer)
 }
 
 pub(crate) fn hash_map_of_hash_map<K1, K2, V, H1, H2, S>(
@@ -310,14 +325,7 @@ where
     V: Serialize,
     S: Serializer,
 {
-    let mut entries: Vec<_> = values.iter().collect();
-    entries.sort_unstable_by_key(|(key, _)| *key);
-
-    let mut map = serializer.serialize_map(Some(entries.len()))?;
-    for (key, value) in entries {
-        map.serialize_entry(key, &SortedHashMap(value))?;
-    }
-    map.end()
+    serialize_sorted_map_entries(values.iter(), SortedHashMap, serializer)
 }
 
 pub(crate) fn im_hash_set<T, H, S>(
@@ -344,14 +352,7 @@ where
     H: BuildHasher,
     S: Serializer,
 {
-    let mut entries: Vec<_> = values.iter().collect();
-    entries.sort_unstable_by_key(|(key, _)| *key);
-
-    let mut map = serializer.serialize_map(Some(entries.len()))?;
-    for (key, value) in entries {
-        map.serialize_entry(key, value)?;
-    }
-    map.end()
+    SortedImHashMap(values).serialize(serializer)
 }
 
 pub(crate) fn im_hash_map_of_im_hash_map<K1, K2, V, H1, H2, S>(
@@ -366,14 +367,7 @@ where
     H2: BuildHasher,
     S: Serializer,
 {
-    let mut entries: Vec<_> = values.iter().collect();
-    entries.sort_unstable_by_key(|(key, _)| *key);
-
-    let mut map = serializer.serialize_map(Some(entries.len()))?;
-    for (key, value) in entries {
-        map.serialize_entry(key, &SortedImHashMap(value))?;
-    }
-    map.end()
+    serialize_sorted_map_entries(values.iter(), SortedImHashMap, serializer)
 }
 
 struct SortedHashSet<'a, T, H>(&'a HashSet<T, H>);
@@ -403,14 +397,7 @@ where
     where
         S: Serializer,
     {
-        let mut entries: Vec<_> = self.0.iter().collect();
-        entries.sort_unstable_by_key(|(key, _)| *key);
-
-        let mut map = serializer.serialize_map(Some(entries.len()))?;
-        for (key, value) in entries {
-            map.serialize_entry(key, value)?;
-        }
-        map.end()
+        serialize_sorted_map_entries(self.0.iter(), std::convert::identity, serializer)
     }
 }
 
@@ -426,14 +413,7 @@ where
     where
         S: Serializer,
     {
-        let mut entries: Vec<_> = self.0.iter().collect();
-        entries.sort_unstable_by_key(|(key, _)| *key);
-
-        let mut map = serializer.serialize_map(Some(entries.len()))?;
-        for (key, value) in entries {
-            map.serialize_entry(key, value)?;
-        }
-        map.end()
+        serialize_sorted_map_entries(self.0.iter(), std::convert::identity, serializer)
     }
 }
 
@@ -532,6 +512,20 @@ mod tests {
             (2, Map::from_iter([(3, "three"), (1, "one")])),
             (1, Map::from_iter([(2, "two"), (1, "one")])),
         ]);
+        for inner in map_of_sets.values() {
+            let values = inner.iter().copied().collect::<Vec<_>>();
+            assert!(
+                values.windows(2).all(|pair| pair[0] > pair[1]),
+                "nested set must expose descending native iteration: {values:?}"
+            );
+        }
+        for inner in map_of_maps.values() {
+            let keys = inner.keys().copied().collect::<Vec<_>>();
+            assert!(
+                keys.windows(2).all(|pair| pair[0] > pair[1]),
+                "nested map must expose descending native iteration: {keys:?}"
+            );
+        }
 
         let serialized = serde_json::to_string(&StandardFixture {
             set: &set,
@@ -824,6 +818,13 @@ mod tests {
             ),
             (1, im::HashMap::from_iter([(2_u64, "two"), (1, "one")])),
         ]);
+        for inner in map_of_maps.values() {
+            let keys = inner.keys().copied().collect::<Vec<_>>();
+            assert!(
+                keys.windows(2).all(|pair| pair[0] > pair[1]),
+                "nested map must expose descending native iteration: {keys:?}"
+            );
+        }
 
         assert_eq!(
             serde_json::to_string(&ImFixture {

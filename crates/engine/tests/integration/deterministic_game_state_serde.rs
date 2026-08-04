@@ -1909,6 +1909,25 @@ fn declare_attackers_numeric_maps_round_trip_through_value_bare_raw_and_trusted(
     malformed["data"]["attacker_constraints"] = serde_json::json!({"01": {"kind": "CantAttack"}});
     assert!(serde_json::from_value::<WaitingFor>(malformed).is_err());
 
+    let valid_attack_targets = value["data"]["valid_attack_targets"].clone();
+
+    let mut malformed_optional = value.clone();
+    malformed_optional["data"]["valid_attack_targets_by_attacker"] =
+        serde_json::json!({"01": valid_attack_targets.clone()});
+    let error = serde_json::from_value::<WaitingFor>(malformed_optional).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        r#"invalid value: string "01", expected a canonical unsigned decimal map key"#,
+        "the optional numeric-map deserializer must reject at the noncanonical key path"
+    );
+
+    let mut canonical_optional = value.clone();
+    canonical_optional["data"]["valid_attack_targets_by_attacker"] =
+        serde_json::json!({"1": valid_attack_targets});
+    let restored = serde_json::from_value::<WaitingFor>(canonical_optional.clone())
+        .expect("the same valid payload must deserialize with a canonical numeric key");
+    assert_eq!(waiting_value(&restored), canonical_optional);
+
     let mut state = GameState::new(FormatConfig::standard(), 2, 42);
     state.waiting_for = waiting;
     assert_waiting_round_trip_across_persistence_forms(state);

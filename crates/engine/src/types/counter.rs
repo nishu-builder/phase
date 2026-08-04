@@ -212,7 +212,6 @@ impl<'de> serde::Deserialize<'de> for CounterType {
 pub(crate) mod counter_map_serde {
     use super::*;
     use serde::de::{self, MapAccess, Visitor};
-    use serde::ser::SerializeMap;
     use serde::{Deserializer, Serializer};
     use std::fmt;
 
@@ -223,14 +222,11 @@ pub(crate) mod counter_map_serde {
     where
         S: Serializer,
     {
-        let mut entries: Vec<_> = map.iter().collect();
-        entries.sort_unstable_by_key(|(key, _)| *key);
-
-        let mut ser_map = serializer.serialize_map(Some(entries.len()))?;
-        for (counter_type, count) in entries {
-            ser_map.serialize_entry(counter_type.as_str().as_ref(), count)?;
-        }
-        ser_map.end()
+        crate::types::deterministic_serde::serialize_sorted_map_entries(
+            map.iter(),
+            std::convert::identity,
+            serializer,
+        )
     }
 
     pub(crate) fn deserialize<'de, D>(
