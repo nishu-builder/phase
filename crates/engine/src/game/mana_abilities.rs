@@ -1578,6 +1578,7 @@ fn can_activate_mana_ability_by_simulation(
     ability_def: &AbilityDefinition,
 ) -> bool {
     crate::game::perf_counters::record_state_clone_for_legality();
+    crate::game::perf_counters::record_mana_readiness_state_clone();
     let mut simulated = state.clone();
     activate_mana_ability(
         &mut simulated,

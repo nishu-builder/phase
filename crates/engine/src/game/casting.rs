@@ -693,6 +693,7 @@ pub struct PriorityCastProbe {
 
 impl PriorityCastProbe {
     pub fn new(state: &GameState, player: PlayerId) -> Self {
+        crate::game::perf_counters::record_priority_cast_probe_state_clone();
         let mut flushed = state.clone();
         super::layers::flush_layers(&mut flushed);
         Self::from_flushed_state(flushed, player)
@@ -7451,16 +7452,13 @@ fn collect_self_spell_cost_modifiers(
     // pipeline: layers pre-compute battlefield characteristics, not cast-time
     // cost deltas on cards in hand.
     for def in spell_obj.static_definitions.iter_all() {
-        if def.active_zones.is_empty() {
-            continue;
-        }
-        if !def.active_zones.contains(&spell_obj.zone) {
-            continue;
-        }
-        // CR 601.2f: Only self-referential cost statics apply here. Any other
-        // `affected` scoping would indicate a battlefield-style static that
-        // should be handled by the battlefield scanner.
-        if !matches!(def.affected, Some(TargetFilter::SelfRef)) {
+        if !self_spell_cost_modifier_applies_before_targets(
+            state,
+            caster,
+            spell_id,
+            def,
+            casting_variant,
+        ) {
             continue;
         }
 
@@ -7480,13 +7478,18 @@ fn collect_self_spell_cost_modifiers(
             _ => continue,
         };
 
-        let has_target_filter = spell_filter
-            .as_ref()
-            .is_some_and(cost_filter_has_target_ref);
-        if target_sensitive_only && !has_target_filter {
+        let filter_analysis = spell_filter.as_ref().map_or(
+            PreTargetCostFilterAnalysis::TargetIndependentRelevant,
+            |filter| {
+                analyze_cost_filter_before_targets_for(
+                    state, caster, spell_id, filter, spell_id, fused,
+                )
+            },
+        );
+        if target_sensitive_only && !filter_analysis.is_target_dependent() {
             continue;
         }
-        if selected_ability.is_none() && has_target_filter {
+        if selected_ability.is_none() && filter_analysis.is_target_dependent() {
             continue;
         }
 
@@ -7531,21 +7534,162 @@ fn collect_self_spell_cost_modifiers(
     collected
 }
 
-fn cost_filter_has_target_ref(filter: &TargetFilter) -> bool {
-    match filter {
-        TargetFilter::Typed(tf) => tf.properties.iter().any(|prop| {
-            matches!(
-                prop,
-                crate::types::ability::FilterProp::Targets { .. }
-                    | crate::types::ability::FilterProp::TargetsOnly { .. }
-            )
-        }),
-        TargetFilter::Or { filters } | TargetFilter::And { filters } => {
-            filters.iter().any(cost_filter_has_target_ref)
-        }
-        TargetFilter::Not { filter } => cost_filter_has_target_ref(filter),
-        _ => false,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreTargetCostFilterAnalysis {
+    Irrelevant,
+    TargetIndependentRelevant,
+    TargetDependent,
+}
+
+impl PreTargetCostFilterAnalysis {
+    fn is_relevant(self) -> bool {
+        self != Self::Irrelevant
     }
+
+    fn is_target_dependent(self) -> bool {
+        self == Self::TargetDependent
+    }
+
+    fn negate(self) -> Self {
+        match self {
+            Self::Irrelevant => Self::TargetIndependentRelevant,
+            Self::TargetIndependentRelevant => Self::Irrelevant,
+            Self::TargetDependent => Self::TargetDependent,
+        }
+    }
+}
+
+/// CR 601.2f: Classify a cost filter before targets are chosen. Fixed `Or` and
+/// `Not` outcomes remain fixed even when an unreachable branch mentions a
+/// target; only a result that chosen targets can still change is target-dependent.
+fn analyze_cost_filter_before_targets_for(
+    state: &GameState,
+    caster: PlayerId,
+    spell_id: ObjectId,
+    filter: &TargetFilter,
+    source_id: ObjectId,
+    fused: bool,
+) -> PreTargetCostFilterAnalysis {
+    match filter {
+        TargetFilter::Typed(typed) => {
+            let has_target_property = typed.properties.iter().any(|property| {
+                matches!(
+                    property,
+                    FilterProp::Targets { .. } | FilterProp::TargetsOnly { .. }
+                )
+            });
+            let non_target_properties = typed
+                .properties
+                .iter()
+                .filter(|property| {
+                    !matches!(
+                        property,
+                        FilterProp::Targets { .. } | FilterProp::TargetsOnly { .. }
+                    )
+                })
+                .cloned()
+                .collect();
+            let base = TargetFilter::Typed(crate::types::ability::TypedFilter {
+                type_filters: typed.type_filters.clone(),
+                controller: typed.controller.clone(),
+                properties: non_target_properties,
+            });
+            if !spell_matches_cost_filter_for(state, caster, spell_id, &base, source_id, fused) {
+                PreTargetCostFilterAnalysis::Irrelevant
+            } else if has_target_property {
+                PreTargetCostFilterAnalysis::TargetDependent
+            } else {
+                PreTargetCostFilterAnalysis::TargetIndependentRelevant
+            }
+        }
+        TargetFilter::Or { filters } => filters.iter().fold(
+            PreTargetCostFilterAnalysis::Irrelevant,
+            |combined, inner| {
+                let next = analyze_cost_filter_before_targets_for(
+                    state, caster, spell_id, inner, source_id, fused,
+                );
+                match (combined, next) {
+                    (PreTargetCostFilterAnalysis::TargetIndependentRelevant, _)
+                    | (_, PreTargetCostFilterAnalysis::TargetIndependentRelevant) => {
+                        PreTargetCostFilterAnalysis::TargetIndependentRelevant
+                    }
+                    (PreTargetCostFilterAnalysis::TargetDependent, _)
+                    | (_, PreTargetCostFilterAnalysis::TargetDependent) => {
+                        PreTargetCostFilterAnalysis::TargetDependent
+                    }
+                    _ => PreTargetCostFilterAnalysis::Irrelevant,
+                }
+            },
+        ),
+        TargetFilter::And { filters } => filters.iter().fold(
+            PreTargetCostFilterAnalysis::TargetIndependentRelevant,
+            |combined, inner| {
+                let next = analyze_cost_filter_before_targets_for(
+                    state, caster, spell_id, inner, source_id, fused,
+                );
+                match (combined, next) {
+                    (PreTargetCostFilterAnalysis::Irrelevant, _)
+                    | (_, PreTargetCostFilterAnalysis::Irrelevant) => {
+                        PreTargetCostFilterAnalysis::Irrelevant
+                    }
+                    (PreTargetCostFilterAnalysis::TargetDependent, _)
+                    | (_, PreTargetCostFilterAnalysis::TargetDependent) => {
+                        PreTargetCostFilterAnalysis::TargetDependent
+                    }
+                    _ => PreTargetCostFilterAnalysis::TargetIndependentRelevant,
+                }
+            },
+        ),
+        TargetFilter::Not { filter } => analyze_cost_filter_before_targets_for(
+            state, caster, spell_id, filter, source_id, fused,
+        )
+        .negate(),
+        _ => {
+            if spell_matches_cost_filter_for(state, caster, spell_id, filter, source_id, fused) {
+                PreTargetCostFilterAnalysis::TargetIndependentRelevant
+            } else {
+                PreTargetCostFilterAnalysis::Irrelevant
+            }
+        }
+    }
+}
+
+/// CR 113.6 + CR 604.1 + CR 601.2f: A self cost modifier can affect the pending
+/// spell only from its declared zone and while its non-target gates hold.
+fn self_spell_cost_modifier_applies_before_targets(
+    state: &GameState,
+    caster: PlayerId,
+    spell_id: ObjectId,
+    definition: &StaticDefinition,
+    casting_variant: Option<CastingVariant>,
+) -> bool {
+    let Some(spell) = state.objects.get(&spell_id) else {
+        return false;
+    };
+    if definition.active_zones.is_empty() || !definition.active_zones.contains(&spell.zone) {
+        return false;
+    }
+    if !matches!(definition.affected, Some(TargetFilter::SelfRef)) {
+        return false;
+    }
+    let StaticMode::ModifyCost {
+        mode: CostModifyMode::Reduce | CostModifyMode::Raise,
+        spell_filter,
+        ..
+    } = &definition.mode
+    else {
+        return false;
+    };
+    let fused = casting_variant == Some(CastingVariant::Fuse);
+    if spell_filter.as_ref().is_some_and(|filter| {
+        !analyze_cost_filter_before_targets_for(state, caster, spell_id, filter, spell_id, fused)
+            .is_relevant()
+    }) {
+        return false;
+    }
+    definition.condition.as_ref().is_none_or(|condition| {
+        self_spell_cost_condition_matches(state, condition, caster, spell_id, casting_variant)
+    })
 }
 
 fn target_ref_matches_cost_filter(
@@ -7785,6 +7929,41 @@ fn evaluate_cost_mod_static_condition(
     }
 }
 
+/// CR 113.6b + CR 604.1 + CR 601.2f: Apply the production zone, caster,
+/// condition, and non-target spell gates before treating a battlefield cost
+/// modifier as relevant to target selection.
+fn battlefield_cost_modifier_applies_before_targets(
+    state: &GameState,
+    caster: PlayerId,
+    spell_id: ObjectId,
+    source: &GameObject,
+    definition: &StaticDefinition,
+    fused: bool,
+) -> bool {
+    let Some(modifier) = definition.board_wide_cost_modifier() else {
+        return false;
+    };
+    if definition.active_zones.is_empty() {
+        if source.zone != Zone::Battlefield {
+            return false;
+        }
+    } else if !definition.active_zones.contains(&source.zone) {
+        return false;
+    }
+    if !modifier.caster_scope.admits(caster, source.controller) {
+        return false;
+    }
+    if definition.condition.as_ref().is_some_and(|condition| {
+        !evaluate_cost_mod_static_condition(state, condition, caster, source.controller, source.id)
+    }) {
+        return false;
+    }
+    modifier.spell_filter.is_none_or(|filter| {
+        analyze_cost_filter_before_targets_for(state, caster, spell_id, filter, source.id, fused)
+            .is_relevant()
+    })
+}
+
 fn collect_battlefield_cost_modifiers(
     state: &GameState,
     caster: PlayerId,
@@ -7826,6 +8005,11 @@ fn collect_battlefield_cost_modifiers(
         let source_controller = src_obj.controller;
 
         {
+            if !battlefield_cost_modifier_applies_before_targets(
+                state, caster, spell_id, src_obj, def, fused,
+            ) {
+                continue;
+            }
             // CR 601.2f + CR 113.6: single structural authority for "is this a
             // board-wide cost modifier, and what are its terms" — shared with
             // deck-time analysis (`phase-ai`'s `features::cost_reduction`) so the
@@ -7841,50 +8025,24 @@ fn collect_battlefield_cost_modifiers(
                 amount,
                 spell_filter,
                 dynamic_count,
-                caster_scope,
+                caster_scope: _,
                 condition: _,
             } = modifier;
             let is_raise = matches!(mode, CostModifyMode::Raise);
 
-            let has_target_filter = spell_filter.is_some_and(cost_filter_has_target_ref);
-            if target_sensitive_only && !has_target_filter {
+            let filter_analysis = spell_filter.map_or(
+                PreTargetCostFilterAnalysis::TargetIndependentRelevant,
+                |filter| {
+                    analyze_cost_filter_before_targets_for(
+                        state, caster, spell_id, filter, bf_id, fused,
+                    )
+                },
+            );
+            if target_sensitive_only && !filter_analysis.is_target_dependent() {
                 continue;
             }
-            if selected_ability.is_none() && has_target_filter {
+            if selected_ability.is_none() && filter_analysis.is_target_dependent() {
                 continue;
-            }
-
-            // CR 113.6 + CR 113.6b: A static functions only in its declared
-            // zones. Empty `active_zones` means battlefield default; non-empty
-            // means restrict to the listed zones. Eminence statics list both
-            // Battlefield and Command and pass for either source zone.
-            if def.active_zones.is_empty() {
-                if src_obj.zone != Zone::Battlefield {
-                    continue;
-                }
-            } else if !def.active_zones.contains(&src_obj.zone) {
-                continue;
-            }
-
-            // CR 601.2f: Check player scope — does this modifier apply to spells the caster casts?
-            // Must run before condition check so QuantityComparison resolves against the caster.
-            if !caster_scope.admits(caster, source_controller) {
-                continue;
-            }
-
-            // CR 601.2f: Check static condition — "as long as" / "during your turn"
-            // clauses gate cost modification. `DuringYourTurn` uses the source
-            // controller; spell-history quantity gates use the caster.
-            if let Some(ref cond) = def.condition {
-                if !evaluate_cost_mod_static_condition(
-                    state,
-                    cond,
-                    caster,
-                    source_controller,
-                    bf_id,
-                ) {
-                    continue;
-                }
             }
 
             // CR 601.2f: Check spell type filter — does the spell match?
@@ -7925,6 +8083,54 @@ fn collect_battlefield_cost_modifiers(
     collected
 }
 
+/// CR 118.8 + CR 601.2f: An imposed additional cost is relevant before target
+/// selection only when its production source, caster, condition, and spell gates
+/// already hold.
+fn imposed_additional_cost_applies_before_targets(
+    state: &GameState,
+    caster: PlayerId,
+    spell_id: ObjectId,
+    source: &GameObject,
+    definition: &StaticDefinition,
+) -> bool {
+    use crate::types::ability::ControllerRef;
+
+    let StaticMode::ImposeAdditionalCost {
+        spell_filter,
+        action: AdditionalCostTaxAction::Cast,
+        ..
+    } = &definition.mode
+    else {
+        return false;
+    };
+    if matches!(definition.affected, Some(TargetFilter::SelfRef)) {
+        return false;
+    }
+    if definition.active_zones.is_empty() {
+        if source.zone != Zone::Battlefield {
+            return false;
+        }
+    } else if !definition.active_zones.contains(&source.zone) {
+        return false;
+    }
+    if let Some(TargetFilter::Typed(typed)) = &definition.affected {
+        match typed.controller {
+            Some(ControllerRef::You) if caster != source.controller => return false,
+            Some(ControllerRef::Opponent) if caster == source.controller => return false,
+            _ => {}
+        }
+    }
+    if definition.condition.as_ref().is_some_and(|condition| {
+        !super::layers::evaluate_condition(state, condition, caster, source.id)
+    }) {
+        return false;
+    }
+    spell_filter.as_ref().is_none_or(|filter| {
+        analyze_cost_filter_before_targets_for(state, caster, spell_id, filter, source.id, false)
+            .is_relevant()
+    })
+}
+
 /// CR 601.2f + CR 118.8: Collect additional non-mana costs imposed by battlefield
 /// statics once targets are chosen. Terror of the Peaks class.
 pub(super) fn collect_imposed_additional_cast_costs(
@@ -7933,8 +8139,6 @@ pub(super) fn collect_imposed_additional_cast_costs(
     spell_id: ObjectId,
     ability: &ResolvedAbility,
 ) -> Vec<AbilityCost> {
-    use crate::types::ability::ControllerRef;
-
     let mut costs = Vec::new();
     // CR 604.1: O(1) presence gate — no ImposeAdditionalCost static means no imposed costs.
     if !static_kind_present(state, StaticModeKind::ImposeAdditionalCost) {
@@ -7943,7 +8147,9 @@ pub(super) fn collect_imposed_additional_cast_costs(
     crate::game::perf_counters::record_static_full_scan();
     for (src_obj, def) in super::functioning_abilities::game_functioning_statics(state) {
         let bf_id = src_obj.id;
-        let source_controller = src_obj.controller;
+        if !imposed_additional_cost_applies_before_targets(state, caster, spell_id, src_obj, def) {
+            continue;
+        }
 
         let StaticMode::ImposeAdditionalCost {
             cost,
@@ -7953,39 +8159,6 @@ pub(super) fn collect_imposed_additional_cast_costs(
         else {
             continue;
         };
-
-        let has_target_filter = spell_filter
-            .as_ref()
-            .is_some_and(cost_filter_has_target_ref);
-        if !has_target_filter {
-            continue;
-        }
-
-        if matches!(def.affected, Some(TargetFilter::SelfRef)) {
-            continue;
-        }
-
-        if def.active_zones.is_empty() {
-            if src_obj.zone != Zone::Battlefield {
-                continue;
-            }
-        } else if !def.active_zones.contains(&src_obj.zone) {
-            continue;
-        }
-
-        if let Some(TargetFilter::Typed(ref tf)) = def.affected {
-            match tf.controller {
-                Some(ControllerRef::You) if caster != source_controller => continue,
-                Some(ControllerRef::Opponent) if caster == source_controller => continue,
-                _ => {}
-            }
-        }
-
-        if let Some(ref cond) = def.condition {
-            if !super::layers::evaluate_condition(state, cond, caster, bf_id) {
-                continue;
-            }
-        }
 
         if let Some(ref filter) = spell_filter {
             if !spell_matches_cost_filter_with_selected_targets(
@@ -8081,6 +8254,50 @@ pub(super) fn apply_cost_floor_with_selected_targets(
     );
 }
 
+/// CR 601.2f: A cost floor is relevant before target selection only after its
+/// production source, caster, condition, and non-target spell gates hold.
+fn battlefield_cost_floor_applies_before_targets(
+    state: &GameState,
+    caster: PlayerId,
+    spell_id: ObjectId,
+    source: &GameObject,
+    definition: &StaticDefinition,
+    fused: bool,
+) -> bool {
+    let StaticMode::ModifyCost {
+        mode: CostModifyMode::Minimum,
+        spell_filter,
+        ..
+    } = &definition.mode
+    else {
+        return false;
+    };
+    if source.zone != Zone::Battlefield {
+        return false;
+    }
+    if !definition.active_zones.is_empty() && !definition.active_zones.contains(&Zone::Battlefield)
+    {
+        return false;
+    }
+    if let Some(TargetFilter::Typed(typed)) = &definition.affected {
+        use crate::types::ability::ControllerRef;
+        match typed.controller {
+            Some(ControllerRef::You) if caster != source.controller => return false,
+            Some(ControllerRef::Opponent) if caster == source.controller => return false,
+            _ => {}
+        }
+    }
+    if definition.condition.as_ref().is_some_and(|condition| {
+        !super::layers::evaluate_condition(state, condition, caster, source.id)
+    }) {
+        return false;
+    }
+    spell_filter.as_ref().is_none_or(|filter| {
+        analyze_cost_filter_before_targets_for(state, caster, spell_id, filter, source.id, fused)
+            .is_relevant()
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_cost_floor_inner(
     state: &GameState,
@@ -8100,6 +8317,12 @@ fn apply_cost_floor_inner(
     for (bf_obj, def) in super::functioning_abilities::battlefield_functioning_statics(state) {
         let bf_id = bf_obj.id;
 
+        if !battlefield_cost_floor_applies_before_targets(
+            state, caster, spell_id, bf_obj, def, fused,
+        ) {
+            continue;
+        }
+
         let StaticMode::ModifyCost {
             mode: CostModifyMode::Minimum,
             ref amount,
@@ -8110,44 +8333,19 @@ fn apply_cost_floor_inner(
             continue;
         };
 
-        let has_target_filter = spell_filter
-            .as_ref()
-            .is_some_and(cost_filter_has_target_ref);
-        if target_sensitive_only && !has_target_filter {
+        let filter_analysis = spell_filter.as_ref().map_or(
+            PreTargetCostFilterAnalysis::TargetIndependentRelevant,
+            |filter| {
+                analyze_cost_filter_before_targets_for(
+                    state, caster, spell_id, filter, bf_id, fused,
+                )
+            },
+        );
+        if target_sensitive_only && !filter_analysis.is_target_dependent() {
             continue;
         }
-        if selected_ability.is_none() && has_target_filter {
+        if selected_ability.is_none() && filter_analysis.is_target_dependent() {
             continue;
-        }
-
-        // CR 113.6: Statics that declare non-battlefield active_zones must not
-        // fire from the battlefield. Empty active_zones = battlefield default.
-        if !def.active_zones.is_empty() && !def.active_zones.contains(&Zone::Battlefield) {
-            continue;
-        }
-
-        // CR 601.2f: Optional caster-scope check via `def.affected`. Trinisphere
-        // emits `affected: None` (the floor applies to every spell), but a
-        // future filtered floor variant ("each spell your opponents cast that
-        // would cost less than ... ") could carry a `ControllerRef`-scoped
-        // affected filter; honor it here for forward-compatibility.
-        if let Some(crate::types::ability::TargetFilter::Typed(ref tf)) = def.affected {
-            use crate::types::ability::ControllerRef;
-            let source_controller = bf_obj.controller;
-            match tf.controller {
-                Some(ControllerRef::You) if caster != source_controller => continue,
-                Some(ControllerRef::Opponent) if caster == source_controller => continue,
-                _ => {}
-            }
-        }
-
-        // CR 601.2f: Evaluate the static's `condition` ("as long as this artifact
-        // is untapped") against the source permanent. Trinisphere's effect
-        // turns off entirely when the artifact is tapped.
-        if let Some(ref cond) = def.condition {
-            if !super::layers::evaluate_condition(state, cond, caster, bf_id) {
-                continue;
-            }
         }
 
         // CR 601.2f: Spell-type filter narrows which spells are floored.
@@ -13595,6 +13793,16 @@ fn can_feasibly_pay_harmonize_mana_cost_with_probe(
     if can_feasibly_pay_mana_cost_with_probe(state, player, Some(source_id), cost, probe) {
         return true;
     }
+    if can_feasibly_pay_mana_cost_with_assist(
+        state,
+        player,
+        source_id,
+        variant == CastingVariant::Fuse,
+        cost,
+        probe,
+    ) {
+        return true;
+    }
     let ManaCost::Cost { generic, .. } = cost else {
         return false;
     };
@@ -13635,6 +13843,45 @@ fn can_feasibly_pay_harmonize_mana_cost_with_probe(
                 None,
             )
         })
+}
+
+/// CR 702.132a + CR 601.2h: Assist may split only the generic portion of a
+/// spell's total cost between its caster and one chosen other player. Candidate
+/// feasibility must therefore preserve a cast that neither player can pay alone
+/// when some concrete helper contribution leaves both shares payable.
+fn can_feasibly_pay_mana_cost_with_assist(
+    state: &GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+    fused: bool,
+    cost: &ManaCost,
+    probe: Option<&PriorityCastProbe>,
+) -> bool {
+    let Some((generic, candidates)) =
+        casting_costs::assist_offer_params(state, player, source_id, cost, fused)
+    else {
+        return false;
+    };
+    let ManaCost::Cost { shards, .. } = cost else {
+        return false;
+    };
+
+    (1..=generic).any(|contribution| {
+        let helper_cost = ManaCost::generic(contribution);
+        candidates.iter().any(|helper| {
+            can_feasibly_pay_mana_cost_with_probe(state, *helper, None, &helper_cost, None)
+                && can_feasibly_pay_mana_cost_with_probe(
+                    state,
+                    player,
+                    Some(source_id),
+                    &ManaCost::Cost {
+                        shards: shards.clone(),
+                        generic: generic - contribution,
+                    },
+                    probe,
+                )
+        })
+    })
 }
 
 fn can_cast_prepared_now_with_probe(
@@ -13988,7 +14235,7 @@ fn can_cast_prepared_now_with_probe(
 /// Used by legal action generation so the frontend and engine agree on whether
 /// a spell is castable from the current board state.
 fn can_pay_mana_cost_after_auto_tap_with_context(
-    simulated: GameState,
+    mut simulated: GameState,
     player: PlayerId,
     source_id: Option<ObjectId>,
     cost: &crate::types::mana::ManaCost,
@@ -13996,7 +14243,7 @@ fn can_pay_mana_cost_after_auto_tap_with_context(
     excluded_sources: &HashSet<ObjectId>,
 ) -> bool {
     can_pay_mana_cost_after_auto_tap_with_context_and_cache(
-        simulated,
+        &mut simulated,
         player,
         source_id,
         cost,
@@ -14013,7 +14260,7 @@ struct AutoTapProbeOptions<'a> {
 }
 
 fn can_pay_mana_cost_after_auto_tap_with_context_and_cache(
-    mut simulated: GameState,
+    simulated: &mut GameState,
     player: PlayerId,
     source_id: Option<ObjectId>,
     cost: &crate::types::mana::ManaCost,
@@ -14023,7 +14270,7 @@ fn can_pay_mana_cost_after_auto_tap_with_context_and_cache(
 ) -> bool {
     let mut tap_events: Vec<crate::types::events::GameEvent> = Vec::new();
     super::casting_costs::auto_tap_mana_sources_with_context_excluding_cached(
-        &mut simulated,
+        simulated,
         player,
         cost,
         &mut tap_events,
@@ -14037,7 +14284,7 @@ fn can_pay_mana_cost_after_auto_tap_with_context_and_cache(
     // preview at a replacement choice. That is an in-progress, payable mana
     // payment, not evidence that the source is unavailable. The live flow
     // serializes the cursor and resumes it after the choice.
-    if mana_ability_cost_payment_is_paused(&simulated) {
+    if mana_ability_cost_payment_is_paused(simulated) {
         return true;
     }
 
@@ -14049,14 +14296,14 @@ fn can_pay_mana_cost_after_auto_tap_with_context_and_cache(
     // `resolve_tap_mana_triggers_inline` as the single authority so they cannot
     // diverge (a divergence was the original bug — the preview said a spell was
     // castable while the real cast failed "Cannot pay mana cost").
-    super::triggers::resolve_tap_mana_triggers_inline(&mut simulated, &mut tap_events, 0);
+    super::triggers::resolve_tap_mana_triggers_inline(simulated, &mut tap_events, 0);
 
-    let any_color = player_can_spend_as_any_color_for_payment(&simulated, player, source_id, ctx);
+    let any_color = player_can_spend_as_any_color_for_payment(simulated, player, source_id, ctx);
     // CR 107.4f + CR 118.1 + CR 118.3 + CR 119.8: Bundle the payer's
     // payment-time permissions (`any_color`, `max_life`, `life_colors`) so
     // K'rrik-style life-for-{B} grants are visible to the affordability check.
     let permissions =
-        super::static_abilities::build_cost_permission_context(&simulated, player, any_color);
+        super::static_abilities::build_cost_permission_context(simulated, player, any_color);
     simulated
         .players
         .iter()
@@ -14067,7 +14314,7 @@ fn can_pay_mana_cost_after_auto_tap_with_context_and_cache(
                     matches!(ctx, PaymentContext::Spell(_))
                         && source_id.is_some_and(|source_id| {
                             can_pay_with_spell_tap_payments(
-                                &simulated,
+                                simulated,
                                 player,
                                 source_id,
                                 cost,
@@ -14131,6 +14378,132 @@ pub(super) fn spell_tap_payment_mode_for(
     } else {
         None
     }
+}
+
+/// CR 601.2c + CR 601.2f: Target selection may precede locking the final
+/// mana obligation. Return true only when none of the production cost axes can
+/// still change the amount or the sources available before payment.
+pub(super) fn pending_mana_obligation_is_stable_before_targets(
+    state: &GameState,
+    player: PlayerId,
+    pending: &PendingCast,
+) -> bool {
+    if pending.activation_ability_index.is_some()
+        || casting_costs::cost_has_x(&pending.cost)
+        || pending.additional_cost_flow.is_some()
+        || pending.deferred_required_additional_cost.is_some()
+        || !pending.additional_cost_queue.is_empty()
+        || pending.additional_cost_payment_mode.is_some()
+        || pending.deferred_target_selection
+    {
+        return false;
+    }
+
+    let fused = pending.casting_variant == CastingVariant::Fuse;
+    let effective_keywords = effective_spell_keywords_for(state, player, pending.object_id, fused);
+    if effective_keywords
+        .iter()
+        .any(|keyword| matches!(keyword, Keyword::Harmonize(_)))
+        || casting_costs::assist_offer_params(
+            state,
+            player,
+            pending.object_id,
+            &pending.cost,
+            fused,
+        )
+        .is_some()
+        || spell_tap_payment_mode_for(state, player, pending.object_id, fused).is_some()
+    {
+        return false;
+    }
+
+    let Some(spell) = state.objects.get(&pending.object_id) else {
+        return false;
+    };
+    if spell.strive_cost.is_some()
+        || spell.static_definitions.iter_all().any(|definition| {
+            let StaticMode::ModifyCost {
+                spell_filter: Some(filter),
+                ..
+            } = &definition.mode
+            else {
+                return false;
+            };
+            analyze_cost_filter_before_targets_for(
+                state,
+                player,
+                pending.object_id,
+                filter,
+                pending.object_id,
+                fused,
+            )
+            .is_target_dependent()
+                && self_spell_cost_modifier_applies_before_targets(
+                    state,
+                    player,
+                    pending.object_id,
+                    definition,
+                    Some(pending.casting_variant),
+                )
+        })
+    {
+        return false;
+    }
+
+    !super::functioning_abilities::game_functioning_statics(state).any(|(source, definition)| {
+        let payment_axis_unstable = match &definition.mode {
+            StaticMode::ModifyCost {
+                spell_filter: Some(filter),
+                ..
+            } => analyze_cost_filter_before_targets_for(
+                state,
+                player,
+                pending.object_id,
+                filter,
+                source.id,
+                fused,
+            )
+            .is_target_dependent(),
+            StaticMode::ImposeAdditionalCost {
+                spell_filter: Some(filter),
+                ..
+            } => analyze_cost_filter_before_targets_for(
+                state,
+                player,
+                pending.object_id,
+                filter,
+                source.id,
+                false,
+            )
+            .is_relevant(),
+            StaticMode::ImposeAdditionalCost {
+                spell_filter: None, ..
+            } => true,
+            _ => false,
+        };
+        payment_axis_unstable
+            && (battlefield_cost_modifier_applies_before_targets(
+                state,
+                player,
+                pending.object_id,
+                source,
+                definition,
+                fused,
+            ) || battlefield_cost_floor_applies_before_targets(
+                state,
+                player,
+                pending.object_id,
+                source,
+                definition,
+                fused,
+            ) || imposed_additional_cost_applies_before_targets(
+                state,
+                player,
+                pending.object_id,
+                source,
+                definition,
+            ))
+    })
 }
 
 fn can_pay_with_spell_tap_payments(
@@ -14378,6 +14751,7 @@ pub fn can_pay_cost_after_auto_tap_with_probe(
     cost: &crate::types::mana::ManaCost,
     probe: Option<&PriorityCastProbe>,
 ) -> bool {
+    crate::game::perf_counters::record_auto_payment_borrowed_wrapper();
     let mut simulated = state.clone();
     let probe_matches =
         probe.is_some_and(|probe| probe.player() == player && probe.is_for_state(state));
@@ -14390,7 +14764,7 @@ pub fn can_pay_cost_after_auto_tap_with_probe(
 
     let spell_ctx = spell_meta.as_ref().map(PaymentContext::Spell);
     can_pay_mana_cost_after_auto_tap_with_context_and_cache(
-        simulated,
+        &mut simulated,
         player,
         Some(source_id),
         cost,
@@ -14398,6 +14772,37 @@ pub fn can_pay_cost_after_auto_tap_with_probe(
         &HashSet::new(),
         AutoTapProbeOptions {
             source_cache,
+            explicit_tap_payment_mode: None,
+        },
+    )
+}
+
+/// CR 601.2g-h: Reuse an already-disposable post-reducer state to test the
+/// exact pending spell with the production Auto payer. This entry owns no
+/// `GameState` clone and never reuses the pre-action source cache.
+pub(crate) fn can_pay_pending_cast_after_auto_tap_in_scratch(
+    state: &mut GameState,
+    pending: &PendingCast,
+) -> bool {
+    let _phase = crate::game::perf_counters::LegalityClonePhaseGuard::enter(
+        crate::game::perf_counters::LegalityClonePhase::PostApplyCore,
+    );
+    crate::game::perf_counters::record_post_apply_auto_payment_core_call();
+    if state.layers_dirty.is_dirty() {
+        super::layers::flush_layers(state);
+    }
+    let player = pending.ability.controller;
+    let spell_meta = build_spell_meta(state, player, pending.object_id);
+    let spell_ctx = spell_meta.as_ref().map(PaymentContext::Spell);
+    can_pay_mana_cost_after_auto_tap_with_context_and_cache(
+        state,
+        player,
+        Some(pending.object_id),
+        &pending.cost,
+        spell_ctx.as_ref(),
+        &HashSet::new(),
+        AutoTapProbeOptions {
+            source_cache: None,
             explicit_tap_payment_mode: None,
         },
     )
@@ -14506,8 +14911,9 @@ fn feasibly_payable_with_tap_payment_mode_in_context(
     tap_payment_mode: ConvokeMode,
     ctx: Option<&PaymentContext>,
 ) -> bool {
+    let mut auto_tap_scratch = simulated.clone();
     if can_pay_mana_cost_after_auto_tap_with_context_and_cache(
-        simulated.clone(),
+        &mut auto_tap_scratch,
         player,
         Some(source_id),
         cost,

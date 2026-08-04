@@ -3610,6 +3610,20 @@ pub(crate) fn priority_actions_with_probe(
 
     // CR 702.61a: Spells and non-mana activated abilities are suppressed by split second.
     if !split_second_active {
+        // CR 601.2g-h: Mana abilities are activated before the total cost is
+        // paid. When every available capability requires a sacrifice, retain
+        // the spell offer but stop at that irreversible source choice.
+        let mana_source_selections =
+            mana_sources::activatable_mana_source_selections(state, player);
+        let cast_payment_mode = if !mana_source_selections.is_empty()
+            && mana_source_selections
+                .iter()
+                .all(|selection| selection.penalty == mana_sources::ManaSourcePenalty::Sacrifices)
+        {
+            CastPaymentMode::AutoExceptSacrificialMana
+        } else {
+            CastPaymentMode::Auto
+        };
         for object_id in casting::spell_objects_available_to_cast(state, player) {
             let Some(obj) = state.objects.get(&object_id) else {
                 continue;
@@ -3621,7 +3635,7 @@ pub(crate) fn priority_actions_with_probe(
                         card_id: obj.card_id,
                         targets: Vec::new(),
 
-                        payment_mode: CastPaymentMode::Auto,
+                        payment_mode: cast_payment_mode,
                     },
                     TacticalClass::Spell,
                     Some(player),

@@ -13644,8 +13644,9 @@ mod priority_facade_boundary_tests {
 mod priority_principal_tests {
     use super::{
         apply_actionless_priority_pass_for_prospective, preflight_priority_window,
+        priority_announcement_to_action, priority_preflight_candidates,
         priority_principal_for_preflight, PriorityPreflight, PriorityPreflightBlock,
-        PriorityPreflightIndeterminate, PriorityReducerFamily,
+        PriorityPreflightCandidate, PriorityPreflightIndeterminate, PriorityReducerFamily,
     };
     use crate::game::zones;
     use crate::types::card_type::CoreType;
@@ -13809,6 +13810,104 @@ mod priority_principal_tests {
             }
         );
         assert_eq!(state, before);
+    }
+
+    #[test]
+    fn priority_play_face_down_candidate_is_reachable_but_not_an_exact_legal_action_candidate() {
+        use crate::types::actions::GameAction;
+        use crate::types::keywords::Keyword;
+        use crate::types::mana::{ManaCost, ManaType, ManaUnit};
+
+        let player = PlayerId(0);
+        let mut state = GameState::new_two_player(42);
+        state.active_player = player;
+        state.priority_player = player;
+        state.phase = crate::types::phase::Phase::PreCombatMain;
+        state.waiting_for = WaitingFor::Priority { player };
+        let morph = zones::create_object(
+            &mut state,
+            CardId(7_301),
+            player,
+            "Preflight Morph".to_string(),
+            Zone::Hand,
+        );
+        {
+            let object = state.objects.get_mut(&morph).unwrap();
+            object.card_types.core_types.push(CoreType::Creature);
+            object.base_card_types = object.card_types.clone();
+            object.mana_cost = ManaCost::generic(8);
+            object.base_mana_cost = object.mana_cost.clone();
+            object.keywords = vec![Keyword::Morph(ManaCost::generic(5))];
+            object.base_keywords = object.keywords.clone();
+        }
+        let prohibition = zones::create_object(
+            &mut state,
+            CardId(7_302),
+            PlayerId(1),
+            "Preflight Name Prohibition".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            use crate::types::ability::{ChosenAttribute, StaticDefinition, TargetFilter};
+            use crate::types::statics::{ProhibitionScope, StaticMode};
+
+            let object = state.objects.get_mut(&prohibition).unwrap();
+            object.card_types.core_types.push(CoreType::Enchantment);
+            object.base_card_types = object.card_types.clone();
+            object
+                .chosen_attributes
+                .push(ChosenAttribute::CardName("Preflight Morph".to_string()));
+            object.static_definitions.push(
+                StaticDefinition::new(StaticMode::CantBeCast {
+                    who: ProhibitionScope::AllPlayers,
+                })
+                .affected(TargetFilter::HasChosenName),
+            );
+        }
+        for _ in 0..3 {
+            state.players[0].mana_pool.add(ManaUnit::new(
+                ManaType::Colorless,
+                morph,
+                false,
+                vec![],
+            ));
+        }
+        let principal = priority_principal_for_preflight(&state)
+            .expect("the synchronized priority window has a principal");
+        let play_face_down = priority_preflight_candidates(&state, &principal)
+            .into_iter()
+            .find(|candidate| candidate.family() == PriorityReducerFamily::PlayFaceDown)
+            .expect("the family-specific face-down candidate must be reachable");
+        assert_eq!(play_face_down.family(), PriorityReducerFamily::PlayFaceDown);
+        assert_eq!(
+            preflight_priority_window(&state),
+            PriorityPreflight::Actionable {
+                family: PriorityReducerFamily::CastSpell,
+            },
+            "the unchanged first-wins aggregate must report the earlier CastSpell family"
+        );
+        assert!(crate::ai_support::candidate_actions(&state)
+            .iter()
+            .all(|candidate| !matches!(candidate.action, GameAction::PlayFaceDown { .. })));
+        assert!(crate::ai_support::legal_actions(&state)
+            .iter()
+            .all(|action| !matches!(action, GameAction::PlayFaceDown { .. })));
+
+        let PriorityPreflightCandidate::Announcement(announcement) = play_face_down else {
+            panic!("the reachable face-down family must carry a reducer announcement")
+        };
+        let action = priority_announcement_to_action(announcement);
+        assert!(matches!(
+            action,
+            GameAction::PlayFaceDown { object_id, .. } if object_id == morph
+        ));
+        let mut projected = state.clone();
+        super::apply_as_current(&mut projected, action)
+            .expect("the reconstructed face-down announcement must reduce successfully");
+        assert!(projected.waiting_for.pending_cast_ref().is_none());
+        assert!(projected.pending_cast.is_none());
+        assert_eq!(projected.objects[&morph].zone, Zone::Battlefield);
+        assert!(projected.objects[&morph].face_down);
     }
 
     #[test]

@@ -46,7 +46,9 @@ use crate::types::actions::GameAction;
 use crate::types::card_type::CardType;
 use crate::types::counter::CounterType;
 use crate::types::definitions::Definitions;
-use crate::types::game_state::{CastPaymentMode, GameState, WaitingFor};
+use crate::types::game_state::{
+    CastPaymentMode, CastingPermissionIndex, GameState, PendingCast, WaitingFor,
+};
 use crate::types::identifiers::ObjectId;
 use crate::types::keywords::Keyword;
 use crate::types::mana::{ManaColor, ManaCost};
@@ -178,7 +180,12 @@ impl CandidateFilter for SimulationFilter {
 
 impl SimulationFilter {
     fn fallback_simulation(&self, state: &GameState, candidate: &CandidateAction) -> bool {
+        let _phase = crate::game::perf_counters::LegalityClonePhaseGuard::enter(
+            crate::game::perf_counters::LegalityClonePhase::RawValidation,
+        );
         crate::game::perf_counters::record_state_clone_for_legality();
+        crate::game::perf_counters::record_phase_owned_state_clone();
+        let before = pending_spell_root(state).map(|(provenance, _)| provenance);
         let mut sim = state.clone();
         // PR-3 Defect-2: mark the entire nested clone-and-apply as a legality probe so
         // the top-level-only loop-shortcut detection (`reconcile_terminal_result` §3)
@@ -199,15 +206,45 @@ impl SimulationFilter {
             .or_else(|| turn_control::authorized_submitters(state).first().copied());
         actor.is_some_and(|actor| {
             let semantic_owner = candidate.metadata.semantic_owner.unwrap_or(actor);
-            crate::game::engine::apply_interaction_for_simulation(
+            if crate::game::engine::apply_interaction_for_simulation(
                 &mut sim,
                 actor,
                 semantic_owner,
                 candidate.action.clone(),
             )
-            .is_ok()
+            .is_err()
+            {
+                return false;
+            }
+
+            let Some((after, pending)) = pending_spell_root(&sim) else {
+                return true;
+            };
+            if before == Some(after) {
+                return true;
+            }
+            !matches!(
+                crate::game::casting_costs::post_origin_auto_payment_verdict(&mut sim, &pending,),
+                Some(false)
+            )
         })
     }
+}
+
+type SpellRootProvenance = (ObjectId, Option<CastingPermissionIndex>);
+
+fn pending_spell_root(state: &GameState) -> Option<(SpellRootProvenance, PendingCast)> {
+    state
+        .waiting_for
+        .pending_cast_ref()
+        .or(state.pending_cast.as_deref())
+        .filter(|pending| pending.activation_ability_index.is_none())
+        .map(|pending| {
+            (
+                (pending.object_id, pending.casting_permission_index),
+                pending.clone(),
+            )
+        })
 }
 
 fn structurally_valid_priority_activation(state: &GameState, action: &GameAction) -> bool {
@@ -242,6 +279,9 @@ fn structurally_valid_priority_cast_with_probe(
     action: &GameAction,
     probe: Option<&casting::PriorityCastProbe>,
 ) -> bool {
+    let _phase = crate::game::perf_counters::LegalityClonePhaseGuard::enter(
+        crate::game::perf_counters::LegalityClonePhase::StrictFastPath,
+    );
     let (
         WaitingFor::Priority { player },
         GameAction::CastSpell {
