@@ -2102,6 +2102,7 @@ dependencies = [
  "sha2",
  "smallvec",
  "strum",
+ "syn 2.0.117",
  "tempfile",
  "thiserror 2.0.18",
  "toml",

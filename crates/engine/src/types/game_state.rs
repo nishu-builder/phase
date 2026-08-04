@@ -138,15 +138,18 @@ mod tuple_key_map {
     use serde::{Deserializer, Serializer};
     use std::fmt;
 
-    pub fn serialize<S>(
-        map: &HashMap<(ObjectId, usize), u32>,
+    pub fn serialize<S, H>(
+        map: &HashMap<(ObjectId, usize), u32, H>,
         serializer: S,
     ) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        let mut ser_map = serializer.serialize_map(Some(map.len()))?;
-        for ((oid, idx), val) in map {
+        let mut entries: Vec<_> = map.iter().collect();
+        entries.sort_unstable_by_key(|(key, _)| *key);
+
+        let mut ser_map = serializer.serialize_map(Some(entries.len()))?;
+        for ((oid, idx), val) in entries {
             ser_map.serialize_entry(&format!("{}_{}", oid.0, idx), val)?;
         }
         ser_map.end()
@@ -195,14 +198,16 @@ mod tuple_key_map {
 mod trigger_definition_ref_map {
     use super::*;
 
-    pub fn serialize<S>(
-        map: &HashMap<TriggerDefinitionRef, u32>,
+    pub fn serialize<S, H>(
+        map: &HashMap<TriggerDefinitionRef, u32, H>,
         serializer: S,
     ) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        map.iter().collect::<Vec<_>>().serialize(serializer)
+        let mut entries: Vec<_> = map.iter().collect();
+        entries.sort_unstable_by_key(|(key, _)| *key);
+        entries.serialize(serializer)
     }
 
     pub fn deserialize<'de, D>(
@@ -3684,7 +3689,11 @@ pub struct PendingChooseOneOf {
     pub context: super::ability::SpellContext,
     /// CR 614.5 + CR 616.1f: replacement effects already applied to the event
     /// that produced this queued branch choice.
-    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "HashSet::is_empty",
+        serialize_with = "crate::types::deterministic_serde::hash_set"
+    )]
     pub replacement_applied: HashSet<AppliedReplacementKey>,
     pub remaining_players: Vec<PlayerId>,
 }
@@ -4584,7 +4593,11 @@ pub struct PendingBatchDeliveries {
     /// physical-card delivery is being resumed. Meld result redirects reuse
     /// this set for each component move so the redirect cannot apply again to
     /// either modified event.
-    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "HashSet::is_empty",
+        serialize_with = "crate::types::deterministic_serde::hash_set"
+    )]
     pub replacement_applied: HashSet<AppliedReplacementKey>,
     /// Exact heterogeneous undelivered suffix. New saves use this authority;
     /// the uniform fields above remain as a compatibility projection for older
@@ -4618,7 +4631,11 @@ pub enum PendingBatchZoneChangeCause {
     StateBasedAction,
     CommanderRuleReturn,
     Draw {
-        #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+        #[serde(
+            default,
+            skip_serializing_if = "HashSet::is_empty",
+            serialize_with = "crate::types::deterministic_serde::hash_set"
+        )]
         seed_applied: HashSet<AppliedReplacementKey>,
     },
     CastingToStack {
@@ -4653,7 +4670,11 @@ pub struct PendingBatchZoneMoveRequest {
     pub exile_duration: Option<Duration>,
     #[serde(default)]
     pub exile_tracking: ZoneDeliveryExileTracking,
-    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "HashSet::is_empty",
+        serialize_with = "crate::types::deterministic_serde::hash_set"
+    )]
     pub replacement_applied: HashSet<AppliedReplacementKey>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub face_down_in_exile: bool,
@@ -9126,20 +9147,34 @@ pub enum WaitingFor {
         /// key means "no legal targets" (no fallback). New prompts always emit
         /// `Some` — computed by the same engine constraints model that enforces
         /// legality in `validate_attack_declaration`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            serialize_with = "crate::types::deterministic_serde::option_hash_map",
+            deserialize_with = "crate::types::deterministic_serde::deserialize_option_numeric_hash_map"
+        )]
         valid_attack_targets_by_attacker:
             Option<HashMap<ObjectId, Vec<crate::game::combat::AttackTarget>>>,
         /// CR 508.1c / CR 508.1d: per-creature combat requirement/restriction
         /// (must-attack / can't-attack) for display badges and Confirm gating.
         /// Display-only — computed by `combat::attacker_constraints_for_active_player`,
         /// the same predicates that enforce legality in `validate_attackers`.
-        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        #[serde(
+            default,
+            skip_serializing_if = "HashMap::is_empty",
+            serialize_with = "crate::types::deterministic_serde::hash_map",
+            deserialize_with = "crate::types::deterministic_serde::deserialize_numeric_hash_map"
+        )]
         attacker_constraints: HashMap<ObjectId, crate::game::combat::CombatRequirement>,
     },
     DeclareBlockers {
         player: PlayerId,
         valid_blocker_ids: Vec<ObjectId>,
-        #[serde(default)]
+        #[serde(
+            default,
+            serialize_with = "crate::types::deterministic_serde::hash_map",
+            deserialize_with = "crate::types::deterministic_serde::deserialize_numeric_hash_map"
+        )]
         valid_block_targets: HashMap<ObjectId, Vec<ObjectId>>,
         /// CR 702.111b (Menace) + CR 509.1b: per-attacker minimum-blocker count
         /// (`count`) plus the `sources` carriers imposing it, for attackers
@@ -9148,13 +9183,23 @@ pub enum WaitingFor {
         /// attackers with the trivial requirement of 1 are omitted. Computed by
         /// `combat::block_requirements_for_player` — the same authority that
         /// enforces the requirement in `validate_blocks`.
-        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        #[serde(
+            default,
+            skip_serializing_if = "HashMap::is_empty",
+            serialize_with = "crate::types::deterministic_serde::hash_map",
+            deserialize_with = "crate::types::deterministic_serde::deserialize_numeric_hash_map"
+        )]
         block_requirements: HashMap<ObjectId, crate::game::combat::BlockRequirement>,
         /// CR 509.1b / CR 509.1c: per-creature combat requirement/restriction
         /// (must-block / can't-block) for display badges and Confirm gating.
         /// Display-only — computed by `combat::blocker_constraints_for_player`,
         /// the same predicate that enforces legality in `validate_blockers_for_player`.
-        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        #[serde(
+            default,
+            skip_serializing_if = "HashMap::is_empty",
+            serialize_with = "crate::types::deterministic_serde::hash_map",
+            deserialize_with = "crate::types::deterministic_serde::deserialize_numeric_hash_map"
+        )]
         blocker_constraints: HashMap<ObjectId, crate::game::combat::CombatRequirement>,
     },
     /// CR 502.3: During the untap step, the active player may choose not to
@@ -9523,7 +9568,11 @@ pub enum WaitingFor {
         context: super::ability::SpellContext,
         /// CR 614.5 + CR 616.1f: replacement effects already applied to the
         /// event that produced this choice.
-        #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+        #[serde(
+            default,
+            skip_serializing_if = "HashSet::is_empty",
+            serialize_with = "crate::types::deterministic_serde::hash_set"
+        )]
         replacement_applied: HashSet<AppliedReplacementKey>,
         /// Players still to face the same choice in APNAP order (CR 701.55d).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -12819,7 +12868,11 @@ pub struct LiminalEntry {
     pub kind: LiminalEntryKind,
     /// CR 614.5: applied replacement identities from the projected entry. Meld
     /// redirects seed both physical component moves with this shared set.
-    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "HashSet::is_empty",
+        serialize_with = "crate::types::deterministic_serde::hash_set"
+    )]
     pub replacement_applied: HashSet<AppliedReplacementKey>,
 }
 
@@ -13024,7 +13077,10 @@ declare_game_state! {
     // the default SipHash RandomState: ObjectId is a thin integer key and this
     // map is looked up millions of times per large-board resolution — profiling
     // showed SipHash hashing + HAMT lookup was ~35% of resolution CPU.
-    #[serde(deserialize_with = "deserialize_objects_with_trigger_provenance")]
+    #[serde(
+        deserialize_with = "deserialize_objects_with_trigger_provenance",
+        serialize_with = "crate::types::deterministic_serde::im_hash_map"
+    )]
     pub objects: im::HashMap<ObjectId, GameObject, rustc_hash::FxBuildHasher>,
     pub next_object_id: u64,
     /// CR 603.7: persisted monotonic delayed-trigger installation allocator.
@@ -13073,6 +13129,7 @@ declare_game_state! {
     pub battlefield: im::Vector<ObjectId>,
     pub stack: im::Vector<StackEntry>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub stack_paid_facts: HashMap<ObjectId, StackPaidSnapshot>,
     pub exile: im::Vector<ObjectId>,
 
@@ -13136,6 +13193,7 @@ declare_game_state! {
     // Replacement effects
     pub pending_replacement: Option<PendingReplacement>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub liminal_entries: HashMap<ObjectId, LiminalEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_liminal_entry_resume: Option<PendingLiminalEntryResume>,
@@ -13168,7 +13226,11 @@ declare_game_state! {
     /// via `resolve_ability_chain`, so clearing earlier wipes the seed before
     /// those later token proposals and re-prompts the originating token-choice
     /// replacement (issue #4886).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::types::deterministic_serde::option_hash_set"
+    )]
     pub post_replacement_token_choice_applied:
         Option<std::collections::HashSet<crate::types::proposed_event::AppliedReplacementKey>>,
 
@@ -13326,6 +13388,7 @@ declare_game_state! {
     /// Memorial" without inferring source by name-diffing. Display metadata
     /// only — never read by game logic. Empty objects skip serialization.
     #[serde(default, skip_serializing_if = "im::HashMap::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::im_hash_map")]
     pub attribution: im::HashMap<ObjectId, ObjectAttribution>,
 
     /// CR 613.1d: Remote recipients whose live card types were derived by a
@@ -13441,6 +13504,7 @@ declare_game_state! {
 
     /// CR 603.7: Object sets tracked for delayed triggers ("those cards", "that creature").
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub tracked_object_sets: HashMap<TrackedSetId, Vec<ObjectId>>,
 
     #[serde(default)]
@@ -13477,22 +13541,26 @@ declare_game_state! {
     /// action provenance (selection sets via `publish_fresh_tracked_set`) are
     /// absent here and are read only by `caused_by: None` references.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map_of_hash_map")]
     pub tracked_set_member_causes: HashMap<TrackedSetId, HashMap<ObjectId, ThisWayCause>>,
 
     // Commander support
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub commander_cast_count: HashMap<ObjectId, u32>,
 
     /// Owner stamped when a commander cast from the command zone is recorded.
     /// CR 903.8: `commander_casts_from_command_zone` must count committed casts
     /// even when the recorded `ObjectId` no longer has `is_commander` set.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub commander_cast_owners: HashMap<ObjectId, PlayerId>,
 
     /// CR 903.9a: Commanders whose owner declined the zone-return choice this
     /// SBA cycle. Cleared when the commander changes zones again (giving the
     /// owner a fresh choice opportunity).
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub commander_declined_zone_return: HashSet<ObjectId>,
 
     /// CR 120.3 + CR 120.6 + CR 702.11b: Battlefield objects that have actually
@@ -13503,6 +13571,7 @@ declare_game_state! {
     /// would-deal amount of CR 120.1a); cleared when the object leaves the
     /// battlefield so a flickered object starts with a clean slate.
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub objects_that_dealt_damage: HashSet<ObjectId>,
 
     /// CR 500.7: Extra turns granted by effects, stored as a LIFO stack.
@@ -13524,6 +13593,7 @@ declare_game_state! {
     /// CR 614.10a: Per-player counts of step occurrences to skip. A pending skip
     /// is consumed only when the named step would otherwise happen.
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::vec_hash_map")]
     pub steps_to_skip: Vec<HashMap<Phase, u32>>,
 
     /// CR 614.10 + CR 614.10a: Per-player turn-scoped combat-phase skip state.
@@ -13599,6 +13669,7 @@ declare_game_state! {
     pub priority_passes: BTreeSet<PlayerId>,
     /// Per-player auto-pass flags. When set, the engine auto-passes for this player.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub auto_pass: HashMap<PlayerId, AutoPassMode>,
 
     /// Per-player phase-stop preferences. While a player's `UntilTurnBoundary`
@@ -13610,17 +13681,20 @@ declare_game_state! {
     /// carries a `PhaseStopScope` (all turns / own turn / opponents' turns),
     /// resolved against `active_player` (CR 102.1) by `phase_stop_hit`.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub phase_stops: HashMap<PlayerId, Vec<PhaseStop>>,
 
     /// Sparse per-player priority-passing preference. Missing entries are
     /// [`PriorityPassingMode::Standard`], preserving legacy saved-game behavior.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub priority_passing_modes: HashMap<PlayerId, PriorityPassingMode>,
 
     /// CR 605.3: Lands manually tapped for mana via TapLandForMana this priority window.
     /// Per-player map enables multiplayer correctness (e.g., UnlessPayment opponent tapping).
     /// Cleared on priority pass, cast, non-mana action, or phase transition.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub lands_tapped_for_mana: HashMap<PlayerId, Vec<ObjectId>>,
 
     /// CR 103.5 + 103.5b: Per-player ledger of bottom cards already put on the
@@ -13638,6 +13712,7 @@ declare_game_state! {
     ///
     /// Cleared when the mulligan flow finishes (all players out of `pending`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub prepaid_mulligan_bottoms: HashMap<PlayerId, u8>,
 
     /// When true, `GameAction::Debug(...)` actions are accepted.
@@ -13873,6 +13948,7 @@ declare_game_state! {
 
     // Trigger constraint tracking keyed by exact source incarnation + occurrence.
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub triggers_fired_this_turn: HashSet<TriggerDefinitionRef>,
     /// CR 603.4: Per-trigger fire counts for MaxTimesPerTurn constraint.
     /// Tracks how many times each exact occurrence has fired this turn.
@@ -13885,8 +13961,10 @@ declare_game_state! {
     /// CR 603.2: Tracks per-opponent-per-turn firing for
     /// OncePerOpponentPerTurn. Keyed by exact occurrence and opponent.
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub triggers_fired_this_turn_per_opponent: HashSet<(TriggerDefinitionRef, PlayerId)>,
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub triggers_fired_this_game: HashSet<TriggerDefinitionRef>,
     #[serde(
         default,
@@ -13906,6 +13984,7 @@ declare_game_state! {
     /// `abilities[]` entry, so it cannot use `activated_abilities_this_turn`
     /// (keyed by `(source_id, ability_index)`). Cleared at turn start.
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub crew_activated_this_turn: HashSet<ObjectIncarnationRef>,
     /// CR 606.1 + CR 606.3 + CR 603.4: Per-player count of loyalty-ability
     /// activations this turn. Incremented in
@@ -13917,6 +13996,7 @@ declare_game_state! {
     /// conditions like The Chain Veil's "if you activated a loyalty ability of
     /// a planeswalker this turn". Cleared at turn start.
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub loyalty_abilities_activated_this_turn: HashMap<PlayerId, u32>,
     /// CR 606.3: Per-player extra loyalty-activation grants for this turn —
     /// each entry raises the per-permanent CR 606.3 cap for every planeswalker
@@ -13925,6 +14005,7 @@ declare_game_state! {
     /// activated ability). Consumed by
     /// `planeswalker::can_activate_loyalty_ability`. Cleared at turn start.
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub extra_loyalty_activations_this_turn: HashMap<PlayerId, u32>,
     /// CR 701.43d: Permanents exerted this turn via the "you may exert it as it
     /// attacks" optional attack cost (Combat Celebrant, Glory-Bound Initiate,
@@ -13934,6 +14015,7 @@ declare_game_state! {
     /// start. Distinct from the exert *cost* path (a `CantUntap` transient), this
     /// set is the authoritative "was exerted this turn" record.
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub exerted_this_turn: std::collections::HashSet<ObjectId>,
     /// CR 701.26 + CR 603.4: Count of times each object became tapped this turn,
     /// keyed by object id. Populated at the central `GameEvent::PermanentTapped`
@@ -13942,6 +14024,7 @@ declare_game_state! {
     /// turn" — the count model (not a HashSet) keeps the CR 603.4 resolution-time
     /// re-check of `FirstTimeObjectTappedThisTurn` correct.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub object_tap_count_this_turn: std::collections::HashMap<ObjectId, u32>,
     /// CR 122.1 + CR 603.4: Count of distinct counter-placement *occurrences*
     /// (put-events, not records) on each object this turn, keyed by object id.
@@ -13955,6 +14038,7 @@ declare_game_state! {
     /// `impl PartialEq` (mirrors `object_tap_count_this_turn`): a per-turn
     /// observational counter must not perturb board-equality.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub object_counter_placement_count_this_turn: std::collections::HashMap<ObjectId, u32>,
     /// CR 508.1g + CR 508.2: Declaration events (e.g. `AttackersDeclared`) held
     /// while the active player resolves the optional "exert as it attacks"
@@ -13984,6 +14068,7 @@ declare_game_state! {
     /// used this turn. Keyed by the granting permanent's ObjectId.
     /// CR 400.7: Zone change creates new ObjectId, naturally resetting.
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub graveyard_cast_permissions_used: HashSet<ObjectId>,
     /// CR 110.4 + CR 601.2a: Tracks which permanent-type slots a
     /// `OncePerTurnPerPermanentType` graveyard-cast permission source has
@@ -13996,6 +14081,7 @@ declare_game_state! {
     /// CR 400.7: Zone change creates a new source `ObjectId`, naturally
     /// resetting all slots.
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub graveyard_cast_permissions_used_per_type: HashSet<(ObjectId, super::card_type::CoreType)>,
     /// CR 110.4: Transient slot stashed by the ChoosePermanentTypeSlot dispatch
     /// for the land-play path. Consumed by `record_graveyard_play_permission` on
@@ -14007,6 +14093,7 @@ declare_game_state! {
     /// permanent's ObjectId. Unlimited sources (Omniscience) never populate this.
     /// CR 400.7: Zone change creates new ObjectId, naturally resetting.
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub hand_cast_free_permissions_used: HashSet<ObjectId>,
     /// CR 118.9 + CR 601.2b: Tracks which once-per-turn `CastWithAlternativeCost`
     /// grant sources (As Foretold) have already had their alternative cost applied
@@ -14015,10 +14102,12 @@ declare_game_state! {
     /// CR 400.7: Zone change creates a new ObjectId, so the permission naturally
     /// resets when the source leaves and returns.
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub alt_cost_grant_permissions_used: HashSet<ObjectId>,
     /// CR 601.2a: Tracks once-per-turn `PlayFromExile` permission sources
     /// consumed this turn. Keyed by the granting source's ObjectId.
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub exile_play_permissions_used: HashSet<ObjectId>,
     /// CR 601.2a + CR 603.7 + CR 611.2a: Tracks `single_use` `PlayFromExile`
     /// grants whose one allowed cast has already been spent. Keyed by the
@@ -14030,6 +14119,7 @@ declare_game_state! {
     /// per turn — it is pruned only when the grant itself expires
     /// (`layers::prune_*_casting_permissions` clears stale tracked-set entries).
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub exile_play_single_use_consumed: HashSet<TrackedSetId>,
     /// CR 601.2a + CR 113.6b: Tracks `OncePerTurn` `StaticMode::ExileCastPermission`
     /// sources that have already had a spell cast through them this turn
@@ -14040,6 +14130,7 @@ declare_game_state! {
     /// CR 400.7: Zone change creates a new source `ObjectId`, naturally
     /// resetting the slot when the source leaves and re-enters play.
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub exile_cast_permissions_used: HashSet<ObjectId>,
     /// CR 601.2a + CR 401.5: Tracks `OncePerTurn`
     /// `StaticMode::TopOfLibraryCastPermission` sources that have already had a
@@ -14052,6 +14143,7 @@ declare_game_state! {
     /// CR 400.7: Zone change creates a new source `ObjectId`, naturally
     /// resetting the slot when the source leaves and re-enters play.
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub top_of_library_cast_permissions_used: HashSet<ObjectId>,
     /// CR 113.6b + CR 601.2a: Per-turn rolling list of cards that have been
     /// exiled "with" each linked-exile source during the current turn. Keyed
@@ -14068,6 +14160,7 @@ declare_game_state! {
     /// only by `StaticMode::ExileCastPermission` and similar per-turn
     /// permissions.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub cards_exiled_with_source_this_turn: HashMap<ObjectId, Vec<ObjectId>>,
     /// CR 702.94a + CR 603.11: Per-player first-card-drawn-this-turn tracking for
     /// miracle's linked triggered ability. Populated by the draw pipeline on the
@@ -14077,11 +14170,13 @@ declare_game_state! {
     /// "first card drawn" condition without re-counting. Absent key means the
     /// player has not drawn yet this turn.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub first_card_drawn_this_turn: HashMap<PlayerId, ObjectId>,
     /// Object IDs of cards actually drawn this turn, per player. Cards remain
     /// in this list even if they later leave hand; consumers filter by current
     /// zone when presenting choices.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub cards_drawn_this_turn: HashMap<PlayerId, Vec<ObjectId>>,
     /// CR 702.94a + CR 603.11: FIFO queue of miracle reveal offers accumulated
     /// during the current action's resolution. Populated by the draw pipeline
@@ -14100,6 +14195,7 @@ declare_game_state! {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_paradigm_remaining_offers: Option<PendingParadigmRemainingOffers>,
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub spells_cast_this_game: HashMap<PlayerId, u32>,
     /// Per-player spell cast history this game.
     /// CR 117.1: Mirrors `spells_cast_this_turn_by_player` but is not cleared
@@ -14107,18 +14203,22 @@ declare_game_state! {
     /// Second Sun's "another spell named {LITERAL} this game") can scan the
     /// full game-scope history.
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub spells_cast_this_game_by_player: HashMap<PlayerId, im::Vector<SpellCastRecord>>,
     /// Per-player spell cast history this turn.
     /// Each entry records the spell's relevant characteristics at cast time,
     /// enabling data-driven filtered counting at resolution.
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub spells_cast_this_turn_by_player: HashMap<PlayerId, im::Vector<SpellCastRecord>>,
     /// Per-player land play origin history this turn.
     /// Mirrors `Player::lands_played_this_turn` when origin-sensitive
     /// conditions need to distinguish hand plays from exile/graveyard plays.
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub lands_played_this_turn_by_player: HashMap<PlayerId, im::Vector<LandPlayRecord>>,
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub players_who_searched_library_this_turn: HashSet<PlayerId>,
     /// CR 603.4: Typed player-action events performed this turn. This is the
     /// turn-scoped counterpart to `player_actions_this_way`, preserving repeated
@@ -14126,10 +14226,13 @@ declare_game_state! {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub player_actions_this_turn: Vec<(PlayerId, PlayerActionKind)>,
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub players_attacked_this_step: HashSet<PlayerId>,
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub players_attacked_this_turn: HashSet<PlayerId>,
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub attacking_creatures_this_turn: HashMap<PlayerId, u32>,
     /// CR 508.6 + CR 508.1b: For each attacking player, the set of defending
     /// players they attacked this turn, accumulated across every combat's
@@ -14138,12 +14241,14 @@ declare_game_state! {
     /// `PlayerFilter::OpponentAttacked { You, ThisTurn }` for "opponents you
     /// attacked this turn" (Militant Angel).
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map_of_hash_set")]
     pub attacked_defenders_this_turn: HashMap<PlayerId, HashSet<PlayerId>>,
     /// CR 508.6 + CR 508.1b: For each creature declared as an attacker this
     /// turn, the defending players it attacked. This is the source-specific
     /// counterpart to `attacked_defenders_this_turn` for text like "each player
     /// this creature attacked this turn" (Angel of Destiny).
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map_of_hash_set")]
     pub creature_attacked_defenders_this_turn: HashMap<ObjectId, HashSet<PlayerId>>,
     /// CR 500.8 + CR 506.1: Number of combat phases that have begun this turn.
     /// Used by intervening-if triggers that only fire during the first combat phase.
@@ -14158,6 +14263,7 @@ declare_game_state! {
     /// CR 508.1a: Object IDs of creatures declared as attackers this turn.
     /// Persists after combat ends for post-combat filtering.
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub creatures_attacked_this_turn: HashSet<ObjectId>,
     /// CR 508.1a + CR 608.2c: Declaration-time attacker snapshots for filtered
     /// post-combat queries ("attacked with a token/commander/Dinosaur this
@@ -14168,8 +14274,10 @@ declare_game_state! {
     /// CR 509.1a: Object IDs of creatures declared as blockers this turn.
     /// Persists after combat ends for post-combat filtering.
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub creatures_blocked_this_turn: HashSet<ObjectId>,
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub players_who_created_token_this_turn: HashSet<PlayerId>,
     /// CR 111.2: Token creation snapshots this turn, preserving creation-time
     /// characteristics for filtered "tokens you created this turn" quantities.
@@ -14178,10 +14286,13 @@ declare_game_state! {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub counter_added_this_turn: Vec<CounterAddedRecord>,
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub players_who_discarded_card_this_turn: HashSet<PlayerId>,
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub cards_discarded_this_turn_by_player: HashMap<PlayerId, u32>,
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub players_who_sacrificed_artifact_this_turn: HashSet<PlayerId>,
     /// CR 701.21a: Sacrificed permanent snapshots this turn, preserving
     /// event-time characteristics for filtered "you sacrificed [quality] this
@@ -14197,6 +14308,7 @@ declare_game_state! {
     /// stacking duplicate batched triggers (issue #3866) without suppressing a
     /// later distinct leave by the same object in the same turn.
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub batched_zone_change_trigger_fired: HashSet<(TriggerDefinitionRef, usize)>,
     /// CR 403.3: Battlefield entry snapshots this turn, enabling data-driven ETB queries.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -14215,6 +14327,7 @@ declare_game_state! {
     /// `turns::start_next_turn` per CR 514. Read by `casting_variant_candidates`
     /// to gate the Freerunning cast permission on the spell's controller.
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub assassin_or_commander_dealt_combat_damage_this_turn: HashSet<PlayerId>,
     /// CR 702.76a + CR 608.2i: Set of `(controller, creature type)` entries for
     /// sources that dealt combat damage to a player this turn (snapshot at
@@ -14225,9 +14338,11 @@ declare_game_state! {
     /// `turns::start_next_turn` per CR 514. Read by `casting_variant_candidates`
     /// to gate the Prowl cast permission ("had any of this spell's creature types").
     #[serde(default, skip_serializing_if = "im::HashSet::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::im_hash_set")]
     pub creature_types_dealt_combat_damage_this_turn: im::HashSet<(PlayerId, String)>,
     /// CR 700.14: Cumulative mana spent on spells this turn per player (for Expend triggers).
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub mana_spent_on_spells_this_turn: HashMap<PlayerId, u32>,
     /// CR 601.2f: One-shot cost reductions for the next spell cast.
     /// Consumed when the player casts their next qualifying spell.
@@ -14247,20 +14362,24 @@ declare_game_state! {
     /// CR 700.2: "choose one that hasn't been chosen this turn"
     /// Note: ObjectId-keyed — zone changes create new ObjectId per CR 400.7, naturally resetting tracking.
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub modal_modes_chosen_this_turn: HashSet<(ObjectId, usize)>,
     /// Modal modes chosen this game per source: (ObjectId, mode_index).
     /// CR 700.2: "choose one that hasn't been chosen" (game-scoped)
     /// Note: ObjectId-keyed — zone changes create new ObjectId per CR 400.7, naturally resetting tracking.
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub modal_modes_chosen_this_game: HashSet<(ObjectId, usize)>,
 
     /// Cards currently revealed to all players (e.g. during a RevealHand effect).
     /// `filter_state_for_player` skips hiding these cards.
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub revealed_cards: HashSet<ObjectId>,
     /// Cards that have been publicly revealed at least once. Unlike
     /// `revealed_cards`, this is not cleared at the next action boundary.
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub public_revealed_cards: HashSet<ObjectId>,
 
     /// Typed suspended-resolution authority. Families move here one at a
@@ -14507,6 +14626,7 @@ declare_game_state! {
     /// library this way" counts the opponents who accepted that offer, even
     /// across player-scope iterations and interactive continuations.
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub player_actions_this_way: HashSet<(PlayerId, PlayerActionKind)>,
 
     /// CR 608.2c: Numeric result from the preceding effect in a sub_ability chain.
@@ -14552,6 +14672,7 @@ declare_game_state! {
     /// carried-subject continuations like "Each player discards ..., then draws
     /// that many ..." after all players have completed the discard pass.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub last_effect_counts_by_player: HashMap<PlayerId, i32>,
 
     /// CR 608.2e: Clause-local equalization snapshot. Each `player_scope` link
@@ -14581,6 +14702,7 @@ declare_game_state! {
     /// CR 702.131a: Players who have the city's blessing (from Ascend).
     /// Once gained, the city's blessing is permanent for the rest of the game.
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub city_blessing: HashSet<PlayerId>,
 
     /// CR 702.50a-b: Active Epic effects — one per resolved Epic spell. Each
@@ -14812,6 +14934,7 @@ declare_game_state! {
     /// Full event batches for triggered abilities currently on the stack,
     /// keyed by stack entry id. Single-event triggers omit an entry here.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub stack_trigger_event_batches: HashMap<ObjectId, Vec<GameEvent>>,
     /// Private CR 603.7 receipt for delayed-trigger abilities currently on the
     /// stack. This side table follows the entry through serialization without
@@ -14819,18 +14942,21 @@ declare_game_state! {
     /// without a row (or its legacy delayed-provenance predecessor) is
     /// ambiguous and rejected at restore rather than guessed as ordinary.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub(crate) stack_trigger_firings: HashMap<ObjectId, TriggerFiring>,
 
     /// CR 400.7: Last Known Information cache.
     /// Populated before zone changes for objects leaving the battlefield.
     /// Cleared on phase/step transitions via `advance_phase()`.
     #[serde(default, skip_serializing_if = "im::HashMap::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::im_hash_map")]
     pub lki_cache: im::HashMap<ObjectId, LKISnapshot>,
     /// CR 608.2h + CR 707.2: Full copiable-values LKI for objects that leave a
     /// public zone. Ordinary `LKISnapshot` is intentionally filter-shaped and
     /// does not carry ability definitions; copy effects need the complete
     /// copiable surface when the copy source later ceases to exist.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub lki_copiable_values: HashMap<ObjectId, CopiableValues>,
 
     /// CR 400.7 + CR 608.2h: LKI keyed by exact object incarnation. The legacy
@@ -14839,6 +14965,7 @@ declare_game_state! {
     /// departure of a re-entered object cannot overwrite the earlier object's LKI.
     /// Cleared with `lki_cache` on phase/step transitions.
     #[serde(default, skip_serializing_if = "im::HashMap::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::im_hash_map_of_im_hash_map")]
     pub lki_by_incarnation: im::HashMap<ObjectId, im::HashMap<u64, LKISnapshot>>,
 
     /// CR 607.2b + CR 603.10e: Last-known "cards exiled with [source]" linkage,
@@ -14851,6 +14978,7 @@ declare_game_state! {
     /// stale entries (cards that later left exile) contribute nothing.
     /// Cleared on phase/step transitions via `advance_phase()`.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub linked_exile_lki: HashMap<ObjectId, Vec<LinkedExileSnapshot>>,
 
     /// Transient: set by PayCost resolver when payment fails.
@@ -14903,13 +15031,16 @@ declare_game_state! {
 
     /// CR 701.54: Per-player ring level (0-3, 4 levels total).
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub ring_level: HashMap<PlayerId, u8>,
     /// CR 701.54: Per-player ring-bearer (the creature the Ring is on).
     #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub ring_bearer: HashMap<PlayerId, Option<ObjectId>>,
 
     /// CR 309 / CR 701.49: Per-player dungeon venture progress.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub dungeon_progress: HashMap<PlayerId, crate::game::dungeon::DungeonProgress>,
     /// CR 901.15: The planar deck (single-deck Planechase option). Front = top;
     /// the active face-up plane/phenomenon lives in the command zone, NOT here.
@@ -14924,6 +15055,7 @@ declare_game_state! {
     /// has taken this turn. Effect-caused planar die rolls do not increment
     /// this counter.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub planar_die_actions_this_turn: HashMap<PlayerId, u32>,
     /// CR 904.3 / CR 904.4: The archenemy's scheme deck (single-deck Archenemy
     /// option). Front = top; face-down in the command zone (CR 314.2). Schemes
@@ -15191,6 +15323,7 @@ impl ConniveSubject {
 pub struct PendingConniveReentry {
     pub conniver: ConniveSubject,
     pub count: u32,
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub applied: HashSet<AppliedReplacementKey>,
 }
 
@@ -15277,6 +15410,7 @@ pub struct PostReplacementDrain {
     /// time. It is co-owned, not merely co-located. (The reading that it has an
     /// independent lifecycle comes from looking at the *instant* of the
     /// `combat_damage` clear rather than its *purpose*; that reading is wrong.)
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub applied: HashSet<AppliedReplacementKey>,
 
     /// CR 615.5 + CR 609.7: source of the *prevented event itself* (the damage
@@ -15606,7 +15740,10 @@ pub struct DrawSequenceFrame {
     /// that produced this frame. Every individual draw, including one resumed
     /// after a replacement choice, starts with this set so an originating
     /// replacement cannot apply to its own substitute draw.
-    #[serde(default)]
+    #[serde(
+        default,
+        serialize_with = "crate::types::deterministic_serde::hash_set"
+    )]
     pub applied: HashSet<AppliedReplacementKey>,
     /// The instruction's completion behavior. Old saves default to [`DrawSequenceOrigin::Plain`].
     #[serde(default)]
@@ -21343,12 +21480,92 @@ mod tests {
     use crate::game::zones::create_object;
     use crate::types::ability::{
         AbilityDefinition, AbilityKind, Effect, PostReplacementContinuation, QuantityExpr,
-        ResolvedAbility, TargetFilter,
+        ResolvedAbility, TargetFilter, TriggerBaseSetInstanceRef, TriggerDefinitionOccurrenceRef,
     };
+    use crate::types::deterministic_serde::test_support::ReverseBuildHasher;
     use crate::types::identifiers::{
         DelayedTriggerInstanceId, DelayedTriggerOrigin, DelayedTriggerToken,
     };
     use crate::types::resolved_commands::ResolvedDelayedTriggerCommand;
+
+    #[derive(Serialize)]
+    struct TupleKeyFixture<'a> {
+        #[serde(serialize_with = "tuple_key_map::serialize")]
+        values: &'a HashMap<(ObjectId, usize), u32, ReverseBuildHasher>,
+    }
+
+    #[derive(Serialize)]
+    struct TriggerRefFixture<'a> {
+        #[serde(serialize_with = "trigger_definition_ref_map::serialize")]
+        values: &'a HashMap<TriggerDefinitionRef, u32, ReverseBuildHasher>,
+    }
+
+    fn printed_trigger_ref(printed_index: usize) -> TriggerDefinitionRef {
+        TriggerDefinitionRef {
+            source: ObjectIncarnationRef::of(ObjectId(7), 3),
+            occurrence: TriggerDefinitionOccurrenceRef::Printed {
+                base_set: TriggerBaseSetInstanceRef::INITIAL,
+                printed_index,
+            },
+        }
+    }
+
+    #[test]
+    fn special_map_serializers_sort_typed_keys_without_changing_wire_shapes() {
+        let mut tuple_values = HashMap::with_hasher(ReverseBuildHasher);
+        tuple_values.insert((ObjectId(7), 0), 10);
+        tuple_values.insert((ObjectId(7), 1), 11);
+        tuple_values.insert((ObjectId(7), 2), 12);
+        assert_eq!(
+            tuple_values.keys().copied().collect::<Vec<_>>(),
+            vec![(ObjectId(7), 2), (ObjectId(7), 1), (ObjectId(7), 0)],
+            "hostile tuple map must expose descending native iteration"
+        );
+        assert_eq!(
+            serde_json::to_string(&TupleKeyFixture {
+                values: &tuple_values,
+            })
+            .expect("tuple-key fixture should serialize"),
+            r#"{"values":{"7_0":10,"7_1":11,"7_2":12}}"#
+        );
+        let tuple_round_trip: HashMap<(ObjectId, usize), u32> = tuple_key_map::deserialize(
+            &mut serde_json::Deserializer::from_str(r#"{"7_2":12,"7_0":10,"7_1":11}"#),
+        )
+        .expect("tuple-key object should deserialize");
+        assert_eq!(tuple_round_trip.len(), 3);
+        assert_eq!(tuple_round_trip.get(&(ObjectId(7), 1)), Some(&11));
+
+        let mut trigger_values = HashMap::with_hasher(ReverseBuildHasher);
+        trigger_values.insert(printed_trigger_ref(0), 10);
+        trigger_values.insert(printed_trigger_ref(1), 11);
+        trigger_values.insert(printed_trigger_ref(2), 12);
+        assert_eq!(
+            trigger_values
+                .keys()
+                .map(|key| match key.occurrence {
+                    TriggerDefinitionOccurrenceRef::Printed { printed_index, .. } => printed_index,
+                    _ => unreachable!("fixture uses printed trigger refs"),
+                })
+                .collect::<Vec<_>>(),
+            vec![2, 1, 0],
+            "hostile trigger map must expose descending native iteration"
+        );
+        assert_eq!(
+            serde_json::to_string(&TriggerRefFixture {
+                values: &trigger_values,
+            })
+            .expect("trigger-ref fixture should serialize"),
+            r#"{"values":[[{"source":{"object_id":7,"incarnation":3},"occurrence":{"type":"Printed","data":{"base_set":1,"printed_index":0}}},10],[{"source":{"object_id":7,"incarnation":3},"occurrence":{"type":"Printed","data":{"base_set":1,"printed_index":1}}},11],[{"source":{"object_id":7,"incarnation":3},"occurrence":{"type":"Printed","data":{"base_set":1,"printed_index":2}}},12]]}"#
+        );
+        let trigger_round_trip = trigger_definition_ref_map::deserialize(
+            &mut serde_json::Deserializer::from_str(
+                r#"[[{"source":{"object_id":7,"incarnation":3},"occurrence":{"type":"Printed","data":{"base_set":1,"printed_index":2}}},12],[{"source":{"object_id":7,"incarnation":3},"occurrence":{"type":"Printed","data":{"base_set":1,"printed_index":0}}},10]]"#,
+            ),
+        )
+        .expect("trigger-ref pair array should deserialize");
+        assert_eq!(trigger_round_trip.len(), 2);
+        assert_eq!(trigger_round_trip.get(&printed_trigger_ref(2)), Some(&12));
+    }
 
     #[test]
     fn migration_preserves_missing_install_roots_as_legacy() {
@@ -23746,6 +23963,29 @@ mod tests {
         assert!(
             !loop_states_equal(&ordinary, &delayed),
             "ordinary and delayed stack-trigger firings must not share a loop identity"
+        );
+    }
+
+    #[test]
+    fn stack_trigger_firings_numeric_map_round_trips_populated() {
+        let mut state = normal_trigger_firing_fixture();
+        let mut second_entry = state.stack.back().expect("fixture stack entry").clone();
+        second_entry.id = ObjectId(9_004);
+        state.stack.push_back(second_entry);
+        state
+            .stack_trigger_firings
+            .insert(ObjectId(9_004), TriggerFiring::LegacyDelayed);
+        assert_eq!(state.stack_trigger_firings.len(), 2);
+
+        let serialized = serde_json::to_string(&state).expect("state should serialize");
+        assert!(serialized.contains(
+            "\"stack_trigger_firings\":{\"9003\":\"Ordinary\",\"9004\":\"LegacyDelayed\"}"
+        ));
+        let restored: GameState = serde_json::from_str(&serialized).expect("state should restore");
+        assert_eq!(restored.stack_trigger_firings, state.stack_trigger_firings);
+        assert_eq!(
+            serde_json::to_string(&restored).expect("restored state should serialize"),
+            serialized
         );
     }
 

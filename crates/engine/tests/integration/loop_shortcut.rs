@@ -5172,58 +5172,11 @@ fn migrated_dump_decodes_through_both_decoders_and_unmigrated_through_neither() 
     // That is a real change to how six fixtures restore, and the two arms above cannot
     // witness it — they assert only that a decode succeeds or fails.
     //
-    // `GameState` has NO `PartialEq`, so this compares the SERIALIZED forms — key by key,
-    // recursively. Several fields are `HashSet`-backed and therefore have NO canonical array
-    // order (two sets built in one process do not even share a hasher seed), so a difference
-    // that is order-only under one of THOSE keys is accepted as a set difference and every
-    // other difference FAILS, naming its own key path. A blanket "sort every array" would
-    // have hidden a real reordering of the stack, a library or a seat order; a hand-picked
-    // single-field normalization would have flaked the first time a different set field
-    // happened to serialize in a different order — which is exactly what it did.
-    //
-    // The allowlist is DERIVED, not remembered:
-    //   grep -rhoE 'pub [a-z_0-9]+: (std::collections::)?HashSet<' \
-    //     crates/engine/src/types/*.rs crates/engine/src/analysis/*.rs | sort -u
-    // An unlisted key that differs only by order still FAILS and names itself, so drift is
-    // loud rather than silent.
-    const SET_BACKED_FIELDS: &[&str] = &[
-        "alt_cost_grant_permissions_used",
-        "applied",
-        "assassin_or_commander_dealt_combat_damage_this_turn",
-        "batched_zone_change_trigger_fired",
-        "bending_types_this_turn",
-        "city_blessing",
-        "commander_declined_zone_return",
-        "creatures_attacked_this_turn",
-        "creatures_blocked_this_turn",
-        "crew_activated_this_turn",
-        "dirty_objects",
-        "dirty_players",
-        "exerted_this_turn",
-        "exile_cast_permissions_used",
-        "exile_play_permissions_used",
-        "exile_play_single_use_consumed",
-        "graveyard_cast_permissions_used",
-        "graveyard_cast_permissions_used_per_type",
-        "hand_cast_free_permissions_used",
-        "modal_modes_chosen_this_game",
-        "modal_modes_chosen_this_turn",
-        "objects_that_dealt_damage",
-        "player_actions_this_way",
-        "players_attacked_this_step",
-        "players_attacked_this_turn",
-        "players_who_created_token_this_turn",
-        "players_who_discarded_card_this_turn",
-        "players_who_sacrificed_artifact_this_turn",
-        "players_who_searched_library_this_turn",
-        "public_revealed_cards",
-        "replacement_applied",
-        "revealed_cards",
-        "top_of_library_cast_permissions_used",
-        "triggers_fired_this_game",
-        "triggers_fired_this_turn",
-        "triggers_fired_this_turn_per_opponent",
-    ];
+    // `GameState` has no `PartialEq`, so compare its serialized forms recursively.
+    // Hash-backed owners now serialize canonically at their field boundaries; arrays are
+    // therefore always order-sensitive here, including libraries, stacks, and trigger order.
+    // Sorting below is diagnostic only: it distinguishes reordering from changed membership
+    // without ever accepting either difference.
 
     /// Collect every path at which `a` and `b` differ in a way that set-ordering cannot
     /// explain. Returns an empty vec iff the two states are equal modulo set order.
@@ -5248,18 +5201,12 @@ fn migrated_dump_decodes_through_both_decoders_and_unmigrated_through_neither() 
             }
             (Value::Array(x), Value::Array(y)) if x == y => {}
             (Value::Array(x), Value::Array(y)) => {
-                let leaf = path.rsplit('.').next().unwrap_or(path);
                 let (mut xs, mut ys) = (x.clone(), y.clone());
                 let key = |v: &Value| v.to_string();
                 xs.sort_by_key(key);
                 ys.sort_by_key(key);
-                if xs == ys && SET_BACKED_FIELDS.contains(&leaf) {
-                    // Order-only difference under a `HashSet`-backed field: not a state
-                    // difference at all, because that field HAS no canonical order.
-                } else if xs == ys {
-                    out.push(format!(
-                        "{path} (REORDERED, and it is not a set-backed field)"
-                    ));
+                if xs == ys {
+                    out.push(format!("{path} (REORDERED)"));
                 } else {
                     out.push(format!("{path} (different elements)"));
                 }

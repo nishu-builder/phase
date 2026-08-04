@@ -6,6 +6,7 @@ pub mod card;
 pub mod card_type;
 pub mod counter;
 pub mod definitions;
+pub(crate) mod deterministic_serde;
 pub mod events;
 pub mod format;
 pub mod game_state;

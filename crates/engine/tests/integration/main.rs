@@ -147,6 +147,7 @@ mod demon_of_fates_design;
 mod descendants_fury_sacrificed_referent_4795;
 mod destroy_redirect_to_battlefield_delivery_tail;
 mod deterministic_blocker_prompt_order;
+mod deterministic_game_state_serde;
 mod devour_co_entry_regression;
 mod devour_intellect_treasure_rider;
 mod dig_impossible_keep_count;

@@ -515,7 +515,11 @@ pub struct GameObject {
     pub back_face: Option<BackFaceData>,
 
     /// Digital-only Specialize: specialized faces keyed by added color pip.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::types::deterministic_serde::option_hash_map"
+    )]
     pub specialize_faces: Option<super::specialize::SpecializeFaceMap>,
 
     /// Digital-only Specialize: set after specializing; prevents re-specializing.
@@ -932,13 +936,21 @@ pub struct GameObject {
     /// CR 701.15c: Which players have goaded this creature. A goaded creature must attack
     /// each combat if able and must attack a player other than the goading player(s) if able.
     /// Multiple players can goad the same creature, creating additional combat requirements.
-    #[serde(default, skip_serializing_if = "std::collections::HashSet::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "std::collections::HashSet::is_empty",
+        serialize_with = "crate::types::deterministic_serde::hash_set"
+    )]
     pub goaded_by: std::collections::HashSet<PlayerId>,
 
     /// CR 701.35a: Which players have detained this permanent. A detained permanent
     /// can't attack or block and its activated abilities can't be activated until the
     /// detaining player's next turn. Cleared during layer evaluation like goaded_by.
-    #[serde(default, skip_serializing_if = "std::collections::HashSet::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "std::collections::HashSet::is_empty",
+        serialize_with = "crate::types::deterministic_serde::hash_set"
+    )]
     pub detained_by: std::collections::HashSet<PlayerId>,
 
     /// CR 701.60a: Whether this creature is currently suspected.
