@@ -6795,17 +6795,10 @@ fn apply_action(
     // Validate and process action against current WaitingFor
     let waiting_for = match (&state.waiting_for.clone(), action) {
         (WaitingFor::Priority { player }, GameAction::PassPriority) => {
-            if state.priority_player
-                != turn_control::authorized_submitter_for_player(state, *player)
-            {
-                return Err(EngineError::NotYourPriority);
-            }
-            if super::precast_copy_shortcut::blocks_pass(state, *player) {
-                return Err(EngineError::ActionNotAllowed(
-                    "A shortened pre-cast shortcut requires a different meaningful action before passing"
-                        .to_string(),
-                ));
-            }
+            // CR 117.3d + CR 723.5 + CR 732.2a-c: single authority, shared with the
+            // AI candidate-legality hatch and the projection fast path so the
+            // three cannot drift.
+            super::priority::pass_priority_legality(state, *player)?;
             let wf = pass_priority_once_with_pipeline(state, &mut events, stack_resolution_limit)?;
             return Ok(ActionResult {
                 events,
@@ -15194,6 +15187,29 @@ mod stage2_injector_tests {
                 //     and the other two did NOT move, which located the insertion below them.
                 //   #6961 (2ead7aab1) + v0.44.0: `:5918/:5995/:8970 ⇒ :5996/:6073/:9048`,
                 //     uniform +78 above all three (whole-file delta +153/-15).
+                //   #6957 (this branch, base 4f524c6014): `:5999/:6076/:9051 ⇒
+                //     `:6061/:6138/:9113`, uniform +62 above all three. The two hunks above
+                //     them are `-3` (the `matches!(scope, PlayerFilter::All)` gate replaced by
+                //     a named local) and `+65` (`scope_keeps_scoped_whole_hand_shuffle_local`
+                //     and its doc comment); every other hunk in the file is at `:27733+`, i.e.
+                //     BELOW all three. Identity re-established, not assumed: each producer is
+                //     sha256-identical to `4f524c6014:effects/mod.rs` at its old coordinate.
+                //   #6956 (same branch, second unit): `:9113 ⇒ :9243`, +130, and ONLY that
+                //     entry moved — the other four stayed byte-identical AND in place, which is
+                //     the set-preservation evidence. The +109 is the
+                //     zero-policy pair inserted at `:7030` (+131, minus a 1-line comment
+                //     reflow at `:7020`), i.e. below `:6061`/`:6138` and above `:9113`. The
+                //     only other hunks are in `mod tests`. Producer sha256-identical at its
+                //     new coordinate.
+                //   #6956 fix round (review round 1): `:6061/:6138/:9243 ⇒ :6065/:6142/:9324`,
+                //     +4 above the first two and +81 above the third. The +4 is the
+                //     `AllExcept` recursion arm added to
+                //     `scope_keeps_scoped_whole_hand_shuffle_local`; the further +77 is the
+                //     `amount_channel` classifier that collapses the twin `_ => 0` / `_ => false`
+                //     registry, plus the relay guard. All three producers sha256-identical at
+                //     their new coordinates AND still inside the same enclosing functions
+                //     (`drive_sequential_repeated_optional_payment` ×2, `resolve_chain_body`),
+                //     which is stronger evidence than the coordinate alone.
                 //
                 // ⚠ THIS ROW FAILS IN CI BEFORE IT FAILS LOCALLY, and that is not a bug in the
                 // row. CI checks out `refs/pull/<n>/merge` — this branch merged with CURRENT
@@ -15206,9 +15222,9 @@ mod stage2_injector_tests {
                 // because that is what makes a NEW mint a counted event; a function +
                 // content-hash anchor would end the drift class while keeping that property,
                 // and is offered as a follow-up rather than taken unannounced mid-review.
-                "game/effects/mod.rs:5996".to_string(),
-                "game/effects/mod.rs:6073".to_string(),
-                "game/effects/mod.rs:9048".to_string(),
+                "game/effects/mod.rs:6065".to_string(),
+                "game/effects/mod.rs:6142".to_string(),
+                "game/effects/mod.rs:9324".to_string(),
                 // UNMOVED across the rebase, and that is itself evidence the SET did not
                 // move: a census that had gained or lost a producer would not leave this
                 // entry both byte-identical AND at the same coordinate.
@@ -15233,7 +15249,22 @@ mod stage2_injector_tests {
                 // is the producer this row NAMES below. The old coordinate now holds
                 // copy-target-slot code that mints nothing. The OTHER FOUR entries did not
                 // move, which is the same set-preservation evidence as the previous rebases.
-                "game/engine.rs:11427".to_string(),
+                //
+                // `PassPriority` structural-legality unit: `:11427 ⇒ :11420`, −7. UNLIKE every
+                // drift above, this one is LOCAL, not upstream — the CI-vs-local diagnosis in
+                // the header does not apply, because the shift originates in this same diff.
+                // The `(Priority, PassPriority)` reducer arm's two inline guards were extracted
+                // into `game::priority::pass_priority_legality`, replacing 11 lines with 4.
+                // That is engine.rs's only hunk ABOVE this producer — `@@ -6798,11 +6798,4 @@`,
+                // net -7, exactly accounting for the shift. The unit's only other engine.rs
+                // hunk is THIS drift-log comment, which sits below the producer and therefore
+                // cannot move it. Identity re-established at the new
+                // coordinate rather than assumed: the line is byte-identical by sha256 to
+                // `93da0ca15:engine.rs:11427`, and it is still inside
+                // `begin_pending_trigger_target_selection` (fn now opens at :11271, itself −7).
+                // The OTHER FOUR entries live in `game/effects/`, which this unit does not
+                // touch at all, and did not move — the same set-preservation evidence.
+                "game/engine.rs:11420".to_string(),
             ],
             "the five production producers, NAMED: the CR 603.5 gate in `resolve_chain_body` \
              plus the two repeated-optional-payment drivers, the per-player acceptance cursor \
