@@ -6729,6 +6729,21 @@ fn find_defiler_reduction(
     None
 }
 
+/// CR 601.2f + CR 118.7: Preview the locked mana obligation after an
+/// affordable Defiler life-payment reduction, without paying life or mutating
+/// the spell's announced cost.
+pub(crate) fn defiler_reduced_cost(
+    state: &GameState,
+    caster: PlayerId,
+    spell_id: ObjectId,
+    cost: &ManaCost,
+) -> Option<ManaCost> {
+    let (_, reduction) = find_defiler_reduction(state, caster, spell_id)?;
+    let mut reduced = cost.clone();
+    apply_defiler_mana_reduction(&mut reduced, &reduction);
+    Some(reduced)
+}
+
 /// CR 601.2b: Handle the player's decision on Defiler life payment.
 /// If accepted, pays life and reduces the spell's mana cost, then continues to mana payment.
 /// If declined, continues with the original cost.
@@ -10586,16 +10601,18 @@ pub(super) fn auto_tap_non_sacrificial_mana_sources(
     );
 }
 
-pub(super) fn pending_cost_is_payable_from_pool(state: &GameState, player: PlayerId) -> bool {
-    let Some(pending) = state.pending_cast.as_deref() else {
-        return false;
-    };
-    let spell_meta = super::casting::build_spell_meta(state, player, pending.object_id);
+pub(crate) fn spell_cost_is_payable_from_pool(
+    state: &GameState,
+    player: PlayerId,
+    object_id: ObjectId,
+    cost: &ManaCost,
+) -> bool {
+    let spell_meta = super::casting::build_spell_meta(state, player, object_id);
     let spell_ctx = spell_meta.as_ref().map(PaymentContext::Spell);
     let any_color = super::casting::player_can_spend_as_any_color_for_payment(
         state,
         player,
-        Some(pending.object_id),
+        Some(object_id),
         spell_ctx.as_ref(),
     );
     let permissions =
@@ -10607,11 +10624,17 @@ pub(super) fn pending_cost_is_payable_from_pool(state: &GameState, player: Playe
         .is_some_and(|candidate| {
             mana_payment::can_pay_for_spell(
                 &candidate.mana_pool,
-                &pending.cost,
+                cost,
                 spell_ctx.as_ref(),
                 permissions,
             )
         })
+}
+
+pub(super) fn pending_cost_is_payable_from_pool(state: &GameState, player: PlayerId) -> bool {
+    state.pending_cast.as_deref().is_some_and(|pending| {
+        spell_cost_is_payable_from_pool(state, player, pending.object_id, &pending.cost)
+    })
 }
 
 #[derive(Debug, Clone)]

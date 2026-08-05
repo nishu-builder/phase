@@ -19,6 +19,14 @@ use engine::types::zones::Zone;
 
 use crate::support::shared_card_db as load_db;
 
+#[test]
+fn offer_side_auto_payment_card_data_prerequisite_is_available() {
+    assert!(
+        load_db().is_some(),
+        "offer-side auto-payment integration tests require the committed card fixture or full export"
+    );
+}
+
 fn interactive_graveyard_mana_ability(color: ManaColor) -> AbilityDefinition {
     AbilityDefinition::new(
         AbilityKind::Activated,

@@ -2679,6 +2679,12 @@ mod tests {
             &[],
         )
         .is_ok());
+        assert!(can_pay_for_spell(
+            &fallback_pool,
+            &fallback_cost,
+            Some(&context),
+            crate::types::mana::CostPermissionContext::default(),
+        ));
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]

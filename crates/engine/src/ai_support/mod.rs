@@ -4257,6 +4257,201 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pool_payable_and_no_cost_spells_keep_auto_mode_with_sacrificial_source_available() {
+        let mut state = setup_priority();
+        state.phase = Phase::PreCombatMain;
+        let source = add_sac_for_mana_source(&mut state, PlayerId(0));
+        state.players[0].mana_pool.add(ManaUnit::new(
+            ManaType::Colorless,
+            ObjectId(702),
+            false,
+            Vec::new(),
+        ));
+        let spell = create_object(
+            &mut state,
+            CardId(703),
+            PlayerId(0),
+            "Pool-Payable Offer Spell".to_string(),
+            Zone::Hand,
+        );
+        {
+            let object = state.objects.get_mut(&spell).unwrap();
+            object.card_types.core_types.push(CoreType::Creature);
+            object.base_card_types = object.card_types.clone();
+            object.mana_cost = ManaCost::generic(1);
+            object.base_mana_cost = object.mana_cost.clone();
+        }
+        let action = GameAction::CastSpell {
+            object_id: spell,
+            card_id: state.objects[&spell].card_id,
+            targets: Vec::new(),
+            payment_mode: crate::types::game_state::CastPaymentMode::Auto,
+        };
+        let no_cost_spell = create_object(
+            &mut state,
+            CardId(708),
+            PlayerId(0),
+            "No-Cost Offer Spell".to_string(),
+            Zone::Hand,
+        );
+        {
+            let object = state.objects.get_mut(&no_cost_spell).unwrap();
+            object.card_types.core_types.push(CoreType::Creature);
+            object.base_card_types = object.card_types.clone();
+            object.mana_cost = ManaCost::zero();
+            object.base_mana_cost = object.mana_cost.clone();
+        }
+        let no_cost_action = GameAction::CastSpell {
+            object_id: no_cost_spell,
+            card_id: state.objects[&no_cost_spell].card_id,
+            targets: Vec::new(),
+            payment_mode: crate::types::game_state::CastPaymentMode::Auto,
+        };
+
+        let candidates = candidate_actions(&state);
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.action == action));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.action == no_cost_action));
+        let legal = legal_actions_full(&state).0;
+        assert!(legal.contains(&action));
+        assert!(legal.contains(&no_cost_action));
+        apply_as_current(&mut state, action).expect("pool-payable cast must complete payment");
+        assert!(matches!(state.waiting_for, WaitingFor::Priority { .. }));
+        assert_eq!(state.objects[&source].zone, Zone::Battlefield);
+    }
+
+    #[test]
+    fn sneak_with_only_sacrificial_mana_preserves_source_choice() {
+        let mut state = setup_priority();
+        state.turn_number = 2;
+        state.phase = Phase::DeclareBlockers;
+        let source = add_sac_for_mana_source(&mut state, PlayerId(0));
+        let attacker = create_object(
+            &mut state,
+            CardId(704),
+            PlayerId(0),
+            "Sneak Return Creature".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let object = state.objects.get_mut(&attacker).unwrap();
+            object.card_types.core_types.push(CoreType::Creature);
+            object.base_card_types = object.card_types.clone();
+            object.tapped = true;
+            object.entered_battlefield_turn = Some(1);
+        }
+        state.combat = Some(crate::game::combat::CombatState {
+            attackers: vec![crate::game::combat::AttackerInfo::attacking_player(
+                attacker,
+                PlayerId(1),
+            )],
+            ..Default::default()
+        });
+        let spell = create_object(
+            &mut state,
+            CardId(705),
+            PlayerId(0),
+            "Sacrificial-Mana Sneak Spell".to_string(),
+            Zone::Hand,
+        );
+        {
+            let object = state.objects.get_mut(&spell).unwrap();
+            object.card_types.core_types.push(CoreType::Creature);
+            object.base_card_types = object.card_types.clone();
+            object.mana_cost = ManaCost::generic(7);
+            object.base_mana_cost = object.mana_cost.clone();
+            object.keywords.push(Keyword::Sneak(ManaCost::generic(1)));
+            object.base_keywords = object.keywords.clone();
+        }
+
+        let action = candidate_actions(&state)
+            .into_iter()
+            .find_map(|candidate| match candidate.action {
+                action @ GameAction::CastSpellAsSneak {
+                    hand_object,
+                    creature_to_return,
+                    payment_mode:
+                        crate::types::game_state::CastPaymentMode::AutoExceptSacrificialMana,
+                    ..
+                } if hand_object == spell && creature_to_return == attacker => Some(action),
+                _ => None,
+            })
+            .expect("Sneak must retain a manual sacrificial-mana cast candidate");
+        assert!(legal_actions_full(&state).0.contains(&action));
+        apply_as_current(&mut state, action).expect("Sneak cast must reach mana-source choice");
+        let WaitingFor::ManaSourceSelection { options, .. } = &state.waiting_for else {
+            panic!("Sneak with only sacrificial mana must stop at source selection")
+        };
+        assert!(options
+            .iter()
+            .any(|option| option.source.object_id == source));
+    }
+
+    #[test]
+    fn web_slinging_with_only_sacrificial_mana_preserves_source_choice() {
+        let mut state = setup_priority();
+        state.phase = Phase::PreCombatMain;
+        let source = add_sac_for_mana_source(&mut state, PlayerId(0));
+        let returned = create_object(
+            &mut state,
+            CardId(706),
+            PlayerId(0),
+            "Web-Slinging Return Creature".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let object = state.objects.get_mut(&returned).unwrap();
+            object.card_types.core_types.push(CoreType::Creature);
+            object.base_card_types = object.card_types.clone();
+            object.tapped = true;
+        }
+        let spell = create_object(
+            &mut state,
+            CardId(707),
+            PlayerId(0),
+            "Sacrificial-Mana Web-Slinging Spell".to_string(),
+            Zone::Hand,
+        );
+        {
+            let object = state.objects.get_mut(&spell).unwrap();
+            object.card_types.core_types.push(CoreType::Creature);
+            object.base_card_types = object.card_types.clone();
+            object.mana_cost = ManaCost::generic(7);
+            object.base_mana_cost = object.mana_cost.clone();
+            object
+                .keywords
+                .push(Keyword::WebSlinging(ManaCost::generic(1)));
+            object.base_keywords = object.keywords.clone();
+        }
+
+        let action = candidate_actions(&state)
+            .into_iter()
+            .find_map(|candidate| match candidate.action {
+                action @ GameAction::CastSpellAsWebSlinging {
+                    hand_object,
+                    creature_to_return,
+                    payment_mode:
+                        crate::types::game_state::CastPaymentMode::AutoExceptSacrificialMana,
+                    ..
+                } if hand_object == spell && creature_to_return == returned => Some(action),
+                _ => None,
+            })
+            .expect("Web-slinging must retain a manual sacrificial-mana cast candidate");
+        assert!(legal_actions_full(&state).0.contains(&action));
+        apply_as_current(&mut state, action)
+            .expect("Web-slinging cast must reach mana-source choice");
+        let WaitingFor::ManaSourceSelection { options, .. } = &state.waiting_for else {
+            panic!("Web-slinging with only sacrificial mana must stop at source selection")
+        };
+        assert!(options
+            .iter()
+            .any(|option| option.source.object_id == source));
+    }
+
     /// V1 (repro fix): on an OPPONENT's turn, a lone sacrifice-for-mana source
     /// with nothing castable in hand and an opponent trigger on the stack must
     /// recommend auto-pass — the sacrifice/its mana enables no concrete follow-up

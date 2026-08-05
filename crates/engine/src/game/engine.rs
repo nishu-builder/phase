@@ -13840,6 +13840,26 @@ mod priority_principal_tests {
             object.keywords = vec![Keyword::Morph(ManaCost::generic(5))];
             object.base_keywords = object.keywords.clone();
         }
+        let sibling_spell = zones::create_object(
+            &mut state,
+            CardId(7_303),
+            player,
+            "Preflight Sibling Spell".to_string(),
+            Zone::Hand,
+        );
+        {
+            let object = state.objects.get_mut(&sibling_spell).unwrap();
+            object.card_types.core_types.push(CoreType::Creature);
+            object.base_card_types = object.card_types.clone();
+            object.mana_cost = ManaCost::zero();
+            object.base_mana_cost = object.mana_cost.clone();
+        }
+        let sibling_action = GameAction::CastSpell {
+            object_id: sibling_spell,
+            card_id: state.objects[&sibling_spell].card_id,
+            targets: Vec::new(),
+            payment_mode: crate::types::game_state::CastPaymentMode::Auto,
+        };
         let prohibition = zones::create_object(
             &mut state,
             CardId(7_302),
@@ -13886,10 +13906,16 @@ mod priority_principal_tests {
             },
             "the unchanged first-wins aggregate must report the earlier CastSpell family"
         );
-        assert!(crate::ai_support::candidate_actions(&state)
+        let candidates = crate::ai_support::candidate_actions(&state);
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.action == sibling_action));
+        assert!(candidates
             .iter()
             .all(|candidate| !matches!(candidate.action, GameAction::PlayFaceDown { .. })));
-        assert!(crate::ai_support::legal_actions(&state)
+        let legal_actions = crate::ai_support::legal_actions(&state);
+        assert!(legal_actions.contains(&sibling_action));
+        assert!(legal_actions
             .iter()
             .all(|action| !matches!(action, GameAction::PlayFaceDown { .. })));
 

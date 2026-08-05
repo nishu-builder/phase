@@ -17042,12 +17042,6 @@ fn gift_recipient_auto_cast_remains_offered_and_reaches_gift_recipient_choice() 
 #[test]
 fn defiler_auto_cast_remains_offered_and_reaches_defiler_payment() {
     let mut state = setup_game_at_main_phase();
-    state.players[0].mana_pool.add(ManaUnit::new(
-        ManaType::Green,
-        ObjectId(77_109),
-        false,
-        Vec::new(),
-    ));
     let spell = create_object(
         &mut state,
         CardId(77_110),

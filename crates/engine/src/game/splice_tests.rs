@@ -235,6 +235,7 @@ fn splice_auto_cast_remains_offered_and_reaches_splice_offer() {
         panic!("Arcane host must reach its splice offer")
     };
     assert_eq!(pending_cast.object_id, host);
+    assert_eq!(pending_cast.payment_mode, CastPaymentMode::Auto);
     assert_eq!(eligible, &vec![splicer]);
 }
 

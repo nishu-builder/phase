@@ -1,3 +1,4 @@
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, HashSet};
 
 use crate::game::casting;
@@ -3508,6 +3509,25 @@ pub(crate) fn priority_actions_with_probe(
     // players can't cast spells or activate non-mana abilities. Special actions
     // (PlayLand, Foretell) and mana abilities remain permitted.
     let split_second_active = crate::game::keywords::stack_has_split_second(state);
+    let mana_source_selections = OnceCell::new();
+    let payment_mode_for_cost = |object_id, cost: &crate::types::mana::ManaCost| {
+        if crate::game::casting_costs::spell_cost_is_payable_from_pool(
+            state, player, object_id, cost,
+        ) {
+            return CastPaymentMode::Auto;
+        }
+        let selections = mana_source_selections
+            .get_or_init(|| mana_sources::activatable_mana_source_selections(state, player));
+        if !selections.is_empty()
+            && selections
+                .iter()
+                .all(|selection| selection.penalty == mana_sources::ManaSourcePenalty::Sacrifices)
+        {
+            CastPaymentMode::AutoExceptSacrificialMana
+        } else {
+            CastPaymentMode::Auto
+        }
+    };
 
     let p = &state.players[player.0 as usize];
     let is_main_phase = matches!(state.phase, Phase::PreCombatMain | Phase::PostCombatMain);
@@ -3613,29 +3633,23 @@ pub(crate) fn priority_actions_with_probe(
         // CR 601.2g-h: Mana abilities are activated before the total cost is
         // paid. When every available capability requires a sacrifice, retain
         // the spell offer but stop at that irreversible source choice.
-        let mana_source_selections =
-            mana_sources::activatable_mana_source_selections(state, player);
-        let cast_payment_mode = if !mana_source_selections.is_empty()
-            && mana_source_selections
-                .iter()
-                .all(|selection| selection.penalty == mana_sources::ManaSourcePenalty::Sacrifices)
-        {
-            CastPaymentMode::AutoExceptSacrificialMana
-        } else {
-            CastPaymentMode::Auto
-        };
         for object_id in casting::spell_objects_available_to_cast(state, player) {
             let Some(obj) = state.objects.get(&object_id) else {
                 continue;
             };
             if casting::can_cast_object_now_with_probe(state, player, object_id, probe) {
+                let payment_mode = casting::effective_spell_cost(state, player, object_id)
+                    .as_ref()
+                    .map_or(CastPaymentMode::Auto, |cost| {
+                        payment_mode_for_cost(object_id, cost)
+                    });
                 actions.push(candidate(
                     GameAction::CastSpell {
                         object_id,
                         card_id: obj.card_id,
                         targets: Vec::new(),
 
-                        payment_mode: cast_payment_mode,
+                        payment_mode,
                     },
                     TacticalClass::Spell,
                     Some(player),
@@ -4221,31 +4235,43 @@ pub(crate) fn priority_actions_with_probe(
                 .map(|p| p.hand.iter().copied().collect::<Vec<_>>())
                 .unwrap_or_default();
             for hand_id in hand_ids {
-                let Some(cost) = keywords::effective_sneak_cost(state, hand_id) else {
-                    continue;
-                };
-                // CR 601.2f: Mana-cost affordability must consider mana that
-                // can be produced by activating mana abilities during the cost
-                // step, not just mana currently floating in the pool.
-                // Delegates to the same auto-tap aware check used by the
-                // normal `CastSpell` emitter (`can_cast_object_now` →
-                // `can_pay_cost_after_auto_tap`) so a Sneak cast with 0
-                // floating mana but enough untapped sources is surfaced.
-                if !crate::game::casting::can_pay_cost_after_auto_tap(state, player, hand_id, &cost)
-                {
+                if keywords::effective_sneak_cost(state, hand_id).is_none() {
                     continue;
                 }
+                // CR 601.2f: Mana-cost affordability must consider mana that
+                // can be produced by activating mana abilities during the cost
+                // step, including irreversible manual activations.
                 let Some(card_id) = state.objects.get(&hand_id).map(|o| o.card_id) else {
                     continue;
                 };
                 for &creature_id in &unblocked {
+                    let Some(prepared_cost) = casting::effective_spell_cost_for_variant(
+                        state,
+                        player,
+                        hand_id,
+                        crate::types::game_state::CastingVariant::Sneak {
+                            returned_creature: creature_id,
+                            placement: None,
+                        },
+                    ) else {
+                        continue;
+                    };
+                    if !crate::game::casting::can_feasibly_pay_mana_cost_with_probe(
+                        state,
+                        player,
+                        Some(hand_id),
+                        &prepared_cost,
+                        probe,
+                    ) {
+                        continue;
+                    }
                     actions.push(candidate(
                         GameAction::CastSpellAsSneak {
                             hand_object: hand_id,
                             card_id,
                             creature_to_return: creature_id,
 
-                            payment_mode: CastPaymentMode::Auto,
+                            payment_mode: payment_mode_for_cost(hand_id, &prepared_cost),
                         },
                         TacticalClass::Ability,
                         Some(player),
@@ -4294,13 +4320,32 @@ pub(crate) fn priority_actions_with_probe(
                     ) {
                         continue;
                     }
+                    let Some(prepared_cost) = casting::effective_spell_cost_for_variant(
+                        state,
+                        player,
+                        hand_id,
+                        crate::types::game_state::CastingVariant::WebSlinging {
+                            returned_creature: creature_id,
+                        },
+                    ) else {
+                        continue;
+                    };
+                    if !casting::can_feasibly_pay_mana_cost_with_probe(
+                        state,
+                        player,
+                        Some(hand_id),
+                        &prepared_cost,
+                        probe,
+                    ) {
+                        continue;
+                    }
                     actions.push(candidate(
                         GameAction::CastSpellAsWebSlinging {
                             hand_object: hand_id,
                             card_id,
                             creature_to_return: creature_id,
 
-                            payment_mode: CastPaymentMode::Auto,
+                            payment_mode: payment_mode_for_cost(hand_id, &prepared_cost),
                         },
                         TacticalClass::Spell,
                         Some(player),

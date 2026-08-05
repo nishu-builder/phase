@@ -1742,7 +1742,7 @@ pub(in crate::game) fn priority_sneak_announcements(
         .flat_map(|candidate| candidate.hand.iter().copied())
         .filter_map(|hand_object| {
             let cost = crate::game::keywords::effective_sneak_cost(state, hand_object)?;
-            if !can_pay_cost_after_auto_tap(state, player, hand_object, &cost) {
+            if !can_feasibly_pay_mana_cost(state, player, Some(hand_object), &cost) {
                 return None;
             }
             state
@@ -5071,6 +5071,17 @@ pub fn effective_spell_cost(
     prepare_spell_cast(state, player, object_id)
         .ok()
         .map(|p| p.mana_cost)
+}
+
+pub(crate) fn effective_spell_cost_for_variant(
+    state: &GameState,
+    player: PlayerId,
+    object_id: ObjectId,
+    variant: CastingVariant,
+) -> Option<crate::types::mana::ManaCost> {
+    prepare_spell_cast_with_variant_override(state, player, object_id, Some(variant))
+        .ok()
+        .map(|prepared| prepared.mana_cost)
 }
 
 /// Returns the engine-effective mana cost for `object_id` **as if** all
@@ -14174,16 +14185,32 @@ fn can_cast_prepared_now_with_probe(
     // CR 117.1d + CR 601.2g: Feasibility, not just auto-tap, gates castability —
     // a player may activate sacrifice-/discard-/life-cost mana abilities during
     // payment (issue #562: KCI must expose Ichor Wellspring as castable).
-    let creature_face_ok = (prepared.modal.is_some()
-        || spell_has_legal_targets_with_probe(state, obj.id, player, probe))
-        && can_feasibly_pay_harmonize_mana_cost_with_probe(
+    let targets_ok = prepared.modal.is_some()
+        || spell_has_legal_targets_with_probe(state, obj.id, player, probe);
+    let mana_payable = can_feasibly_pay_harmonize_mana_cost_with_probe(
+        state,
+        player,
+        prepared.object_id,
+        prepared.casting_variant,
+        &prepared.mana_cost,
+        probe,
+    ) || casting_costs::defiler_reduced_cost(
+        state,
+        player,
+        prepared.object_id,
+        &prepared.mana_cost,
+    )
+    .is_some_and(|reduced| {
+        can_feasibly_pay_harmonize_mana_cost_with_probe(
             state,
             player,
             prepared.object_id,
             prepared.casting_variant,
-            &prepared.mana_cost,
+            &reduced,
             probe,
-        );
+        )
+    });
+    let creature_face_ok = targets_ok && mana_payable;
 
     if creature_face_ok {
         return true;
@@ -14982,7 +15009,7 @@ pub(crate) fn has_manual_mana_ability_for_spell_payment(
     )
 }
 
-pub(super) fn can_feasibly_pay_mana_cost_with_probe(
+pub(crate) fn can_feasibly_pay_mana_cost_with_probe(
     state: &GameState,
     player: PlayerId,
     source_id: Option<ObjectId>,
