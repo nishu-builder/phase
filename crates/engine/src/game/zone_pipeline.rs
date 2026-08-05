@@ -738,10 +738,9 @@ pub(crate) fn move_object_with_terminal(
             .get(&req.object_id)
             .expect("object exists (zone read above)");
         // CR 111.8: A token that has left the battlefield can't change zones; it
-        // remains in place and ceases to exist at the next SBA (CR 111.7). A
-        // same-id CR 601.2a `StackEntryKind::Spell` placeholder makes an
-        // announced spell effectively stack-resident and eligible for its
-        // retained-origin representation's delivery to `Zone::Stack`.
+        // remains in place and ceases to exist at the next SBA (CR 111.7). An
+        // exact CR 601.2a pending spell plus its announcement placeholder makes
+        // the retained-origin representation stack-resident until this delivery.
         if zones::token_is_outside_battlefield_and_stack(state, obj) {
             return ZoneMoveTerminalResult::Completed(ZoneMoveCompletion::Remained);
         }

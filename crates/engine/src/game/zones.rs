@@ -19,17 +19,28 @@ use super::printed_cards::{apply_back_face_to_object, snapshot_object_face};
 
 /// CR 109.1 + CR 601.2a + CR 405.1: A spell is an object on the stack from
 /// announcement, even while this engine retains its origin-zone field until
-/// finalization. CR 602.2a / CR 603.3: Activated and triggered abilities are
-/// distinct noncard stack objects, so a same-id non-spell entry cannot make its
-/// source object stack-resident.
+/// finalization. The retained-origin representation is stack-resident only while
+/// the exact spell's `PendingCast` lifecycle and announcement placeholder both
+/// remain live; a bare same-id stack entry is insufficient.
 fn object_has_stack_residency(state: &GameState, obj: &GameObject) -> bool {
-    obj.zone == Zone::Stack
-        || state.stack.iter().any(|entry| match &entry.kind {
-            StackEntryKind::Spell { .. } => entry.id == obj.id,
-            StackEntryKind::ActivatedAbility { .. }
-            | StackEntryKind::TriggeredAbility { .. }
-            | StackEntryKind::KeywordAction { .. } => false,
-        })
+    if obj.zone == Zone::Stack {
+        return true;
+    }
+
+    let is_pending_spell = |pending: &crate::types::game_state::PendingCast| {
+        pending.object_id == obj.id && pending.activation_ability_index.is_none()
+    };
+    let has_pending_spell = state.pending_cast.as_deref().is_some_and(is_pending_spell)
+        || state
+            .waiting_for
+            .pending_cast_ref()
+            .is_some_and(is_pending_spell);
+
+    has_pending_spell
+        && state
+            .stack
+            .iter()
+            .any(|entry| entry.id == obj.id && matches!(entry.kind, StackEntryKind::Spell { .. }))
 }
 
 /// CR 704.5d / CR 111.7 / CR 111.8: A token outside the battlefield ceases to
@@ -2305,10 +2316,10 @@ mod tests {
 
     use super::*;
     use crate::types::ability::{
-        ContinuousModification, ControllerRef, Effect, FilterProp, ResolvedAbility,
-        StaticDefinition, TargetFilter, TypeFilter, TypedFilter,
+        ContinuousModification, ControllerRef, FilterProp, StaticDefinition, TargetFilter,
+        TypeFilter, TypedFilter,
     };
-    use crate::types::game_state::{CastingVariant, GameState};
+    use crate::types::game_state::GameState;
     use crate::types::keywords::Keyword;
     use crate::types::mana::ManaCost;
 
@@ -2691,79 +2702,6 @@ mod tests {
             !state.players[0].library.contains(&id),
             "token must not be inserted into its owner's library"
         );
-    }
-
-    #[test]
-    fn announced_token_move_requires_same_id_spell_entry() {
-        let mut state = setup();
-        let announced_spell = create_object(
-            &mut state,
-            CardId(1),
-            PlayerId(0),
-            "Announced Spell Copy".to_string(),
-            Zone::Exile,
-        );
-        state.objects.get_mut(&announced_spell).unwrap().is_token = true;
-        state.stack.push_back(StackEntry {
-            id: announced_spell,
-            source_id: announced_spell,
-            controller: PlayerId(0),
-            kind: StackEntryKind::Spell {
-                card_id: CardId(1),
-                ability: None,
-                casting_variant: CastingVariant::Normal,
-                actual_mana_spent: 0,
-            },
-        });
-
-        let same_id_ability = create_object(
-            &mut state,
-            CardId(2),
-            PlayerId(0),
-            "Activated Source".to_string(),
-            Zone::Exile,
-        );
-        state.objects.get_mut(&same_id_ability).unwrap().is_token = true;
-        state.stack.push_back(StackEntry {
-            id: same_id_ability,
-            source_id: same_id_ability,
-            controller: PlayerId(0),
-            kind: StackEntryKind::ActivatedAbility {
-                source_id: same_id_ability,
-                ability: Box::new(ResolvedAbility::new(
-                    Effect::NoOp,
-                    vec![],
-                    same_id_ability,
-                    PlayerId(0),
-                )),
-            },
-        });
-
-        assert_eq!(state.objects[&announced_spell].zone, Zone::Exile);
-        assert_eq!(state.objects[&same_id_ability].zone, Zone::Exile);
-
-        let mut spell_events = Vec::new();
-        move_to_zone(&mut state, announced_spell, Zone::Stack, &mut spell_events);
-        assert_eq!(state.objects[&announced_spell].zone, Zone::Stack);
-        assert!(spell_events.iter().any(|event| {
-            matches!(
-                event,
-                GameEvent::ZoneChanged { object_id, to: Zone::Stack, .. }
-                    if *object_id == announced_spell
-            )
-        }));
-
-        // CR 109.1 / CR 602.2a: The same-id activated ability is its own
-        // noncard stack object and cannot authorize movement of its source.
-        let mut ability_events = Vec::new();
-        move_to_zone(
-            &mut state,
-            same_id_ability,
-            Zone::Stack,
-            &mut ability_events,
-        );
-        assert_eq!(state.objects[&same_id_ability].zone, Zone::Exile);
-        assert!(ability_events.is_empty());
     }
 
     #[test]

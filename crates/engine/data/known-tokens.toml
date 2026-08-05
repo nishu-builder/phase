@@ -67685,11 +67685,6 @@ colors = ["Green"]
 keywords = ["Trample"]
 
 [[token.source_card_refs]]
-card_name = "Advent of the Wurm"
-scryfall_oracle_id = "eb62aa4b-c11b-4195-ae85-cff8f78ce17b"
-scryfall_id = "f40284e6-01a1-4372-a92c-940e5732607e"
-
-[[token.source_card_refs]]
 card_name = "Armada Wurm"
 scryfall_oracle_id = "33598888-0367-4085-9415-f4e21da08354"
 scryfall_id = "50cb4bf3-70d1-4acc-a1fb-49f4ea74ca16"
@@ -85531,11 +85526,6 @@ colors = [
     "White",
 ]
 keywords = ["Flying"]
-
-[[token.source_card_refs]]
-card_name = "Teysa, Envoy of Ghosts"
-scryfall_oracle_id = "98b283dc-96a6-45a3-8a3f-11458497f358"
-scryfall_id = "cbd8183c-6967-4332-b822-02b82c14ef2d"
 
 [[token.source_card_refs]]
 card_name = "Beckon Apparition"
@@ -119528,11 +119518,6 @@ card_name = "Horncaller's Chant"
 scryfall_oracle_id = "8c069834-ed89-4298-989b-e67036d56196"
 scryfall_id = "7b8d33ed-9ca2-41d1-ba35-fdeb5b88ad44"
 
-[[token.source_card_refs]]
-card_name = "Trostani's Summoner"
-scryfall_oracle_id = "874e0b54-bc24-4887-abe1-1ecfd3a3abae"
-scryfall_id = "1921fa4e-2256-4ef1-b2fe-874f9fbbcdf3"
-
 [token.token_image_ref]
 scryfall_id = "1331008a-ae86-4640-b823-a73be766ac16"
 scryfall_oracle_id = "a685171a-616f-42e1-9161-4a64fb51a977"
@@ -139114,11 +139099,6 @@ colors = ["White"]
 keywords = ["Vigilance"]
 
 [[token.source_card_refs]]
-card_name = "Sunspire Gatekeepers"
-scryfall_oracle_id = "df2cc4ba-70b8-4875-8f84-9c268ab8d5f6"
-scryfall_id = "0a3bc6b9-475b-4257-a3bc-1a0b70d45f79"
-
-[[token.source_card_refs]]
 card_name = "Selesnya Charm"
 scryfall_oracle_id = "a1a49639-bcc4-4522-8862-c9fb13d40880"
 scryfall_id = "a9848eab-1d3a-4ab0-adf6-c20858aa3afb"
@@ -139137,11 +139117,6 @@ scryfall_id = "122d821f-c8dd-4a3c-a6d7-b42fe5491f02"
 card_name = "Security Blockade"
 scryfall_oracle_id = "b4b397a9-85cb-4bdf-8c2e-a151a02a4208"
 scryfall_id = "e6250b31-8592-48b2-a877-3637c9ee7d49"
-
-[[token.source_card_refs]]
-card_name = "Trostani's Summoner"
-scryfall_oracle_id = "874e0b54-bc24-4887-abe1-1ecfd3a3abae"
-scryfall_id = "1921fa4e-2256-4ef1-b2fe-874f9fbbcdf3"
 
 [token.token_image_ref]
 scryfall_id = "67d3d039-248a-4eb8-be5c-12959b458fea"
@@ -144207,11 +144182,6 @@ scryfall_id = "c71a6dbc-11cd-43f9-ac1b-fe779d590bff"
 card_name = "Assemble the Legion"
 scryfall_oracle_id = "6f81bef3-6ca0-4cf4-aa99-7b2813eeef04"
 scryfall_id = "5515422b-5bdd-413b-a414-ad3510dd62cc"
-
-[[token.source_card_refs]]
-card_name = "Blaze Commando"
-scryfall_oracle_id = "92e2f982-f8b9-4c3b-ab50-14c025370e5c"
-scryfall_id = "5e179f0d-2965-44e4-8483-67b330a8608c"
 
 [[token.source_card_refs]]
 card_name = "Sunhome Guildmage"
@@ -169871,46 +169841,6 @@ scryfall_id = "81910ade-a742-4ed7-ab15-bca95850f8b5"
 scryfall_id = "4bd69d39-c2ce-44b4-b2d0-5e384d69db02"
 scryfall_oracle_id = "340aaeb6-cd18-4908-9729-8c53ab02c6f8"
 preset_id = "c2376c1a-2d69-52dc-84a0-aec8a4e9a82b"
-
-[[token]]
-id = "c24dadf0-35cd-5122-91a2-c6744ff64ca5"
-category = "Creature"
-fidelity = "PartialMissingAbilities"
-source_card_names = [
-    "Vernal Sovereign",
-    "Voice of Resurgence",
-]
-set_code = "DGM"
-set_name = "Dragon's Maze"
-collector_number = "1"
-released_at = "2013-05-03"
-type_line = "Token Creature — Elemental"
-rules_text = "This creature's power and toughness are each equal to the number of creatures you control."
-
-[token.pt_provenance.SourceDefinedOrDynamic]
-power = "*"
-toughness = "*"
-
-[token.body]
-display_name = "Elemental"
-core_types = ["Creature"]
-subtypes = ["Elemental"]
-supertypes = []
-colors = [
-    "Green",
-    "White",
-]
-keywords = []
-
-[[token.source_card_refs]]
-card_name = "Voice of Resurgence"
-scryfall_oracle_id = "5cbbb3f3-63a4-4983-81ea-8c405b10e63f"
-scryfall_id = "07246783-d475-4f61-99ac-e2b574072349"
-
-[token.token_image_ref]
-scryfall_id = "5bfb1440-d4c1-42cf-a777-ee1644dbbac7"
-scryfall_oracle_id = "9f790267-5be9-41aa-be69-f87a8ce5a29e"
-preset_id = "c24dadf0-35cd-5122-91a2-c6744ff64ca5"
 
 [[token]]
 id = "c260fa03-ae9a-5bda-8c06-aab126a23edd"
@@ -209858,9 +209788,7 @@ source_card_names = [
     "Aether Channeler",
     "Akim, the Soaring Wind",
     "Battle Screech",
-    "Beck",
     "Beck // Call",
-    "Call",
     "Emeria Angel",
     "Eyes in the Skies",
     "Falcon and Redwing",
@@ -209897,18 +209825,6 @@ colors = ["White"]
 keywords = ["Flying"]
 
 [[token.source_card_refs]]
-card_name = "Beck // Call"
-face_name = "Call"
-scryfall_oracle_id = "5b8472c8-a7e7-46f2-aecf-e954082a5ef5"
-scryfall_id = "a01d6540-9eaf-4e08-a62d-682551ee78e9"
-
-[[token.source_card_refs]]
-card_name = "Beck // Call"
-face_name = "Beck"
-scryfall_oracle_id = "5b8472c8-a7e7-46f2-aecf-e954082a5ef5"
-scryfall_id = "a01d6540-9eaf-4e08-a62d-682551ee78e9"
-
-[[token.source_card_refs]]
 card_name = "Eyes in the Skies"
 scryfall_oracle_id = "9697cd05-474e-46f3-8bcc-d4b6fb2059a1"
 scryfall_id = "befef095-3429-4dd7-aa01-2f7f619675d4"
@@ -209917,11 +209833,6 @@ scryfall_id = "befef095-3429-4dd7-aa01-2f7f619675d4"
 card_name = "Seller of Songbirds"
 scryfall_oracle_id = "87e4c6ff-f83f-412b-9d23-aac7a57ef6db"
 scryfall_id = "2a41edbe-4c5a-4535-a082-235dc3ffe60a"
-
-[[token.source_card_refs]]
-card_name = "Scion of Vitu-Ghazi"
-scryfall_oracle_id = "a34c4d5c-6ecb-4da2-8734-a2f3d35cfe8b"
-scryfall_id = "3cd20865-0a9a-4a72-92f9-77c8d6384b46"
 
 [token.token_image_ref]
 scryfall_id = "05b4dbe1-12ac-404f-a1fe-96e0b620533e"
@@ -220865,7 +220776,6 @@ id = "fa42ee21-15bf-591e-93c7-0f78f10e338f"
 category = "Creature"
 fidelity = "Full"
 source_card_names = [
-    "Alive",
     "Alive // Well",
     "Call of the Conclave",
     "Centaur Glade",
@@ -220874,7 +220784,6 @@ source_card_names = [
     "Rampage of the Clans",
     "Trostani's Summoner",
     "Vitu-Ghazi Guildmage",
-    "Well",
 ]
 set_code = "RTR"
 set_name = "Return to Ravnica"
@@ -220898,21 +220807,9 @@ scryfall_oracle_id = "e1635acd-ed1e-4038-a11a-6518df285253"
 scryfall_id = "c6df8f4d-a07a-4664-878d-efec8b2affb9"
 
 [[token.source_card_refs]]
-card_name = "Alive // Well"
-face_name = "Alive"
-scryfall_oracle_id = "57ad3c3a-6ac7-4a35-bc07-00f6ea0988c5"
-scryfall_id = "db84415e-048a-4cfc-9121-5ae17a412198"
-
-[[token.source_card_refs]]
 card_name = "Centaur's Herald"
 scryfall_oracle_id = "b47fd32d-1a56-414f-9d91-ddd46d4b5ac7"
 scryfall_id = "08598b2b-6fd2-4a1d-8d74-7ca6d93ad382"
-
-[[token.source_card_refs]]
-card_name = "Alive // Well"
-face_name = "Well"
-scryfall_oracle_id = "57ad3c3a-6ac7-4a35-bc07-00f6ea0988c5"
-scryfall_id = "db84415e-048a-4cfc-9121-5ae17a412198"
 
 [[token.source_card_refs]]
 card_name = "Coursers' Accord"
@@ -220923,11 +220820,6 @@ scryfall_id = "f027ceb0-5d2b-4cf6-87ad-e6b9b1e20634"
 card_name = "Vitu-Ghazi Guildmage"
 scryfall_oracle_id = "da6f79ec-5f7e-4099-89c5-6d2bfc14d957"
 scryfall_id = "e54f8e61-550f-4493-b8ba-65f81b2457d3"
-
-[[token.source_card_refs]]
-card_name = "Trostani's Summoner"
-scryfall_oracle_id = "874e0b54-bc24-4887-abe1-1ecfd3a3abae"
-scryfall_id = "1921fa4e-2256-4ef1-b2fe-874f9fbbcdf3"
 
 [token.token_image_ref]
 scryfall_id = "880d5dc1-ceec-4c5f-93c2-c88b7dbfcac2"

@@ -2302,8 +2302,7 @@ mod tests {
     use super::*;
     use crate::game::zones::create_object;
     use crate::types::ability::{
-        AbilityDefinition, AbilityKind, Effect, ReplacementDefinition, ResolvedAbility,
-        TargetFilter,
+        AbilityDefinition, AbilityKind, Effect, ReplacementDefinition, TargetFilter,
     };
     use crate::types::actions::GameAction;
     use crate::types::format::FormatConfig;
@@ -4912,7 +4911,7 @@ mod tests {
     }
 
     #[test]
-    fn announced_off_zone_noncard_survival_requires_same_id_spell_entry() {
+    fn bare_same_id_spell_entry_does_not_prevent_off_zone_noncard_cleanup() {
         fn add_off_zone_noncard(
             state: &mut GameState,
             card_id: u64,
@@ -4947,73 +4946,26 @@ mod tests {
             });
         }
 
-        fn push_virtual_activated_entry(state: &mut GameState, id: ObjectId) {
-            state.stack.push_back(StackEntry {
-                id,
-                source_id: id,
-                controller: PlayerId(0),
-                kind: StackEntryKind::ActivatedAbility {
-                    source_id: id,
-                    ability: Box::new(ResolvedAbility::new(Effect::NoOp, vec![], id, PlayerId(0))),
-                },
-            });
-        }
-
         let mut state = setup();
-        let announced_token = add_off_zone_noncard(&mut state, 1, "Announced Token", true, false);
-        let activated_token = add_off_zone_noncard(&mut state, 2, "Activated Token", true, false);
-        let unmatched_token = add_off_zone_noncard(&mut state, 3, "Unmatched Token", true, false);
-        let announced_copy = add_off_zone_noncard(&mut state, 4, "Announced Copy", false, true);
-        let activated_copy = add_off_zone_noncard(&mut state, 5, "Activated Copy", false, true);
-        let unmatched_copy = add_off_zone_noncard(&mut state, 6, "Unmatched Copy", false, true);
+        let token = add_off_zone_noncard(&mut state, 1, "Orphan Token", true, false);
+        let copy = add_off_zone_noncard(&mut state, 2, "Orphan Copy", false, true);
+        push_spell_placeholder(&mut state, token, 1);
+        push_spell_placeholder(&mut state, copy, 2);
 
-        push_spell_placeholder(&mut state, announced_token, 1);
-        push_virtual_activated_entry(&mut state, activated_token);
-        push_spell_placeholder(&mut state, announced_copy, 4);
-        push_virtual_activated_entry(&mut state, activated_copy);
-
-        for id in [
-            announced_token,
-            activated_token,
-            unmatched_token,
-            announced_copy,
-            activated_copy,
-            unmatched_copy,
-        ] {
+        for id in [token, copy] {
             assert!(state.objects.contains_key(&id));
             assert_eq!(state.objects[&id].zone, Zone::Exile);
         }
-        assert!(state.stack.iter().any(|entry| {
-            entry.id == activated_token
-                && entry.source_id == activated_token
-                && matches!(entry.kind, StackEntryKind::ActivatedAbility { .. })
-        }));
-        assert!(state.stack.iter().any(|entry| {
-            entry.id == activated_copy
-                && entry.source_id == activated_copy
-                && matches!(entry.kind, StackEntryKind::ActivatedAbility { .. })
-        }));
 
         let mut events = Vec::new();
         check_state_based_actions(&mut state, &mut events);
 
-        // CR 601.2a: The exact same-id spell placeholders make these announced
-        // spell objects stack-resident despite the retained Exile field.
-        assert!(state.objects.contains_key(&announced_token));
-        assert!(state.objects.contains_key(&announced_copy));
-
-        // CR 704.5d + CR 704.5e: Unmatched off-zone tokens/copies cease, and
-        // CR 109.1 / CR 602.2a means a same-id activated ability cannot protect
-        // its source.
-        for id in [
-            activated_token,
-            unmatched_token,
-            activated_copy,
-            unmatched_copy,
-        ] {
+        // CR 704.5d + CR 704.5e: Bare same-id spell entries do not establish a
+        // live casting lifecycle, so both synthetic off-zone objects cease.
+        for id in [token, copy] {
             assert!(
                 !state.objects.contains_key(&id),
-                "off-zone noncard object {id:?} must cease without its own spell entry"
+                "off-zone noncard object {id:?} must cease without its own PendingCast"
             );
         }
     }

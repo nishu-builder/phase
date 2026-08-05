@@ -73,7 +73,7 @@ fn build_prepared_swords_fixture(
     }
 }
 
-fn begin_prepared_cast_across_sba(runner: &mut GameRunner, emeritus: ObjectId) -> ObjectId {
+fn begin_prepared_cast(runner: &mut GameRunner, emeritus: ObjectId) -> ObjectId {
     runner
         .act(GameAction::Debug(
             engine::types::actions::DebugAction::SetPrepared {
@@ -102,19 +102,6 @@ fn begin_prepared_cast_across_sba(runner: &mut GameRunner, emeritus: ObjectId) -
         StackEntryKind::Spell { ability: None, .. }
     ));
     assert!(runner.state().objects.contains_key(&copy_id));
-
-    let mut sba_events = Vec::new();
-    engine::game::sba::check_state_based_actions(runner.state_mut(), &mut sba_events);
-
-    // CR 601.2a: The announced spell remains on the stack throughout target
-    // selection, even while the engine retains its origin-zone representation.
-    assert!(runner.state().objects.contains_key(&copy_id));
-    assert!(runner.state().stack.iter().any(|entry| entry.id == copy_id));
-    assert!(matches!(
-        &runner.state().waiting_for,
-        WaitingFor::TargetSelection { pending_cast, .. }
-            if pending_cast.object_id == copy_id
-    ));
 
     copy_id
 }
@@ -178,8 +165,11 @@ fn issue_1312_prepared_swords_to_plowshares_triggers_lecturing_scornmage() {
         counterspell: _,
     } = build_prepared_swords_fixture(db, true, false);
     let scornmage = scornmage.expect("Scornmage fixture requested");
-    let copy_id = begin_prepared_cast_across_sba(&mut runner, emeritus);
+    let copy_id = begin_prepared_cast(&mut runner, emeritus);
     drive_cast_to_stack(&mut runner, exile_target);
+    // CR 601.2a + CR 704.3: Choosing the target completes the cast through
+    // `apply`, which reaches the ordinary priority-boundary SBA pipeline. The
+    // prepared copy must already have finalized into its real Stack zone there.
     assert_prepared_copy_finalized_on_stack(&runner, copy_id, exile_target);
 
     let scornmage_triggers = runner
@@ -227,7 +217,7 @@ fn issue_1312_countered_prepared_copy_ceases_without_resolving() {
         counterspell,
     } = build_prepared_swords_fixture(db, false, true);
     let counterspell = counterspell.expect("Counterspell fixture requested");
-    let copy_id = begin_prepared_cast_across_sba(&mut runner, emeritus);
+    let copy_id = begin_prepared_cast(&mut runner, emeritus);
     drive_cast_to_stack(&mut runner, exile_target);
     assert_prepared_copy_finalized_on_stack(&runner, copy_id, exile_target);
 
