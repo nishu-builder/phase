@@ -1,7 +1,7 @@
 use crate::types::card_type::CoreType;
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
-    GameState, ResolutionSourceRelatch, StackEntry, ZoneChangeCombatStatus,
+    GameState, ResolutionSourceRelatch, StackEntry, StackEntryKind, ZoneChangeCombatStatus,
 };
 use crate::types::identifiers::{CardId, ObjectId, ObjectIncarnationRef};
 use crate::types::player::PlayerId;
@@ -17,11 +17,27 @@ use crate::types::zones::Zone;
 use super::game_object::GameObject;
 use super::printed_cards::{apply_back_face_to_object, snapshot_object_face};
 
-/// CR 111.7 / CR 111.8: A token outside the battlefield ceases to exist at
-/// the next SBA, and can't change zones before then. Stack tokens are excluded
-/// so spell copies can finish resolving before the next SBA check.
-pub(super) fn token_is_outside_battlefield_and_stack(obj: &GameObject) -> bool {
-    obj.is_token && obj.zone != Zone::Battlefield && obj.zone != Zone::Stack
+/// CR 109.1 + CR 601.2a + CR 405.1: A spell is an object on the stack from
+/// announcement, even while this engine retains its origin-zone field until
+/// finalization. CR 602.2a / CR 603.3: Activated and triggered abilities are
+/// distinct noncard stack objects, so a same-id non-spell entry cannot make its
+/// source object stack-resident.
+fn object_has_stack_residency(state: &GameState, obj: &GameObject) -> bool {
+    obj.zone == Zone::Stack
+        || state.stack.iter().any(|entry| match &entry.kind {
+            StackEntryKind::Spell { .. } => entry.id == obj.id,
+            StackEntryKind::ActivatedAbility { .. }
+            | StackEntryKind::TriggeredAbility { .. }
+            | StackEntryKind::KeywordAction { .. } => false,
+        })
+}
+
+/// CR 704.5d / CR 111.7 / CR 111.8: A token outside the battlefield ceases to
+/// exist at the next SBA and can't change zones before then. Effectively
+/// stack-resident tokens are excluded so announced spell copies can finish
+/// casting and resolving before the next applicable SBA check.
+pub(super) fn token_is_outside_battlefield_and_stack(state: &GameState, obj: &GameObject) -> bool {
+    obj.is_token && obj.zone != Zone::Battlefield && !object_has_stack_residency(state, obj)
 }
 
 /// CR 704.5e + CR 707.10a: A copy of a card in any zone other than the stack or
@@ -30,8 +46,11 @@ pub(super) fn token_is_outside_battlefield_and_stack(obj: &GameObject) -> bool {
 /// (CR 707.10f makes a permanent copy a token there) and may change zones freely
 /// while alive, so this predicate is used ONLY by the cease-to-exist SBA — never
 /// by the CR 111.8 "can't change zones" movement guards, which apply to tokens only.
-pub(super) fn copy_of_card_outside_battlefield_and_stack(obj: &GameObject) -> bool {
-    obj.is_copy && obj.zone != Zone::Battlefield && obj.zone != Zone::Stack
+pub(super) fn copy_of_card_outside_battlefield_and_stack(
+    state: &GameState,
+    obj: &GameObject,
+) -> bool {
+    obj.is_copy && obj.zone != Zone::Battlefield && !object_has_stack_residency(state, obj)
 }
 
 /// CR 122.2 + CR 113.6b: Determine whether `object_id`'s counters survive a move
@@ -941,7 +960,7 @@ pub fn move_to_zone(
     if state
         .objects
         .get(&object_id)
-        .is_some_and(token_is_outside_battlefield_and_stack)
+        .is_some_and(|obj| token_is_outside_battlefield_and_stack(state, obj))
     {
         return;
     }
@@ -1638,7 +1657,7 @@ pub fn move_to_library_at_index(
     if state
         .objects
         .get(&object_id)
-        .is_some_and(token_is_outside_battlefield_and_stack)
+        .is_some_and(|obj| token_is_outside_battlefield_and_stack(state, obj))
     {
         return;
     }
@@ -2286,10 +2305,10 @@ mod tests {
 
     use super::*;
     use crate::types::ability::{
-        ContinuousModification, ControllerRef, FilterProp, StaticDefinition, TargetFilter,
-        TypeFilter, TypedFilter,
+        ContinuousModification, ControllerRef, Effect, FilterProp, ResolvedAbility,
+        StaticDefinition, TargetFilter, TypeFilter, TypedFilter,
     };
-    use crate::types::game_state::GameState;
+    use crate::types::game_state::{CastingVariant, GameState};
     use crate::types::keywords::Keyword;
     use crate::types::mana::ManaCost;
 
@@ -2672,6 +2691,79 @@ mod tests {
             !state.players[0].library.contains(&id),
             "token must not be inserted into its owner's library"
         );
+    }
+
+    #[test]
+    fn announced_token_move_requires_same_id_spell_entry() {
+        let mut state = setup();
+        let announced_spell = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Announced Spell Copy".to_string(),
+            Zone::Exile,
+        );
+        state.objects.get_mut(&announced_spell).unwrap().is_token = true;
+        state.stack.push_back(StackEntry {
+            id: announced_spell,
+            source_id: announced_spell,
+            controller: PlayerId(0),
+            kind: StackEntryKind::Spell {
+                card_id: CardId(1),
+                ability: None,
+                casting_variant: CastingVariant::Normal,
+                actual_mana_spent: 0,
+            },
+        });
+
+        let same_id_ability = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Activated Source".to_string(),
+            Zone::Exile,
+        );
+        state.objects.get_mut(&same_id_ability).unwrap().is_token = true;
+        state.stack.push_back(StackEntry {
+            id: same_id_ability,
+            source_id: same_id_ability,
+            controller: PlayerId(0),
+            kind: StackEntryKind::ActivatedAbility {
+                source_id: same_id_ability,
+                ability: Box::new(ResolvedAbility::new(
+                    Effect::NoOp,
+                    vec![],
+                    same_id_ability,
+                    PlayerId(0),
+                )),
+            },
+        });
+
+        assert_eq!(state.objects[&announced_spell].zone, Zone::Exile);
+        assert_eq!(state.objects[&same_id_ability].zone, Zone::Exile);
+
+        let mut spell_events = Vec::new();
+        move_to_zone(&mut state, announced_spell, Zone::Stack, &mut spell_events);
+        assert_eq!(state.objects[&announced_spell].zone, Zone::Stack);
+        assert!(spell_events.iter().any(|event| {
+            matches!(
+                event,
+                GameEvent::ZoneChanged { object_id, to: Zone::Stack, .. }
+                    if *object_id == announced_spell
+            )
+        }));
+
+        // CR 109.1 / CR 602.2a: The same-id activated ability is its own
+        // noncard stack object and cannot authorize movement of its source.
+        let mut ability_events = Vec::new();
+        move_to_zone(
+            &mut state,
+            same_id_ability,
+            Zone::Stack,
+            &mut ability_events,
+        );
+        assert_eq!(state.objects[&same_id_ability].zone, Zone::Exile);
+        assert!(ability_events.is_empty());
     }
 
     #[test]

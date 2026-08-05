@@ -2124,8 +2124,8 @@ fn check_token_cease_to_exist(state: &mut GameState, any_performed: &mut bool) {
         .objects
         .iter()
         .filter(|(_, obj)| {
-            zones::token_is_outside_battlefield_and_stack(obj)
-                || zones::copy_of_card_outside_battlefield_and_stack(obj)
+            zones::token_is_outside_battlefield_and_stack(state, obj)
+                || zones::copy_of_card_outside_battlefield_and_stack(state, obj)
         })
         .map(|(id, obj)| (*id, obj.zone, obj.owner))
         .collect();
@@ -2302,10 +2302,12 @@ mod tests {
     use super::*;
     use crate::game::zones::create_object;
     use crate::types::ability::{
-        AbilityDefinition, AbilityKind, Effect, ReplacementDefinition, TargetFilter,
+        AbilityDefinition, AbilityKind, Effect, ReplacementDefinition, ResolvedAbility,
+        TargetFilter,
     };
     use crate::types::actions::GameAction;
     use crate::types::format::FormatConfig;
+    use crate::types::game_state::{CastingVariant, StackEntry, StackEntryKind};
     use crate::types::identifiers::{CardId, ObjectId};
     use crate::types::replacements::ReplacementEvent;
 
@@ -4907,6 +4909,113 @@ mod tests {
             state.objects.contains_key(&id),
             "Token on stack should survive SBA"
         );
+    }
+
+    #[test]
+    fn announced_off_zone_noncard_survival_requires_same_id_spell_entry() {
+        fn add_off_zone_noncard(
+            state: &mut GameState,
+            card_id: u64,
+            name: &str,
+            is_token: bool,
+            is_copy: bool,
+        ) -> ObjectId {
+            let id = create_object(
+                state,
+                CardId(card_id),
+                PlayerId(0),
+                name.to_string(),
+                Zone::Exile,
+            );
+            let object = state.objects.get_mut(&id).unwrap();
+            object.is_token = is_token;
+            object.is_copy = is_copy;
+            id
+        }
+
+        fn push_spell_placeholder(state: &mut GameState, id: ObjectId, card_id: u64) {
+            state.stack.push_back(StackEntry {
+                id,
+                source_id: id,
+                controller: PlayerId(0),
+                kind: StackEntryKind::Spell {
+                    card_id: CardId(card_id),
+                    ability: None,
+                    casting_variant: CastingVariant::Normal,
+                    actual_mana_spent: 0,
+                },
+            });
+        }
+
+        fn push_virtual_activated_entry(state: &mut GameState, id: ObjectId) {
+            state.stack.push_back(StackEntry {
+                id,
+                source_id: id,
+                controller: PlayerId(0),
+                kind: StackEntryKind::ActivatedAbility {
+                    source_id: id,
+                    ability: Box::new(ResolvedAbility::new(Effect::NoOp, vec![], id, PlayerId(0))),
+                },
+            });
+        }
+
+        let mut state = setup();
+        let announced_token = add_off_zone_noncard(&mut state, 1, "Announced Token", true, false);
+        let activated_token = add_off_zone_noncard(&mut state, 2, "Activated Token", true, false);
+        let unmatched_token = add_off_zone_noncard(&mut state, 3, "Unmatched Token", true, false);
+        let announced_copy = add_off_zone_noncard(&mut state, 4, "Announced Copy", false, true);
+        let activated_copy = add_off_zone_noncard(&mut state, 5, "Activated Copy", false, true);
+        let unmatched_copy = add_off_zone_noncard(&mut state, 6, "Unmatched Copy", false, true);
+
+        push_spell_placeholder(&mut state, announced_token, 1);
+        push_virtual_activated_entry(&mut state, activated_token);
+        push_spell_placeholder(&mut state, announced_copy, 4);
+        push_virtual_activated_entry(&mut state, activated_copy);
+
+        for id in [
+            announced_token,
+            activated_token,
+            unmatched_token,
+            announced_copy,
+            activated_copy,
+            unmatched_copy,
+        ] {
+            assert!(state.objects.contains_key(&id));
+            assert_eq!(state.objects[&id].zone, Zone::Exile);
+        }
+        assert!(state.stack.iter().any(|entry| {
+            entry.id == activated_token
+                && entry.source_id == activated_token
+                && matches!(entry.kind, StackEntryKind::ActivatedAbility { .. })
+        }));
+        assert!(state.stack.iter().any(|entry| {
+            entry.id == activated_copy
+                && entry.source_id == activated_copy
+                && matches!(entry.kind, StackEntryKind::ActivatedAbility { .. })
+        }));
+
+        let mut events = Vec::new();
+        check_state_based_actions(&mut state, &mut events);
+
+        // CR 601.2a: The exact same-id spell placeholders make these announced
+        // spell objects stack-resident despite the retained Exile field.
+        assert!(state.objects.contains_key(&announced_token));
+        assert!(state.objects.contains_key(&announced_copy));
+
+        // CR 704.5d + CR 704.5e: Unmatched off-zone tokens/copies cease, and
+        // CR 109.1 / CR 602.2a means a same-id activated ability cannot protect
+        // its source.
+        for id in [
+            activated_token,
+            unmatched_token,
+            activated_copy,
+            unmatched_copy,
+        ] {
+            assert!(
+                !state.objects.contains_key(&id),
+                "off-zone noncard object {id:?} must cease without its own spell entry"
+            );
+        }
     }
 
     // --- CR 704.5e + CR 707.10a: Copy-of-a-card cease-to-exist tests ---
