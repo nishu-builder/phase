@@ -13648,12 +13648,85 @@ mod priority_principal_tests {
         priority_principal_for_preflight, PriorityPreflight, PriorityPreflightBlock,
         PriorityPreflightCandidate, PriorityPreflightIndeterminate, PriorityReducerFamily,
     };
+    use crate::game::game_object::BackFaceData;
+    use crate::game::scenario::{GameScenario, P0};
     use crate::game::zones;
-    use crate::types::card_type::CoreType;
+    use crate::types::ability::{
+        AbilityDefinition, AbilityKind, Effect, QuantityExpr, TargetFilter,
+    };
+    use crate::types::card_type::{CardType, CoreType};
     use crate::types::game_state::{GameState, WaitingFor};
-    use crate::types::identifiers::CardId;
+    use crate::types::identifiers::{CardId, ObjectId};
+    use crate::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
+    use crate::types::phase::Phase;
     use crate::types::player::PlayerId;
     use crate::types::zones::Zone;
+
+    fn issue_4001_alternative_face_fixture(mana_count: usize) -> (GameState, ObjectId) {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::DeclareAttackers);
+        let object_id = scenario
+            .add_creature_to_hand(P0, "Frolicking Familiar", 2, 2)
+            .with_mana_cost(ManaCost::Cost {
+                shards: vec![ManaCostShard::Red],
+                generic: 2,
+            })
+            .id();
+        let mut runner = scenario.build();
+        runner
+            .state_mut()
+            .objects
+            .get_mut(&object_id)
+            .unwrap()
+            .back_face = Some(BackFaceData {
+            name: "Blow Off Steam".to_string(),
+            power: None,
+            toughness: None,
+            loyalty: None,
+            printed_loyalty: None,
+            defense: None,
+            card_types: {
+                let mut card_types = CardType::default();
+                card_types.core_types.push(CoreType::Instant);
+                card_types.subtypes.push("Adventure".to_string());
+                card_types
+            },
+            mana_cost: ManaCost::Cost {
+                shards: vec![ManaCostShard::Red],
+                generic: 1,
+            },
+            keywords: Vec::new(),
+            abilities: vec![AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::DealDamage {
+                    amount: QuantityExpr::Fixed { value: 2 },
+                    target: TargetFilter::Any,
+                    damage_source: None,
+                    excess: None,
+                },
+            )],
+            trigger_definitions: Default::default(),
+            replacement_definitions: Default::default(),
+            static_definitions: Default::default(),
+            color: vec![ManaColor::Red],
+            printed_ref: None,
+            modal: None,
+            additional_cost: None,
+            strive_cost: None,
+            casting_restrictions: Vec::new(),
+            casting_options: Vec::new(),
+            layout_kind: None,
+        });
+        for _ in 0..mana_count {
+            runner.state_mut().players[0].mana_pool.add(ManaUnit::new(
+                ManaType::Red,
+                ObjectId(0),
+                false,
+                Vec::new(),
+            ));
+        }
+        (runner.state().clone(), object_id)
+    }
 
     #[test]
     fn principal_preserves_the_controlled_priority_seat() {
@@ -13720,6 +13793,44 @@ mod priority_principal_tests {
             preflight_priority_window(&state),
             PriorityPreflight::Actionless
         );
+    }
+
+    #[test]
+    fn priority_preflight_keeps_cast_legal_only_through_alternative_face() {
+        let (state, object_id) = issue_4001_alternative_face_fixture(2);
+        let before = state.clone();
+
+        assert!(
+            crate::game::casting::effective_spell_cost(&state, P0, object_id).is_none(),
+            "the creature front face must remain unpreparable outside a main phase"
+        );
+        assert!(
+            crate::game::casting::can_cast_object_now(&state, P0, object_id),
+            "the instant Adventure face must make the object castable"
+        );
+        assert_eq!(
+            preflight_priority_window(&state),
+            PriorityPreflight::Actionable {
+                family: PriorityReducerFamily::CastSpell,
+            }
+        );
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn priority_preflight_stays_actionless_when_neither_face_is_castable() {
+        let (state, object_id) = issue_4001_alternative_face_fixture(0);
+        let before = state.clone();
+
+        assert!(
+            !crate::game::casting::can_cast_object_now(&state, P0, object_id),
+            "neither the front face nor the Adventure face is currently castable"
+        );
+        assert_eq!(
+            preflight_priority_window(&state),
+            PriorityPreflight::Actionless
+        );
+        assert_eq!(state, before);
     }
 
     #[test]

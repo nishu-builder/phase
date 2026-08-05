@@ -3510,11 +3510,6 @@ pub(crate) fn priority_actions_with_probe(
     // (PlayLand, Foretell) and mana abilities remain permitted.
     let split_second_active = crate::game::keywords::stack_has_split_second(state);
     let mana_source_selections = OnceCell::new();
-    let payment_mode_for_cost = |object_id, cost: &crate::types::mana::ManaCost| {
-        let selections = mana_source_selections
-            .get_or_init(|| mana_sources::activatable_mana_source_selections(state, player));
-        casting::payment_mode_for_prepared_spell_cost(state, player, object_id, cost, selections)
-    };
 
     let p = &state.players[player.0 as usize];
     let is_main_phase = matches!(state.phase, Phase::PreCombatMain | Phase::PostCombatMain);
@@ -3624,12 +3619,11 @@ pub(crate) fn priority_actions_with_probe(
             let Some(obj) = state.objects.get(&object_id) else {
                 continue;
             };
-            if casting::can_cast_object_now_with_probe(state, player, object_id, probe) {
-                let payment_mode = casting::effective_spell_cost(state, player, object_id)
-                    .as_ref()
-                    .map_or(CastPaymentMode::Auto, |cost| {
-                        payment_mode_for_cost(object_id, cost)
-                    });
+            let selections = mana_source_selections
+                .get_or_init(|| mana_sources::activatable_mana_source_selections(state, player));
+            if let Some(payment_mode) = casting::castable_spell_payment_mode_with_probe(
+                state, player, object_id, selections, probe,
+            ) {
                 actions.push(candidate(
                     GameAction::CastSpell {
                         object_id,

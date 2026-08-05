@@ -1617,17 +1617,13 @@ pub(in crate::game) fn priority_cast_spell_announcements(
         .into_iter()
         .filter_map(|object_id| {
             let object = state.objects.get(&object_id)?;
-            if !can_cast_object_now(state, player, object_id) {
-                return None;
-            }
-            let cost = effective_spell_cost(state, player, object_id)?;
-            let payment_mode = payment_mode_for_prepared_spell_cost(
+            let payment_mode = castable_spell_payment_mode_with_probe(
                 state,
                 player,
                 object_id,
-                &cost,
                 &mana_source_selections,
-            );
+                None,
+            )?;
             Some(PriorityCastSpellAnnouncement::new(
                 object_id,
                 object.card_id,
@@ -5260,6 +5256,11 @@ struct CastingVariantChoiceSet {
 struct PreparedCastingVariant {
     transformed_state: GameState,
     prepared: PreparedSpellCast,
+}
+
+struct CastableSpellVerdict {
+    payment_state: Option<GameState>,
+    prepared_cost: Option<ManaCost>,
 }
 
 /// Apply every cast-method characteristic transform to a detached state and
@@ -13818,40 +13819,65 @@ pub fn can_cast_object_now_with_probe(
     object_id: ObjectId,
     probe: Option<&PriorityCastProbe>,
 ) -> bool {
+    castable_spell_verdict_with_probe(state, player, object_id, probe).is_some()
+}
+
+fn castable_alternative_spell_face_verdict(
+    state: &GameState,
+    player: PlayerId,
+    object_id: ObjectId,
+) -> Option<CastableSpellVerdict> {
+    let obj = state.objects.get(&object_id)?;
+
+    // CR 715.3a / CR 720.3a: An Adventure instant/sorcery face may be
+    // castable even when `prepare_spell_cast` fails on the creature face —
+    // most commonly the sorcery-speed timing gate outside main phases.
+    if alternative_spell_layout(obj).is_some() && cast_face_choice_offered_from_zone(state, obj) {
+        let mut transformed_state = state.clone();
+        swap_to_alternative_spell_face(transformed_state.objects.get_mut(&object_id)?);
+        if let Ok(prepared) = prepare_spell_cast(&transformed_state, player, object_id) {
+            if can_cast_prepared_now_with_probe(&transformed_state, player, &prepared, None) {
+                return Some(CastableSpellVerdict {
+                    payment_state: Some(transformed_state),
+                    prepared_cost: Some(prepared.mana_cost),
+                });
+            }
+        }
+    }
+
+    // CR 709.3 + CR 712.11b: Spell//spell split cards and spell//spell
+    // MDFCs may be castable via the other face even when preparation fails
+    // on the current face — e.g. a graveyard permission cast of Life //
+    // Death when only Death is affordable (#3987).
+    if cast_spell_face_choice_available(obj) && cast_spell_face_choice_offered_from_zone(state, obj)
+    {
+        let mut transformed_state = state.clone();
+        simulate_chosen_split_spell_back_face(transformed_state.objects.get_mut(&object_id)?);
+        let mut verdict =
+            castable_spell_verdict_with_probe(&transformed_state, player, object_id, None)?;
+        if verdict.payment_state.is_none() {
+            verdict.payment_state = Some(transformed_state);
+        }
+        return Some(verdict);
+    }
+
+    None
+}
+
+fn castable_spell_verdict_with_probe(
+    state: &GameState,
+    player: PlayerId,
+    object_id: ObjectId,
+    probe: Option<&PriorityCastProbe>,
+) -> Option<CastableSpellVerdict> {
     // CR 702.61a: While a spell with split second is on the stack, players can't
     // cast spells (mana abilities are exempt per CR 702.61b, but spells are not).
     if super::keywords::stack_has_split_second(state) {
-        return false;
+        return None;
     }
     let Ok(prepared) = prepare_spell_cast(state, player, object_id) else {
-        // CR 715.3a / CR 720.3a: An Adventure instant/sorcery face may be
-        // castable even when `prepare_spell_cast` fails on the creature face —
-        // most commonly the sorcery-speed timing gate outside main phases.
-        if let Some(obj) = state.objects.get(&object_id) {
-            if alternative_spell_layout(obj).is_some()
-                && cast_face_choice_offered_from_zone(state, obj)
-            {
-                let mut sim = state.clone();
-                if let Some(sim_obj) = sim.objects.get_mut(&object_id) {
-                    swap_to_alternative_spell_face(sim_obj);
-                }
-                if let Ok(prepared) = prepare_spell_cast(&sim, player, object_id) {
-                    return can_cast_prepared_now_with_probe(&sim, player, &prepared, None);
-                }
-            }
-            // CR 709.3 + CR 712.11b: Spell//spell split cards and spell//spell
-            // MDFCs may be castable via the other face even when prepare fails
-            // on the current face — e.g. a graveyard permission cast of Life //
-            // Death when only Death is affordable (#3987).
-            if cast_spell_face_choice_available(obj)
-                && cast_spell_face_choice_offered_from_zone(state, obj)
-            {
-                let mut sim = state.clone();
-                if let Some(sim_obj) = sim.objects.get_mut(&object_id) {
-                    simulate_chosen_split_spell_back_face(sim_obj);
-                }
-                return can_cast_object_now_with_probe(&sim, player, object_id, None);
-            }
+        if let Some(verdict) = castable_alternative_spell_face_verdict(state, player, object_id) {
+            return Some(verdict);
         }
         // CR 708.4 + CR 702.37c / CR 702.168b: a morph/megamorph/disguise card whose
         // FACE-UP cast is prohibited (Meddling Mage / Nevermore naming it) fails
@@ -13871,15 +13897,25 @@ pub fn can_cast_object_now_with_probe(
             )
             && face_down_cast_is_permitted(state, player, object_id)
         {
-            return true;
+            return Some(CastableSpellVerdict {
+                payment_state: None,
+                prepared_cost: None,
+            });
         }
         let choices = casting_variant_choice_set(state, player, object_id, probe);
-        return !choices.options.is_empty();
+        return (!choices.options.is_empty()).then_some(CastableSpellVerdict {
+            payment_state: None,
+            prepared_cost: None,
+        });
     };
-    can_cast_prepared_now_with_probe(state, player, &prepared, probe)
+    let is_castable = can_cast_prepared_now_with_probe(state, player, &prepared, probe)
         || !casting_variant_choice_set(state, player, object_id, probe)
             .options
-            .is_empty()
+            .is_empty();
+    is_castable.then_some(CastableSpellVerdict {
+        payment_state: None,
+        prepared_cost: Some(prepared.mana_cost),
+    })
 }
 
 /// CR 702.180a (issue #1550): Harmonize may tap up to one untapped creature
@@ -15142,6 +15178,32 @@ pub(crate) fn payment_mode_for_prepared_spell_cost(
     } else {
         CastPaymentMode::Auto
     }
+}
+
+/// CR 601.2g-h: Admit an ordinary cast and derive its payment mode from the
+/// exact face whose prepared characteristics made the cast legal. This is the
+/// shared authority for normal priority preflight and tactical candidates, so
+/// neither consumer can accept an alternative-face cast and then ask the
+/// uncastable front face for its cost.
+pub(crate) fn castable_spell_payment_mode_with_probe(
+    state: &GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+    mana_source_selections: &[ManaSourceSelection],
+    probe: Option<&PriorityCastProbe>,
+) -> Option<CastPaymentMode> {
+    let verdict = castable_spell_verdict_with_probe(state, player, source_id, probe)?;
+    let Some(cost) = verdict.prepared_cost.as_ref() else {
+        return Some(CastPaymentMode::Auto);
+    };
+    let payment_state = verdict.payment_state.as_ref().unwrap_or(state);
+    Some(payment_mode_for_prepared_spell_cost(
+        payment_state,
+        player,
+        source_id,
+        cost,
+        mana_source_selections,
+    ))
 }
 
 /// CR 601.2g-h: Shared offer verdict for a spell whose exact alternative or
