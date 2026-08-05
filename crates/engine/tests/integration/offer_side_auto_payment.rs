@@ -4,7 +4,8 @@ use engine::game::scenario_db::GameScenarioDbExt;
 use engine::types::ability::{
     AbilityCost, AbilityDefinition, AbilityKind, CardPlayMode, CastFromZoneDriver,
     CastingPermission, ControllerRef, Effect, FilterProp, ManaContribution, ManaProduction,
-    StaticCondition, StaticDefinition, TargetFilter, TargetRef, TypeFilter, TypedFilter,
+    SacrificeCost, StaticCondition, StaticDefinition, TargetFilter, TargetRef, TypeFilter,
+    TypedFilter,
 };
 use engine::types::actions::{DebugAction, GameAction};
 use engine::types::game_state::{
@@ -52,6 +53,209 @@ fn interactive_graveyard_mana_ability(color: ManaColor) -> AbilityDefinition {
                 }]),
         )),
     })
+}
+
+fn self_sacrificing_mana_ability(color: ManaColor) -> AbilityDefinition {
+    AbilityDefinition::new(
+        AbilityKind::Activated,
+        Effect::Mana {
+            produced: ManaProduction::Fixed {
+                colors: vec![color],
+                contribution: ManaContribution::Base,
+            },
+            restrictions: vec![],
+            grants: vec![],
+            expiry: None,
+            target: None,
+        },
+    )
+    .cost(AbilityCost::Sacrifice(SacrificeCost::count(
+        TargetFilter::SelfRef,
+        1,
+    )))
+}
+
+fn setup_sneak_with_sacrificial_mana(
+    sneak_cost: u32,
+) -> (GameRunner, ObjectId, ObjectId, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::DeclareBlockers);
+    let attacker = scenario.add_creature(P0, "Sneak Return Witness", 2, 2).id();
+    let spell = scenario
+        .add_spell_to_hand(P0, "Sacrificial Sneak Witness", true)
+        .with_mana_cost(ManaCost::generic(7))
+        .with_keyword(Keyword::Sneak(ManaCost::generic(sneak_cost)))
+        .id();
+    let mana_source = scenario
+        .add_creature(P0, "Sneak Blood Pet Witness", 1, 1)
+        .with_ability_definition(self_sacrificing_mana_ability(ManaColor::Black))
+        .id();
+    let mut runner = scenario.build();
+    runner.state_mut().phase = Phase::DeclareBlockers;
+    runner.state_mut().active_player = P0;
+    runner.state_mut().priority_player = P0;
+    runner.state_mut().waiting_for = WaitingFor::Priority { player: P0 };
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&attacker)
+        .unwrap()
+        .tapped = true;
+    runner.state_mut().combat = Some(engine::game::combat::CombatState {
+        attackers: vec![engine::game::combat::AttackerInfo::attacking_player(
+            attacker, P1,
+        )],
+        ..Default::default()
+    });
+    (runner, spell, attacker, mana_source)
+}
+
+fn setup_web_slinging_with_sacrificial_mana(
+    web_slinging_cost: u32,
+) -> (GameRunner, ObjectId, ObjectId, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let returned_creature = scenario
+        .add_creature(P0, "Web-Slinging Return Witness", 2, 2)
+        .id();
+    let spell = scenario
+        .add_spell_to_hand(P0, "Sacrificial Web-Slinging Witness", true)
+        .with_mana_cost(ManaCost::generic(7))
+        .with_keyword(Keyword::WebSlinging(ManaCost::generic(web_slinging_cost)))
+        .id();
+    let mana_source = scenario
+        .add_creature(P0, "Web-Slinging Blood Pet Witness", 1, 1)
+        .with_ability_definition(self_sacrificing_mana_ability(ManaColor::Black))
+        .id();
+    let mut runner = scenario.build();
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&returned_creature)
+        .unwrap()
+        .tapped = true;
+    (runner, spell, returned_creature, mana_source)
+}
+
+fn complete_sacrificial_mana_cast(
+    runner: &mut GameRunner,
+    action: GameAction,
+    spell: ObjectId,
+    mana_source: ObjectId,
+) {
+    runner
+        .act(action)
+        .expect("the offered cast must enter its explicit mana-source choice");
+    let selection = match &runner.state().waiting_for {
+        WaitingFor::ManaSourceSelection { options, .. } => options
+            .iter()
+            .find(|selection| selection.source.object_id == mana_source)
+            .cloned()
+            .expect("the sacrificial source must remain available for explicit consent"),
+        other => panic!("expected ManaSourceSelection, got {other:?}"),
+    };
+    runner
+        .act(GameAction::ActivateManaSource { selection })
+        .expect("the selected self-sacrificing mana ability must resolve");
+    assert_eq!(runner.state().objects[&mana_source].zone, Zone::Graveyard);
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::ManaPayment { .. }
+    ));
+    runner
+        .act(GameAction::PassPriority)
+        .expect("the produced mana must complete the prepared cast payment");
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::Priority { .. }
+    ));
+    assert_eq!(runner.state().objects[&spell].zone, Zone::Stack);
+}
+
+/// CR 702.190a + CR 601.2g-h: Sneak's exact alternative cost remains offered
+/// when only an explicitly chosen self-sacrificing mana ability can pay it.
+#[test]
+fn sneak_sacrificial_only_cost_is_offered_and_completes_manually() {
+    let (mut runner, spell, attacker, mana_source) = setup_sneak_with_sacrificial_mana(1);
+    let action = legal_actions(runner.state())
+        .into_iter()
+        .find(|action| {
+            matches!(
+                action,
+                GameAction::CastSpellAsSneak {
+                    hand_object,
+                    creature_to_return,
+                    payment_mode: CastPaymentMode::AutoExceptSacrificialMana,
+                    ..
+                } if *hand_object == spell && *creature_to_return == attacker
+            )
+        })
+        .expect("the choice-preserving Sneak cast must be offered");
+
+    complete_sacrificial_mana_cast(&mut runner, action, spell, mana_source);
+    assert_eq!(runner.state().objects[&attacker].zone, Zone::Hand);
+}
+
+/// CR 702.190a + CR 601.2h: A Sneak action whose prepared alternative cost
+/// exceeds the only sacrificial source's capacity remains unoffered.
+#[test]
+fn sneak_truly_unpayable_sacrificial_cost_is_not_offered() {
+    let (runner, spell, attacker, _) = setup_sneak_with_sacrificial_mana(2);
+    assert_eq!(
+        engine::game::keywords::effective_sneak_cost(runner.state(), spell),
+        Some(ManaCost::generic(2)),
+        "reach guard: the Sneak alternative-cost authority must resolve the tested cost"
+    );
+    assert!(runner.state().combat.as_ref().is_some_and(|combat| combat
+        .attackers
+        .iter()
+        .any(|entry| entry.object_id == attacker)));
+    assert!(!legal_actions(runner.state()).iter().any(|action| matches!(
+        action,
+        GameAction::CastSpellAsSneak { hand_object, .. } if *hand_object == spell
+    )));
+}
+
+/// CR 702.188a + CR 601.2g-h: Web-slinging's exact alternative cost remains
+/// offered when only an explicitly chosen self-sacrificing mana ability pays it.
+#[test]
+fn web_slinging_sacrificial_only_cost_is_offered_and_completes_manually() {
+    let (mut runner, spell, returned_creature, mana_source) =
+        setup_web_slinging_with_sacrificial_mana(1);
+    let action = legal_actions(runner.state())
+        .into_iter()
+        .find(|action| {
+            matches!(
+                action,
+                GameAction::CastSpellAsWebSlinging {
+                    hand_object,
+                    creature_to_return,
+                    payment_mode: CastPaymentMode::AutoExceptSacrificialMana,
+                    ..
+                } if *hand_object == spell && *creature_to_return == returned_creature
+            )
+        })
+        .expect("the choice-preserving Web-slinging cast must be offered");
+
+    complete_sacrificial_mana_cast(&mut runner, action, spell, mana_source);
+    assert_eq!(runner.state().objects[&returned_creature].zone, Zone::Hand);
+}
+
+/// CR 702.188a + CR 601.2h: A Web-slinging action whose prepared alternative
+/// cost exceeds the only sacrificial source's capacity remains unoffered.
+#[test]
+fn web_slinging_truly_unpayable_sacrificial_cost_is_not_offered() {
+    let (runner, spell, returned_creature, _) = setup_web_slinging_with_sacrificial_mana(2);
+    assert_eq!(
+        engine::game::keywords::effective_web_slinging_cost(runner.state(), P0, spell),
+        Some(ManaCost::generic(2)),
+        "reach guard: the Web-slinging alternative-cost authority must resolve the tested cost"
+    );
+    assert!(runner.state().objects[&returned_creature].tapped);
+    assert!(!legal_actions(runner.state()).iter().any(|action| matches!(
+        action,
+        GameAction::CastSpellAsWebSlinging { hand_object, .. } if *hand_object == spell
+    )));
 }
 
 fn setup_murder_with_static(

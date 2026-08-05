@@ -335,7 +335,7 @@ fn priority_announcement_to_action(announcement: PriorityAnnouncement) -> GameAc
             object_id: announcement.object_id(&_access),
             card_id: announcement.card_id(&_access),
             targets: Vec::new(),
-            payment_mode: crate::types::game_state::CastPaymentMode::Auto,
+            payment_mode: announcement.payment_mode(&_access),
         },
         PriorityAnnouncement::Foretell(announcement) => GameAction::Foretell {
             object_id: announcement.object_id(&_access),
@@ -382,14 +382,14 @@ fn priority_announcement_to_action(announcement: PriorityAnnouncement) -> GameAc
             hand_object: announcement.hand_object(&_access),
             card_id: announcement.card_id(&_access),
             creature_to_return: announcement.creature_to_return(&_access),
-            payment_mode: crate::types::game_state::CastPaymentMode::Auto,
+            payment_mode: announcement.payment_mode(&_access),
         },
         PriorityAnnouncement::CastSpellAsWebSlinging(announcement) => {
             GameAction::CastSpellAsWebSlinging {
                 hand_object: announcement.hand_object(&_access),
                 card_id: announcement.card_id(&_access),
                 creature_to_return: announcement.creature_to_return(&_access),
-                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
+                payment_mode: announcement.payment_mode(&_access),
             }
         }
         PriorityAnnouncement::CastSpellForFree(announcement) => GameAction::CastSpellForFree {

@@ -22,8 +22,8 @@ use crate::types::game_state::{
 use crate::types::identifiers::{CardId, ObjectId, TrackedSetId};
 use crate::types::keywords::{FlashbackCost, Keyword, KeywordKind};
 use crate::types::mana::{
-    ActivationManaColorConstraint, ManaColor, ManaCost, ManaCostShard, ManaSpellGrant,
-    PaymentContext, SpecialAction, SpellMeta,
+    ActivationManaColorConstraint, ManaColor, ManaCost, ManaCostShard, ManaSourceSelection,
+    ManaSpellGrant, PaymentContext, SpecialAction, SpellMeta,
 };
 use crate::types::player::PlayerId;
 use crate::types::resolved_commands::ManaPaymentRecipient;
@@ -76,6 +76,7 @@ pub(in crate::game) struct PriorityForetellAnnouncement {
 pub(in crate::game) struct PriorityCastSpellAnnouncement {
     object_id: ObjectId,
     card_id: CardId,
+    payment_mode: CastPaymentMode,
 }
 
 /// An engine-authored land-play announcement for the Priority preflight. The
@@ -109,6 +110,7 @@ pub(in crate::game) struct PrioritySneakAnnouncement {
     hand_object: ObjectId,
     card_id: CardId,
     creature_to_return: ObjectId,
+    payment_mode: CastPaymentMode,
 }
 
 /// An engine-authored Web Slinging cast announcement for Priority preflight.
@@ -118,14 +120,21 @@ pub(in crate::game) struct PriorityWebSlingingAnnouncement {
     hand_object: ObjectId,
     card_id: CardId,
     creature_to_return: ObjectId,
+    payment_mode: CastPaymentMode,
 }
 
 impl PriorityWebSlingingAnnouncement {
-    fn new(hand_object: ObjectId, card_id: CardId, creature_to_return: ObjectId) -> Self {
+    fn new(
+        hand_object: ObjectId,
+        card_id: CardId,
+        creature_to_return: ObjectId,
+        payment_mode: CastPaymentMode,
+    ) -> Self {
         Self {
             hand_object,
             card_id,
             creature_to_return,
+            payment_mode,
         }
     }
 
@@ -145,15 +154,28 @@ impl PriorityWebSlingingAnnouncement {
         _access: &PriorityAnnouncementFacadeAccess,
     ) -> ObjectId {
         self.creature_to_return
+    }
+
+    pub(in crate::game) fn payment_mode(
+        &self,
+        _access: &PriorityAnnouncementFacadeAccess,
+    ) -> CastPaymentMode {
+        self.payment_mode
     }
 }
 
 impl PrioritySneakAnnouncement {
-    fn new(hand_object: ObjectId, card_id: CardId, creature_to_return: ObjectId) -> Self {
+    fn new(
+        hand_object: ObjectId,
+        card_id: CardId,
+        creature_to_return: ObjectId,
+        payment_mode: CastPaymentMode,
+    ) -> Self {
         Self {
             hand_object,
             card_id,
             creature_to_return,
+            payment_mode,
         }
     }
 
@@ -173,6 +195,13 @@ impl PrioritySneakAnnouncement {
         _access: &PriorityAnnouncementFacadeAccess,
     ) -> ObjectId {
         self.creature_to_return
+    }
+
+    pub(in crate::game) fn payment_mode(
+        &self,
+        _access: &PriorityAnnouncementFacadeAccess,
+    ) -> CastPaymentMode {
+        self.payment_mode
     }
 }
 
@@ -245,8 +274,12 @@ impl PriorityPlayLandAnnouncement {
 }
 
 impl PriorityCastSpellAnnouncement {
-    fn new(object_id: ObjectId, card_id: CardId) -> Self {
-        Self { object_id, card_id }
+    fn new(object_id: ObjectId, card_id: CardId, payment_mode: CastPaymentMode) -> Self {
+        Self {
+            object_id,
+            card_id,
+            payment_mode,
+        }
     }
 
     pub(in crate::game) fn object_id(
@@ -258,6 +291,13 @@ impl PriorityCastSpellAnnouncement {
 
     pub(in crate::game) fn card_id(&self, _access: &PriorityAnnouncementFacadeAccess) -> CardId {
         self.card_id
+    }
+
+    pub(in crate::game) fn payment_mode(
+        &self,
+        _access: &PriorityAnnouncementFacadeAccess,
+    ) -> CastPaymentMode {
+        self.payment_mode
     }
 }
 
@@ -1571,12 +1611,28 @@ pub(in crate::game) fn priority_cast_spell_announcements(
     principal: &PriorityPrincipal,
 ) -> Vec<PriorityCastSpellAnnouncement> {
     let player = principal.semantic_holder();
+    let mana_source_selections =
+        super::mana_sources::activatable_mana_source_selections(state, player);
     spell_objects_available_to_cast(state, player)
         .into_iter()
         .filter_map(|object_id| {
             let object = state.objects.get(&object_id)?;
-            can_cast_object_now(state, player, object_id)
-                .then(|| PriorityCastSpellAnnouncement::new(object_id, object.card_id))
+            if !can_cast_object_now(state, player, object_id) {
+                return None;
+            }
+            let cost = effective_spell_cost(state, player, object_id)?;
+            let payment_mode = payment_mode_for_prepared_spell_cost(
+                state,
+                player,
+                object_id,
+                &cost,
+                &mana_source_selections,
+            );
+            Some(PriorityCastSpellAnnouncement::new(
+                object_id,
+                object.card_id,
+                payment_mode,
+            ))
         })
         .collect()
 }
@@ -1734,6 +1790,8 @@ pub(in crate::game) fn priority_sneak_announcements(
                 .is_some_and(|object| object.controller == player)
         })
         .collect();
+    let mana_source_selections =
+        super::mana_sources::activatable_mana_source_selections(state, player);
     state
         .players
         .iter()
@@ -1741,21 +1799,40 @@ pub(in crate::game) fn priority_sneak_announcements(
         .into_iter()
         .flat_map(|candidate| candidate.hand.iter().copied())
         .filter_map(|hand_object| {
-            let cost = crate::game::keywords::effective_sneak_cost(state, hand_object)?;
-            if !can_feasibly_pay_mana_cost(state, player, Some(hand_object), &cost) {
-                return None;
-            }
+            crate::game::keywords::effective_sneak_cost(state, hand_object)?;
             state
                 .objects
                 .get(&hand_object)
-                .map(|object| (hand_object, object.card_id))
+                .map(|object| (hand_object, object.card_id, &mana_source_selections))
         })
-        .flat_map(|(hand_object, card_id)| {
+        .flat_map(|(hand_object, card_id, mana_source_selections)| {
             unblocked_attackers
                 .iter()
                 .copied()
-                .map(move |creature_to_return| {
-                    PrioritySneakAnnouncement::new(hand_object, card_id, creature_to_return)
+                .filter_map(move |creature_to_return| {
+                    let cost = effective_spell_cost_for_variant(
+                        state,
+                        player,
+                        hand_object,
+                        CastingVariant::Sneak {
+                            returned_creature: creature_to_return,
+                            placement: None,
+                        },
+                    )?;
+                    let payment_mode = prepared_spell_payment_verdict_with_probe(
+                        state,
+                        player,
+                        hand_object,
+                        &cost,
+                        mana_source_selections,
+                        None,
+                    )?;
+                    Some(PrioritySneakAnnouncement::new(
+                        hand_object,
+                        card_id,
+                        creature_to_return,
+                        payment_mode,
+                    ))
                 })
         })
         .collect()
@@ -1783,6 +1860,8 @@ pub(in crate::game) fn priority_web_slinging_announcements(
             })
         })
         .collect();
+    let mana_source_selections =
+        super::mana_sources::activatable_mana_source_selections(state, player);
     state
         .players
         .iter()
@@ -1794,22 +1873,35 @@ pub(in crate::game) fn priority_web_slinging_announcements(
             state
                 .objects
                 .get(&hand_object)
-                .map(|object| (hand_object, object.card_id))
+                .map(|object| (hand_object, object.card_id, &mana_source_selections))
         })
-        .flat_map(|(hand_object, card_id)| {
+        .flat_map(|(hand_object, card_id, mana_source_selections)| {
             tapped_creatures
                 .iter()
                 .copied()
-                .filter(move |&creature_to_return| {
-                    can_cast_spell_as_web_slinging_now(
+                .filter_map(move |creature_to_return| {
+                    let cost = effective_spell_cost_for_variant(
                         state,
                         player,
                         hand_object,
+                        CastingVariant::WebSlinging {
+                            returned_creature: creature_to_return,
+                        },
+                    )?;
+                    let payment_mode = prepared_spell_payment_verdict_with_probe(
+                        state,
+                        player,
+                        hand_object,
+                        &cost,
+                        mana_source_selections,
+                        None,
+                    )?;
+                    Some(PriorityWebSlingingAnnouncement::new(
+                        hand_object,
+                        card_id,
                         creature_to_return,
-                    )
-                })
-                .map(move |creature_to_return| {
-                    PriorityWebSlingingAnnouncement::new(hand_object, card_id, creature_to_return)
+                        payment_mode,
+                    ))
                 })
         })
         .collect()
@@ -10585,6 +10677,24 @@ pub fn can_cast_spell_as_web_slinging_now(
     let Some(card_id) = state.objects.get(&hand_object).map(|obj| obj.card_id) else {
         return false;
     };
+    let variant = CastingVariant::WebSlinging {
+        returned_creature: creature_to_return,
+    };
+    let Some(cost) = effective_spell_cost_for_variant(state, player, hand_object, variant) else {
+        return false;
+    };
+    let mana_source_selections =
+        super::mana_sources::activatable_mana_source_selections(state, player);
+    let Some(payment_mode) = prepared_spell_payment_verdict_with_probe(
+        state,
+        player,
+        hand_object,
+        &cost,
+        &mana_source_selections,
+        None,
+    ) else {
+        return false;
+    };
     let mut simulated = state.clone();
     let mut events = Vec::new();
     handle_cast_spell_as_web_slinging_with_payment_mode(
@@ -10593,7 +10703,7 @@ pub fn can_cast_spell_as_web_slinging_now(
         hand_object,
         card_id,
         creature_to_return,
-        CastPaymentMode::Auto,
+        payment_mode,
         &mut events,
     )
     .is_ok()
@@ -15007,6 +15117,48 @@ pub(crate) fn has_manual_mana_ability_for_spell_payment(
         Some(source_id),
         spell_ctx.as_ref(),
     )
+}
+
+/// CR 601.2g-h: Choose the payment mode for an already-prepared spell cost.
+/// Pool-payable costs may finish automatically; a cost whose only currently
+/// activatable mana sources are sacrificial must preserve the explicit source
+/// choice instead of consuming an irreversible resource during offer probing.
+pub(crate) fn payment_mode_for_prepared_spell_cost(
+    state: &GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+    cost: &ManaCost,
+    mana_source_selections: &[ManaSourceSelection],
+) -> CastPaymentMode {
+    if super::casting_costs::spell_cost_is_payable_from_pool(state, player, source_id, cost) {
+        return CastPaymentMode::Auto;
+    }
+    if !mana_source_selections.is_empty()
+        && mana_source_selections.iter().all(|selection| {
+            selection.penalty == super::mana_sources::ManaSourcePenalty::Sacrifices
+        })
+    {
+        CastPaymentMode::AutoExceptSacrificialMana
+    } else {
+        CastPaymentMode::Auto
+    }
+}
+
+/// CR 601.2g-h: Shared offer verdict for a spell whose exact alternative or
+/// normal mana cost has already been prepared. A legal offer must be feasibly
+/// payable, and its payment mode must preserve any required sacrificial-source
+/// choice through the real reducer path.
+pub(crate) fn prepared_spell_payment_verdict_with_probe(
+    state: &GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+    cost: &ManaCost,
+    mana_source_selections: &[ManaSourceSelection],
+    probe: Option<&PriorityCastProbe>,
+) -> Option<CastPaymentMode> {
+    can_feasibly_pay_mana_cost_with_probe(state, player, Some(source_id), cost, probe).then(|| {
+        payment_mode_for_prepared_spell_cost(state, player, source_id, cost, mana_source_selections)
+    })
 }
 
 pub(crate) fn can_feasibly_pay_mana_cost_with_probe(

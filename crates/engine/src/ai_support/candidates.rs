@@ -3511,22 +3511,9 @@ pub(crate) fn priority_actions_with_probe(
     let split_second_active = crate::game::keywords::stack_has_split_second(state);
     let mana_source_selections = OnceCell::new();
     let payment_mode_for_cost = |object_id, cost: &crate::types::mana::ManaCost| {
-        if crate::game::casting_costs::spell_cost_is_payable_from_pool(
-            state, player, object_id, cost,
-        ) {
-            return CastPaymentMode::Auto;
-        }
         let selections = mana_source_selections
             .get_or_init(|| mana_sources::activatable_mana_source_selections(state, player));
-        if !selections.is_empty()
-            && selections
-                .iter()
-                .all(|selection| selection.penalty == mana_sources::ManaSourcePenalty::Sacrifices)
-        {
-            CastPaymentMode::AutoExceptSacrificialMana
-        } else {
-            CastPaymentMode::Auto
-        }
+        casting::payment_mode_for_prepared_spell_cost(state, player, object_id, cost, selections)
     };
 
     let p = &state.players[player.0 as usize];
@@ -4256,22 +4243,26 @@ pub(crate) fn priority_actions_with_probe(
                     ) else {
                         continue;
                     };
-                    if !crate::game::casting::can_feasibly_pay_mana_cost_with_probe(
+                    let selections = mana_source_selections.get_or_init(|| {
+                        mana_sources::activatable_mana_source_selections(state, player)
+                    });
+                    let Some(payment_mode) = casting::prepared_spell_payment_verdict_with_probe(
                         state,
                         player,
-                        Some(hand_id),
+                        hand_id,
                         &prepared_cost,
+                        selections,
                         probe,
-                    ) {
+                    ) else {
                         continue;
-                    }
+                    };
                     actions.push(candidate(
                         GameAction::CastSpellAsSneak {
                             hand_object: hand_id,
                             card_id,
                             creature_to_return: creature_id,
 
-                            payment_mode: payment_mode_for_cost(hand_id, &prepared_cost),
+                            payment_mode,
                         },
                         TacticalClass::Ability,
                         Some(player),
@@ -4312,14 +4303,6 @@ pub(crate) fn priority_actions_with_probe(
                     continue;
                 };
                 for &creature_id in &tapped_creatures {
-                    if !casting::can_cast_spell_as_web_slinging_now(
-                        state,
-                        player,
-                        hand_id,
-                        creature_id,
-                    ) {
-                        continue;
-                    }
                     let Some(prepared_cost) = casting::effective_spell_cost_for_variant(
                         state,
                         player,
@@ -4330,22 +4313,26 @@ pub(crate) fn priority_actions_with_probe(
                     ) else {
                         continue;
                     };
-                    if !casting::can_feasibly_pay_mana_cost_with_probe(
+                    let selections = mana_source_selections.get_or_init(|| {
+                        mana_sources::activatable_mana_source_selections(state, player)
+                    });
+                    let Some(payment_mode) = casting::prepared_spell_payment_verdict_with_probe(
                         state,
                         player,
-                        Some(hand_id),
+                        hand_id,
                         &prepared_cost,
+                        selections,
                         probe,
-                    ) {
+                    ) else {
                         continue;
-                    }
+                    };
                     actions.push(candidate(
                         GameAction::CastSpellAsWebSlinging {
                             hand_object: hand_id,
                             card_id,
                             creature_to_return: creature_id,
 
-                            payment_mode: payment_mode_for_cost(hand_id, &prepared_cost),
+                            payment_mode,
                         },
                         TacticalClass::Spell,
                         Some(player),
