@@ -793,53 +793,79 @@ pub fn derive_views(state: &GameState, viewer: Option<PlayerId>) -> DerivedViews
     views.turn_order = turn_order;
     views.viewer_turn_number = viewer_turn_number;
 
-    // CR 732.2c: once every player accepted the shortcut it IS taken, at the finite N the
-    // proposal named — so an axis with a scheduled collapse is already BOUNDED and must not
-    // render `∞` anywhere beside the finite totals it is growing. ONE authority
-    // (`GameState::scheduled_collapse_axes`), THREE consumers below: the per-axis resource
-    // badge rows, the ∞ object pile, and the ∞ counter pills. The gate is computed here,
-    // once per controller, precisely so no surface can re-derive it and drift — a HUD that
-    // hides the resource badge while a card group still shows ∞ is internally inconsistent.
+    // WHY THE THREE ∞ CHANNELS BELOW ARE UNCONDITIONAL — the accept→boundary window.
     //
-    // Filter the PROJECTION, never the store: `unbounded_resources` +
-    // `unbounded_loop_enablers` stay in CR 104.4b / CR 110.1 lockstep until the CR 500.5
-    // boundary applies the growth, which is what keeps `zones::apply_zone_exit_cleanup`'s
-    // defuse armed in the meantime.
+    // THE WINDOW IS AN ENGINE DEVIATION, PRE-EXISTING AND DELIBERATE — NOT A RULES ENTITLEMENT, and
+    // no CR is cited as licensing it. CR 732.2c has the shortcut taken the moment the last player
+    // accepts, with the game advancing to the last proposed ending point; this engine instead parks
+    // at priority with the accepted count recorded but its results UNAPPLIED, and settles them at
+    // the next CR 500.5 boundary (`game::turns`, unchanged by this projection). Nothing below
+    // claims otherwise. What IS resolved at accept is the count itself
+    // (`pending_materialization_count`); what is deferred is applying it, plus `turns.rs`' `min: 0`
+    // under-delivery tolerance, which that file documents in its own words.
     //
-    // FAIL-CLOSED: only axes a registered materialization really collapses are hidden, so an
-    // unregistered ∞ axis (a mana engine registers none) still renders.
+    // The two CRs this code does rely on, each for what it actually governs:
+    //  • CR 732.2c — the shortcut is taken at the count every player accepted, so the collapse may
+    //    not EXCEED it. `turns.rs`' `max:` reads the recorded bound for exactly that reason and
+    //    `SubmitPayAmount` rejects an over-collapse. That is a CEILING on the collapse; it says
+    //    nothing about what the display may show, and this projection does not read it.
+    //  • CR 500.5 — the TIMING LANDMARK only: it defines the step/phase end, at which
+    //    until-end-of-step effects expire and unspent mana empties. That mana drain is the one
+    //    thing here CR 500.5 genuinely governs (`turns::drain_pending_phase_transition_progress`,
+    //    and it is why a `Mana(_)` ∞ ends there). It does NOT license CASHING OUT the deferred
+    //    token/life/counter growth at that moment — the engine chose that landmark, and that
+    //    choice is part of the same uncited deviation described above.
     //
-    // CLASS RULE for the hide-set: hide only axes whose growth is still DEFERRED; never hide an
-    // axis that is ALREADY MATERIALIZED and spendable right now. `Tokens` / `Counters` / `Life`
-    // are deferred by construction — the growth is not on the board until the boundary applies
-    // it — so an `∞` for them is exactly the lie this gate kills. A `DriveSequence` is the one
-    // item that does NOT name a deferral: its `collapsed_axes` is `proposal.unbounded`, i.e.
-    // EVERY axis of the whole loop, and a `Mana(_)` among them is live *now* —
-    // `mana_payment::refill_infinite_mana` tops that controller's pool back to
-    // `INFINITE_MANA_PER_TYPE` off the STORE (which this projection deliberately never touches)
-    // after every action. Hiding it would show no `∞` beside a pool that keeps refilling: the
-    // same internally-inconsistent HUD as an `∞ Life` badge on a finite life total, inverted.
-    // CR 500.5: `turns::drain_pending_phase_transition_progress` clears the mana axis when the
-    // step/phase ends, and THAT is what legitimately ends the badge — not this projection.
+    // WHY `∞` IS RIGHT HERE IS AN ENGINE-STATE ARGUMENT, NOT A RULES ONE. Throughout the window the
+    // loop's enabling permanents are still on the battlefield and `unbounded_resources` still
+    // carries the mark, so the controller really does still hold a set of actions that could be
+    // repeated indefinitely — a CR-732.1b-SHAPED capability, which is the same sense the rest of
+    // this crate cites CR 732.1b in. `∞` renders that live mark honestly.
     //
-    // `Mana(_)` is today's only already-materialized axis: census of production readers of
-    // `GameState::unbounded_resources` (`refill_infinite_mana`, the CR 500.5 clear in `turns`,
-    // and this projection) shows it is the only axis any reader turns back into a spendable
-    // resource. Widen this `retain` only for an axis that gains the same property.
-    let scheduled_collapse: BTreeMap<PlayerId, BTreeSet<ResourceAxis>> = state
-        .pending_unbounded_materialization
-        .iter()
-        .map(|(&controller, items)| {
-            let mut axes = state.scheduled_collapse_axes(items);
-            axes.retain(|a| !matches!(a, ResourceAxis::Mana(_)));
-            (controller, axes)
-        })
-        .collect();
-    let collapse_scheduled = |controller: PlayerId, axis: &ResourceAxis| -> bool {
-        scheduled_collapse
-            .get(&controller)
-            .is_some_and(|axes| axes.contains(axis))
-    };
+    // WHAT THIS PROJECTION DOES **NOT** CLAIM: that the mark is REVOCABLE for this class. The
+    // zone-exit defuse (`zones::apply_zone_exit_cleanup`) is gated on a NON-EMPTY
+    // `unbounded_loop_enablers`, and the only production writer of that map is the Interactive
+    // Path-C arm (`engine.rs`'s `register_unbounded_loop_enablers` call).
+    // `materialize_object_growth_shortcut` never registers enablers, so for the OBJECT-GROWTH class
+    // — which is exactly the token and counter families this projection displays — the defuse gate
+    // never matches and is INERT. `engine_resolution_choices.rs` documents that gap in those words
+    // and tracks it as a pre-existing deferred follow-up; it is not introduced here.
+    //
+    // CONSEQUENCE, STATED RATHER THAN BURIED: because that defuse is inert for this class, an
+    // enabler leaving the battlefield between accept and boundary leaves a STALE `∞` in the STORE.
+    // The store is deliberately NOT filtered (the defuse and the boundary both read it), so the
+    // live-authority check lives HERE, at the projection: `object_growth_backing` drops a row whose
+    // whole registered display set has left the battlefield, exactly as the pile and counter loops
+    // already drop individual departed members. That is a DISPLAY revocation only — it never
+    // touches `pending_unbounded_materialization`, so the growth the table accepted still lands.
+    // Registering enablers instead would route this through `clear_unbounded_loop`, a SIX-map wipe
+    // that also destroys the accepted collapse stash and its CR 732.2c bound; see
+    // `types::game_state::clear_unbounded_loop`. What ends the MARK for this class is still the
+    // boundary, below.
+    //
+    // And hiding it is strictly worse on display coherence, which is what the old "the badge is a
+    // lie" comment was really about. The BASE gate filtered the PROJECTION while the STORE still
+    // said `∞` — a HUD contradicting its own engine — and it also suppressed an already-
+    // materialized `Mana(_)` axis that `mana_payment::refill_infinite_mana` keeps topping back up,
+    // i.e. it hid a badge beside a pool the player can visibly keep spending.
+    //
+    // The three loops below therefore read only the `∞` stores and the LIVE battlefield; none
+    // consults `GameState::scheduled_collapse_axes` (whose sole production caller is
+    // `clear_collapsed_materializations`). This sentence used to read "only their own stores",
+    // which the row guard below falsified the moment it was added: `object_growth_backing`
+    // deliberately cross-reads the pile and counter-target stores, because whether a ROW is still
+    // live is a question about those backing sets, not about its own. Corrected here rather than
+    // left standing — a stale claim introduced by the commit that exists to fix stale claims is
+    // the one defect this change cannot afford. The stores are not filtered either:
+    // `unbounded_resources` keeps the mark until the boundary applies the growth. (`unbounded_loop_enablers` is held in
+    // lockstep with it as an ENGINE-STATE invariant required by no CR — but see the inertness note
+    // above: for the object-growth class that map is EMPTY, so the lockstep is vacuously satisfied
+    // here and is load-bearing only for the Interactive Path-C class that populates it.)
+    //
+    // What ends each `∞` is the boundary, never this projection:
+    // `clear_collapsed_materializations` drops the collapsed axes once the growth is applied, and
+    // `turns::drain_pending_phase_transition_progress` clears a `Mana(_)` axis when the step or
+    // phase ends (CR 500.5).
 
     // CR 732.2a: project every unbounded-resource loop into per-(player, axis)
     // `∞` HUD rows. Runs in every format (placed BEFORE the Commander
@@ -848,7 +874,12 @@ pub fn derive_views(state: &GameState, viewer: Option<PlayerId>) -> DerivedViews
     // (`attribution_player`); the frontend only formats each axis to a family.
     for (&controller, axes) in &state.unbounded_resources {
         for &axis in axes {
-            if collapse_scheduled(controller, &axis) {
+            // CR 732.2a + CR 110.1: an object-growth ∞ whose ENTIRE registered display set
+            // has left the battlefield has no live board backing left — drop the row rather
+            // than render an ∞ beside an already-empty ∞ pile. `None` (never registered a
+            // backing set, e.g. a mana engine) keeps the badge; see `object_growth_backing`
+            // for why that asymmetry is typed rather than collapsed into a bool.
+            if object_growth_backing(state, controller, axis) == Some(false) {
                 continue;
             }
             views.unbounded_resources.push(UnboundedResourceView {
@@ -863,14 +894,8 @@ pub fn derive_views(state: &GameState, viewer: Option<PlayerId>) -> DerivedViews
     // left the battlefield (stale member). Public board state (no viewer filtering);
     // the frontend renders `∞` on any group whose members are all pile members.
     //
-    // CR 732.2c: same gate, same authority as the badge rows above. The pile IS the
-    // `TokensCreated` axis — `clear_collapsed_materializations` drops it on exactly that
-    // axis collapsing — so once that axis has a scheduled finite mint the group must stop
-    // rendering ∞ in lockstep with its resource badge.
-    for (&controller, ids) in &state.unbounded_loop_pile {
-        if collapse_scheduled(controller, &ResourceAxis::TokensCreated) {
-            continue;
-        }
+    // Unconditional while a collapse is merely scheduled — see the engine-deviation block above.
+    for ids in state.unbounded_loop_pile.values() {
         for id in ids {
             if state.battlefield.contains(id) {
                 views.unbounded_pile.push(*id);
@@ -885,20 +910,10 @@ pub fn derive_views(state: &GameState, viewer: Option<PlayerId>) -> DerivedViews
     // `unbounded_pile`; the frontend renders `∞` (not `×N`) on any counter pill whose
     // type is in this set. Runs in every format (BEFORE the Commander short-circuit).
     //
-    // CR 732.2c: same gate, same authority. A pill's axis is derived by the SHARED
-    // `(object, counter) -> ResourceAxis` mapping the collapse itself uses
-    // (`collapsed_counter_axis`), so a pill can never disagree with the badge it mirrors.
-    // The class lookup is LIVE by design here: this loop only emits pills for bearers still
-    // on the battlefield, so the object is present and its class is current.
-    for (&controller, targets) in &state.unbounded_counter_targets {
+    // Unconditional while a collapse is merely scheduled — see the engine-deviation block above.
+    for targets in state.unbounded_counter_targets.values() {
         for (id, ct) in targets {
             if !state.battlefield.contains(id) {
-                continue;
-            }
-            if collapse_scheduled(
-                controller,
-                &crate::types::game_state::collapsed_counter_axis(state, *id, ct),
-            ) {
                 continue;
             }
             views
@@ -1075,6 +1090,99 @@ fn attribution_player(axis: ResourceAxis, controller: PlayerId) -> PlayerId {
         | ResourceAxis::EtbTriggers
         | ResourceAxis::LtbTriggers
         | ResourceAxis::SacTriggers => controller,
+    }
+}
+
+/// CR 732.2a: whether the object-growth `∞` display set the accept registered for `axis`
+/// still has LIVE authority — i.e. at least one registered member is still on the
+/// battlefield (CR 110.1: a permanent stops being one as it moves to another zone).
+///
+/// The `Option` is the whole point, and the two negative answers are NOT the same thing:
+///
+/// - `Some(false)` = the axis HAS a registered board backing and every member of it has
+///   left the battlefield. The `∞` has no live authority behind it ⇒ **drop the row**,
+///   rather than render an `∞` badge beside an already-empty `∞` pile.
+/// - `None` = the axis NEVER registered a backing set. A mana engine registers no pile at
+///   all, and an untapped-growth loop's pile seed is a no-op on an empty set
+///   (`register_unbounded_loop_pile` early-returns). There is no live authority to consult
+///   ⇒ **badge unchanged**. Collapsing this into a `bool` would silently hide every
+///   unbacked `∞`, which is the opposite of the intended fix.
+///
+/// This is the SINGLE authority for "is this object-growth display set still on the board".
+/// The pile and counter-target loops in `derive_views` apply the same
+/// `state.battlefield.contains` test at MEMBER level; this is its SET-level closure, so all
+/// three read the same board in the same frame and none can be staler than another.
+///
+/// GRANULARITY — the rule that decides which axes may consult a backing store at all:
+///
+/// > A CONTROLLER-keyed backing store can answer an AXIS-scoped question if and only if the
+/// > axis is a UNIT variant.
+///
+/// `TokensCreated` is a unit variant, so a controller can hold at most one of it and
+/// `unbounded_loop_pile[controller]` IS that axis' backing — a bijection, no granularity is
+/// assumed that the store does not have. `Counter(CounterClass, ObjectClass)` is a DATA
+/// variant: `mark_unbounded_loop` unions arbitrarily many per controller (`entry.extend`), so a
+/// controller-keyed store is strictly coarser than the axis, and it returns `None` here.
+///
+/// An earlier revision of this function did read `unbounded_counter_targets` for `Counter(..)`,
+/// and its doc claimed the error direction was safe — "over-KEEPS a badge, never over-drops
+/// one". That was FALSE, and measured so: one accepted proposal can carry both
+/// `Counter(Plus1Plus1, Creature)` (`analysis::corpus`'s `ResourceFamily::Counters`) and the
+/// display channel's object-agnostic `Counter(Other, Other)`, while only the latter's targets
+/// are ever registered — so when those targets left the battlefield the guard dropped EVERY
+/// counter row, including the one whose backing it had never consulted.
+///
+/// Re-keying the store by `(controller, ResourceAxis)` would not fix it. The targets are
+/// axis-blind at the DERIVATION, not just at the key: `register_unbounded_counter_targets` is
+/// fed by `game::engine::current_period_counter_targets` →
+/// `analysis::resource::grown_generic_counter_targets`, which takes no axis argument and
+/// returns one undifferentiated `Generic`-only set for the whole proposal. A per-axis key would
+/// assert a scope nothing derives. Revoking a counter row needs an axis-scoped authority to
+/// exist first; until one does, this refuses rather than guesses.
+///
+/// Read-only: recomputed from live state on every `derive_views` call, nothing is stored,
+/// so nothing can go stale. Deliberately not a `clear_unbounded_loop` from the zone-exit
+/// defuse — that call drops six maps including `pending_unbounded_materialization` and its
+/// CR 732.2c bound, i.e. it would cancel growth the table has already unanimously accepted
+/// ("the shortcut is taken" the moment the last player accepts). Revoking the BADGE is a
+/// display decision; revoking the agreed GROWTH is not ours to make here.
+fn object_growth_backing(
+    state: &GameState,
+    controller: PlayerId,
+    axis: ResourceAxis,
+) -> Option<bool> {
+    match axis {
+        // The ∞ pile IS the registered backing set for the token axis
+        // (`register_unbounded_loop_pile`, written at accept by
+        // `materialize_object_growth_shortcut`).
+        ResourceAxis::TokensCreated => state
+            .unbounded_loop_pile
+            .get(&controller)
+            .map(|pile| pile.iter().any(|id| state.battlefield.contains(id))),
+        // No registered board backing exists for these axes — no live authority to consult,
+        // badge unchanged. Exhaustive on purpose: a future ResourceAxis variant must decide
+        // which side it lands on rather than silently defaulting to "unbacked"; the
+        // unit-variant rule in this function's doc is the criterion for choosing.
+        //
+        // `Counter(..)` is here rather than reading `unbounded_counter_targets` because that
+        // store cannot answer a per-axis question — see the GRANULARITY note above. Witnessed
+        // by `counter_rows_are_not_revoked_by_a_controller_keyed_backing_set`.
+        ResourceAxis::Counter(..)
+        | ResourceAxis::Mana(_)
+        | ResourceAxis::Life(_)
+        | ResourceAxis::DamageDealt(_)
+        | ResourceAxis::LibraryDelta(_)
+        | ResourceAxis::Poison(_)
+        | ResourceAxis::Trigger(_)
+        | ResourceAxis::CardsDrawn
+        | ResourceAxis::Casts
+        | ResourceAxis::LandfallTriggers
+        | ResourceAxis::CombatPhases
+        | ResourceAxis::ExtraTurns
+        | ResourceAxis::DeathTriggers
+        | ResourceAxis::EtbTriggers
+        | ResourceAxis::LtbTriggers
+        | ResourceAxis::SacTriggers => None,
     }
 }
 
@@ -1619,6 +1727,88 @@ mod tests {
         assert!(
             views.commander_damage_by_attacker.is_empty(),
             "non-Commander format must short-circuit regardless of stored damage entries"
+        );
+    }
+
+    /// A controller-keyed backing store can answer an axis-scoped question only when the axis is
+    /// a UNIT variant. `TokensCreated` is one — at most one per controller, so
+    /// `unbounded_loop_pile[controller]` IS that axis' backing. `Counter(CounterClass,
+    /// ObjectClass)` is not: `mark_unbounded_loop` unions arbitrary axes for one controller, and
+    /// the backing derivation (`current_period_counter_targets` → `grown_generic_counter_targets`)
+    /// accepts NO axis — it diffs every shared object's growable `Generic` counters and returns
+    /// ONE undifferentiated set for the whole proposal.
+    ///
+    /// So the controller-keyed `Some(false)` this PR first shipped revoked EVERY counter row at
+    /// once, including axes whose backing was never in that set: a certified proposal can carry
+    /// both `Counter(Plus1Plus1, Creature)` (`analysis::corpus`'s `ResourceFamily::Counters`) and
+    /// the display channel's object-agnostic `Counter(Other, Other)`, while only the latter's
+    /// Generic targets are ever registered. That is an over-DROP — the opposite of the
+    /// "conservative, over-keeps only" claim the first revision shipped with.
+    ///
+    /// Two-sided on ONE assertion (are both rows on the wire?): restoring the controller-keyed
+    /// `Some(false)` arm reds the SUBJECT — both rows vanish, including the axis whose backing was
+    /// never consulted. The CONTROL runs FIRST as the non-vacuity anchor: it proves this wire can
+    /// carry two counter rows at all, which a "rows survived" assertion alone cannot establish.
+    #[test]
+    fn counter_rows_are_not_revoked_by_a_controller_keyed_backing_set() {
+        use crate::analysis::resource::{CounterClass, ObjectClass, ResourceAxis};
+        use crate::game::zones::move_to_zone;
+        use crate::types::counter::CounterType;
+        use crate::types::events::GameEvent;
+
+        // The two axes one accepted counter-growth proposal can carry at once. Only the
+        // object-agnostic one is the display channel's, and only ITS targets get registered.
+        let plus1_axis = ResourceAxis::Counter(CounterClass::Plus1Plus1, ObjectClass::Creature);
+        let generic_axis = ResourceAxis::Counter(CounterClass::Other, ObjectClass::Other);
+
+        let build = || {
+            let mut state = GameState::new_two_player(42);
+            let target = create_object(
+                &mut state,
+                CardId(1),
+                PlayerId(0),
+                "Pentad Prism".to_string(),
+                Zone::Battlefield,
+            );
+            state.mark_unbounded_loop(PlayerId(0), &[plus1_axis, generic_axis]);
+            // CR 701.34a: the registered backing is the GENERIC channel's, derived axis-blind.
+            // Nothing here backs `plus1_axis` — that is the whole point.
+            state.register_unbounded_counter_targets(
+                PlayerId(0),
+                vec![(target, CounterType::Generic("charge".to_string()))],
+            );
+            (state, target)
+        };
+
+        let rows = |state: &GameState| -> Vec<ResourceAxis> {
+            derive_views(state, Some(PlayerId(0)))
+                .unbounded_resources
+                .iter()
+                .map(|r| r.axis)
+                .collect()
+        };
+
+        // CONTROL first — the reach anchor: both marked axes reach the wire.
+        let (control, _kept) = build();
+        let control_rows = rows(&control);
+        assert!(
+            control_rows.contains(&plus1_axis) && control_rows.contains(&generic_axis),
+            "THE assertion (control): both marked counter axes reach the wire, got {control_rows:?}"
+        );
+
+        // SUBJECT: the only registered (Generic) target leaves the battlefield.
+        let (mut subject, target) = build();
+        let mut events: Vec<GameEvent> = Vec::new();
+        move_to_zone(&mut subject, target, Zone::Graveyard, &mut events);
+        assert!(
+            !subject.battlefield.contains(&target),
+            "precondition: the registered target really left the battlefield"
+        );
+        let subject_rows = rows(&subject);
+        assert!(
+            subject_rows.contains(&plus1_axis) && subject_rows.contains(&generic_axis),
+            "THE assertion (subject): a controller-keyed backing set must not revoke ANY counter \
+             row — least of all `plus1_axis`, whose backing was never registered, got {subject_rows:?}"
         );
     }
 

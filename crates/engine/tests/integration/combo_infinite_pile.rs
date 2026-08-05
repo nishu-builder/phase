@@ -220,36 +220,74 @@ fn real_4p_object_growth_accept_writes_infinite_pile() {
 
     // (2) DERIVED — derive_views projects the pile (battlefield-filtered, public board state).
     //
-    // R6a (CR 732.2c): this accept ALSO scheduled a finite `TokensCreated` collapse, and a
-    // scheduled axis is already bounded — so the ∞ group must be hidden on the WIRE in
-    // lockstep with its resource badge. Filter the PROJECTION, never the store: the store
-    // assertions above and the round-trip below are unchanged and still pass.
-    assert!(
-        derive_views(&state, Some(P0)).unbounded_pile.is_empty(),
-        "CR 732.2c: a scheduled finite collapse hides the ∞ group (the store keeps it)"
-    );
-    // Non-vacuity + the ORIGINAL claim, retained: with nothing scheduled the projection is
-    // still exactly the battlefield-filtered pile set.
+    // This accept ALSO scheduled a finite `TokensCreated` collapse, but the engine DEFERS applying
+    // it to the CR 500.5 boundary — an engine deviation, pre-existing and deliberate. No token has
+    // been minted yet: the `oracle` set below is the tapped fodder P0 ALREADY controlled, and the ∞
+    // mark over it is live, so the pile stays PROJECTED. The scheduling does not change the pile
+    // set, which is why the same `oracle` comparison runs directly on the real post-accept state.
     //
-    // NOT A SYNTHETIC STATE — "pile present, stash absent" is engine-reachable, and this is
-    // the production sequence that reaches it (cited so the next auditor need not re-derive
-    // it): accept an object-growth loop → the CR 500.5 boundary prompt → `SubmitPayAmount` →
-    // the handler's `take_pending_materialization` (`game::engine_resolution_choices`) empties
-    // the stash FIRST → the `Tokens` mint then PAUSES on an optional token-doubling
-    // replacement (CR 616.1) → the pause path calls `clear_collapsed_materializations(player,
-    // &collapsed)` with `collapsed` NOT containing the still-paused `Tokens` item ⇒ pile and
-    // ∞ axes preserved, stash already gone. NOT A CLAIM — ASSERTED, in
-    // `combo_infinite_pile::med_tokens_boundary_mint_pause_preserves_replacement_choice`, whose
-    // closing two assertions drive that exact sequence and check
-    // `pending_unbounded_materialization[P0]` ABSENT while `derive_views(..).unbounded_pile` is
-    // non-empty. That test is this arm's production-reachability evidence.
-    let mut unscheduled = state.clone();
-    unscheduled.pending_unbounded_materialization.clear();
-    let derived = derive_views(&unscheduled, Some(P0));
+    // REVERT-PROBE (RP-1): restore the `collapse_scheduled(controller, &TokensCreated) { continue; }`
+    // guard in `derive_views`' pile loop ⇒ THIS `assert_eq!` fails with an empty `left` while the
+    // store assertions (1)/(i)/(ii)/(iii) above stay green.
+    let derived = derive_views(&state, Some(P0));
     let derived_set: BTreeSet<ObjectId> = derived.unbounded_pile.iter().copied().collect();
+
+    // Cross-seam wire pin, PART 1 — compute + (optionally) REGENERATE. Provenance: every
+    // key/value below is ENGINE-EMITTED (`serde_json::to_value(&derive_views(..))`). The three ∞
+    // keys are lifted BY NAME from the real serialized DerivedViews so unrelated derived-view churn
+    // cannot move this golden, while the field names and value encodings — the part the TS mirror
+    // must match — stay engine-authored.
+    //
+    // The WRITE deliberately precedes every ∞ assertion in this fn, and the drift COMPARE
+    // deliberately follows them: a revert probe that reds one of those assertions must still be
+    // able to regenerate the client goldens with `UPDATE_WIRE_GOLDEN=1`, or the client-side half of
+    // that probe (RP-1b, RP-2) is unreachable. An assert panic aborts the test.
+    //
+    // DETERMINISM: `unbounded_counters` is a std `HashMap` (derived_views.rs), but
+    // `serde_json::Map` is BTreeMap-backed (serde_json has no `preserve_order` feature in this
+    // workspace — see Cargo.lock), so `to_value` re-sorts every map key. Measured byte-identical
+    // across independent test processes. No normalization needed.
+    let wire = serde_json::to_value(&derived).expect("derived views serialize");
+    let golden: serde_json::Map<String, serde_json::Value> = [
+        "unbounded_pile",
+        "unbounded_resources",
+        "unbounded_counters",
+    ]
+    .into_iter()
+    .filter_map(|k| wire.get(k).map(|v| (k.to_string(), v.clone())))
+    .collect();
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../client/src/test/fixtures/unbounded-token-wire.json"
+    );
+    if std::env::var_os("UPDATE_WIRE_GOLDEN").is_some() {
+        // `client/src/test/fixtures/` may not exist yet; `fs::write` does not create parents.
+        std::fs::create_dir_all(
+            std::path::Path::new(path)
+                .parent()
+                .expect("golden has a parent"),
+        )
+        .expect("create the client wire-golden directory");
+        std::fs::write(
+            path,
+            format!("{}\n", serde_json::to_string_pretty(&golden).unwrap()),
+        )
+        .expect("write the wire golden");
+    }
+
     assert_eq!(
         derived_set, oracle,
         "derive_views().unbounded_pile must equal the pile set (battlefield-filtered)"
+    );
+
+    // Cross-seam wire pin, PART 2 — the drift COMPARE (see PART 1 for why it sits here).
+    let committed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).expect("committed wire golden"))
+            .unwrap();
+    assert_eq!(
+        serde_json::Value::Object(golden),
+        committed,
+        "the client's wire golden drifted from engine output — re-run with UPDATE_WIRE_GOLDEN=1"
     );
 
     // (3) ROUND-TRIP — the pile survives serialize → deserialize (the "reloaded post-accept
@@ -261,20 +299,11 @@ fn real_4p_object_growth_accept_writes_infinite_pile() {
         Some(&oracle),
         "the ∞ pile survives a serde round-trip (post-fix saves reload it)"
     );
-    // R6a (CR 732.2c): the stash round-trips too, so the reloaded state's collapse is still
-    // SCHEDULED and its ∞ group stays hidden on the WIRE — same gate, same authority.
-    assert!(
-        derive_views(&reloaded, Some(P0)).unbounded_pile.is_empty(),
-        "CR 732.2c: the reloaded scheduled collapse still hides the ∞ group"
-    );
-    // Same engine-reachable "pile present, stash absent" shape as above — see the
-    // `SubmitPayAmount` → `take_pending_materialization` → CR 616.1 mint-pause →
-    // `clear_collapsed_materializations` sequence cited at (2).
-    let mut reloaded_unscheduled = reloaded.clone();
-    reloaded_unscheduled
-        .pending_unbounded_materialization
-        .clear();
-    let reloaded_set: BTreeSet<ObjectId> = derive_views(&reloaded_unscheduled, Some(P0))
+    // The stash round-trips too, so the reloaded state's collapse is still SCHEDULED — and the ∞
+    // pile stays PROJECTED while it is, for the same reason as (2) above. The scheduling does not
+    // change the pile set, which is why the same `oracle` comparison now runs directly on the real
+    // reloaded post-accept state instead of on a stash-cleared clone.
+    let reloaded_set: BTreeSet<ObjectId> = derive_views(&reloaded, Some(P0))
         .unbounded_pile
         .iter()
         .copied()
@@ -625,22 +654,12 @@ fn build_fresh_4p_cast_offer_accept_writes_infinite_pile() {
 
     // (2) DERIVED — derive_views projects the pile.
     //
-    // R6a (CR 732.2c): the accept also scheduled a finite `TokensCreated` collapse ⇒ the ∞
-    // group is hidden on the WIRE while it is scheduled. Store unchanged (see the round-trip).
-    assert!(
-        derive_views(runner.state(), Some(P0))
-            .unbounded_pile
-            .is_empty(),
-        "CR 732.2c: a scheduled finite collapse hides the ∞ group (the store keeps it)"
-    );
-    // Non-vacuity + the ORIGINAL claim, retained. "Pile present, stash absent" is
-    // engine-reachable, not synthetic — the `SubmitPayAmount` → `take_pending_materialization`
-    // → CR 616.1 mint-pause → `clear_collapsed_materializations` sequence cited in
-    // `real_4p_object_growth_accept_writes_infinite_pile`, ASSERTED by
-    // `med_tokens_boundary_mint_pause_preserves_replacement_choice`'s closing two assertions.
-    let mut unscheduled = runner.state().clone();
-    unscheduled.pending_unbounded_materialization.clear();
-    let derived_set: BTreeSet<ObjectId> = derive_views(&unscheduled, Some(P0))
+    // The accept also scheduled a finite `TokensCreated` collapse, but the engine DEFERS applying
+    // it to the CR 500.5 boundary (an engine deviation, pre-existing and deliberate), so nothing is
+    // minted yet and the ∞ pile stays PROJECTED while it is merely scheduled. The scheduling does
+    // not change the pile set, which is why the same `oracle` comparison now runs directly on the
+    // real post-accept state.
+    let derived_set: BTreeSet<ObjectId> = derive_views(runner.state(), Some(P0))
         .unbounded_pile
         .iter()
         .copied()
@@ -1448,22 +1467,12 @@ fn real_4p_one_shot_bootstrap_seeds_tapped_infinite_pile_and_w_plus_1_untapped()
 
     // derive_views projects the pile; it survives a serde round-trip.
     //
-    // R6a (CR 732.2c): the accept also scheduled a finite `TokensCreated` collapse ⇒ the ∞
-    // group is hidden on the WIRE while it is scheduled. Store unchanged (round-trip below).
-    assert!(
-        derive_views(runner.state(), Some(P0))
-            .unbounded_pile
-            .is_empty(),
-        "CR 732.2c: a scheduled finite collapse hides the ∞ group (the store keeps it)"
-    );
-    // Non-vacuity + the ORIGINAL claim, retained. "Pile present, stash absent" is
-    // engine-reachable, not synthetic — the `SubmitPayAmount` → `take_pending_materialization`
-    // → CR 616.1 mint-pause → `clear_collapsed_materializations` sequence cited in
-    // `real_4p_object_growth_accept_writes_infinite_pile`, ASSERTED by
-    // `med_tokens_boundary_mint_pause_preserves_replacement_choice`'s closing two assertions.
-    let mut unscheduled = runner.state().clone();
-    unscheduled.pending_unbounded_materialization.clear();
-    let derived_set: BTreeSet<ObjectId> = derive_views(&unscheduled, Some(P0))
+    // The accept also scheduled a finite `TokensCreated` collapse, but the engine DEFERS applying
+    // it to the CR 500.5 boundary (an engine deviation, pre-existing and deliberate), so nothing is
+    // minted yet and the ∞ pile stays PROJECTED while it is merely scheduled. The scheduling does
+    // not change the pile set, which is why the same `oracle` comparison now runs directly on the
+    // real post-accept state.
+    let derived_set: BTreeSet<ObjectId> = derive_views(runner.state(), Some(P0))
         .unbounded_pile
         .iter()
         .copied()
@@ -1536,6 +1545,219 @@ fn real_4p_one_shot_bootstrap_seeds_tapped_infinite_pile_and_w_plus_1_untapped()
         ),
         "the cashed-out loop must NOT re-prompt at the next boundary, got {:?}",
         runner.state().waiting_for
+    );
+}
+
+/// The one-shot-bootstrap rig driven to the ACCEPTED state: the real buyback+convoke Sprout
+/// Swarm cast (convoking the one-shot Witherbloom for the {G}) → CR 732.2a offer → APNAP
+/// accept of `Fixed(5)`. The two setup mutations are the same rules-neutral ones
+/// `real_4p_one_shot_bootstrap_seeds_tapped_infinite_pile_and_w_plus_1_untapped` documents in
+/// full (untap 405 so ZERO tapped fodder exists; Green-first Witherbloom so
+/// `GameRunner::convoke_with` picks a colour the engine already pip-matches).
+///
+/// This rig is chosen for the ∞-row backing arms below because its accept-time seed makes the
+/// pile provably ONE object, so "the last backing member leaves" is a single `move_to_zone`.
+fn one_shot_bootstrap_accepted_state() -> GameState {
+    let mut state: GameState = serde_json::from_str(&UNTAPPED_PRECAST_STATE)
+        .expect("the real untapped-precast 4p dump must deserialize into the current GameState");
+    state
+        .objects
+        .get_mut(&ObjectId(405))
+        .expect("fixture carries Saproling 405")
+        .tapped = false;
+    {
+        let w = state
+            .objects
+            .get_mut(&ObjectId(401))
+            .expect("fixture carries Witherbloom 401");
+        w.color = vec![ManaColor::Green, ManaColor::Black];
+        w.base_color = vec![ManaColor::Green, ManaColor::Black];
+    }
+    let mut runner = GameRunner::from_state(state);
+    let outcome = runner
+        .cast(ObjectId(402))
+        .accept_optional()
+        .convoke_with(&[ObjectId(401)])
+        .commit()
+        .resolve();
+    assert!(
+        matches!(
+            outcome.final_waiting_for(),
+            WaitingFor::LoopShortcut { proposer, .. } if *proposer == P0
+        ),
+        "rig reach-guard: the convoked recast must surface P0's CR 732.2a offer, got {:?}",
+        outcome.final_waiting_for()
+    );
+    drive_all_accept_n(runner.state_mut(), 5);
+    runner.state().clone()
+}
+
+/// MED-1 (CR 732.2a + CR 110.1): an object-growth `∞` ROW dies with its registered backing.
+///
+/// ONE rig, TWO arms, THE SAME assertion — `derive_views(..).unbounded_resources` contains
+/// `ResourceAxis::TokensCreated`:
+///
+/// | arm (in run order) | what leaves the battlefield       | THE assertion |
+/// |--------------------|-----------------------------------|---------------|
+/// | control            | a non-pile untapped Saproling     | **present**   |
+/// | subject            | the pile's ONLY member (the seed) | **absent**    |
+///
+/// The control is the matched pair, not a second scenario: same fixture, same cast, same
+/// accept, same `move_to_zone` chokepoint, differing only in WHICH object departs. That is
+/// what makes the subject arm's absence attributable to the backing check rather than to the
+/// zone move. It runs FIRST on purpose — see the comment at that arm.
+///
+/// MUTATIONS (two-sided, RUN):
+/// - **DROP** the `object_growth_backing(..) == Some(false)` guard in `derive_views`' resource
+///   row loop ⇒ the SUBJECT arm reds ("…must be dropped, got [TokensCreated]" — the pre-fix
+///   behaviour: an ∞ row beside an already-empty ∞ pile); the control stays green, and no
+///   other test in the loop/∞ blast radius moves (1 failure / 164).
+/// - **TRIVIALIZE** that guard to an unconditional `continue` ⇒ the CONTROL arm reds ("…must
+///   persist, got []"); the subject arm's own assertions still pass. Collateral is 7 further
+///   ∞-row-presence tests (8 failed / 156 passed), which is correct: hiding every row breaks
+///   every test that asserts one is shown.
+/// - Third probe, for the `Some(false)`/`None` asymmetry the helper's doc comment claims:
+///   return `Some(false)` from `object_growth_backing`'s never-registered arm ⇒ 4 tests red,
+///   including both `loop_shortcut_mana_engine` badge tests. The `None` branch is load-bearing,
+///   not decorative.
+///
+/// The store guards below are the anti-"register enablers instead" tripwire: routing this
+/// through `zones`' defuse would call `clear_unbounded_loop`, which also wipes
+/// `pending_unbounded_materialization` and its CR 732.2c bound — i.e. one dying token would
+/// cancel the collapse the whole table accepted. These rows go red the moment that happens.
+#[test]
+fn object_growth_infinity_row_dies_with_its_last_pile_member() {
+    use engine::analysis::resource::ResourceAxis;
+    use engine::game::zones::move_to_zone;
+    use engine::types::events::GameEvent;
+
+    let base = one_shot_bootstrap_accepted_state();
+
+    // ── REACH GUARDS: the accepted state really carries the row and a one-member backing set.
+    // Without these, the subject arm's "absent" could pass on a state that never had a row.
+    assert_eq!(
+        base.unbounded_resources.len(),
+        1,
+        "reach-guard: exactly one controller carries ∞ marks on this rig"
+    );
+    let marked = base
+        .unbounded_resources
+        .get(&P0)
+        .expect("the accept marks P0's ∞ axes")
+        .clone();
+    assert!(
+        marked.contains(&ResourceAxis::TokensCreated),
+        "reach-guard: the object-growth accept marks TokensCreated, got {marked:?}"
+    );
+    let pile = base
+        .unbounded_loop_pile
+        .get(&P0)
+        .expect("the object-growth accept registers a ∞ pile")
+        .clone();
+    assert_eq!(
+        pile.len(),
+        1,
+        "reach-guard: this rig's seeded pile is exactly ONE object, so a single departure \
+         empties the whole backing set"
+    );
+    let seed_id = *pile.iter().next().unwrap();
+    assert!(
+        base.battlefield.contains(&seed_id),
+        "reach-guard: the pile member is on the battlefield at accept"
+    );
+
+    let rows = |state: &GameState| -> Vec<ResourceAxis> {
+        derive_views(state, Some(P0))
+            .unbounded_resources
+            .iter()
+            .map(|r| r.axis)
+            .collect()
+    };
+
+    // ── CONTROL FIRST (matched pair, and the wire-level non-vacuity anchor for the subject
+    // arm below): same rig, same `move_to_zone` chokepoint — but the object that leaves is NOT
+    // in the pile, so the backing survives and the row must PERSIST. Deliberately ordered
+    // BEFORE the subject: an equivalent "row present on the untouched base state" guard would
+    // panic first under the TRIVIALIZE mutation and MASK this arm, leaving the pair one-sided.
+    let mut control = base.clone();
+    let bystander = *p0_untapped_saprolings(&control)
+        .iter()
+        .next()
+        .expect("the W+1 untapped remainder supplies a non-pile bystander");
+    assert_ne!(
+        bystander, seed_id,
+        "control precondition: the departing object is NOT a pile member"
+    );
+    let mut events: Vec<GameEvent> = Vec::new();
+    move_to_zone(&mut control, bystander, Zone::Graveyard, &mut events);
+    assert!(
+        !control.battlefield.contains(&bystander),
+        "the control's departure really happened"
+    );
+    let control_rows = rows(&control);
+    assert!(
+        control_rows.contains(&ResourceAxis::TokensCreated),
+        "THE assertion (control): the registered pile still has a live member, so the ∞ row \
+         must persist, got {control_rows:?}"
+    );
+
+    // ── SUBJECT: the last (only) backing member leaves through the real production
+    // chokepoint `zones::move_to_zone`, not by hand-editing the pile.
+    let mut subject = base.clone();
+    let mut events: Vec<GameEvent> = Vec::new();
+    move_to_zone(&mut subject, seed_id, Zone::Graveyard, &mut events);
+    assert!(
+        !subject.battlefield.contains(&seed_id),
+        "the departure really happened (CR 110.1: it stopped being a permanent)"
+    );
+    let subject_rows = rows(&subject);
+    assert!(
+        !subject_rows.contains(&ResourceAxis::TokensCreated),
+        "THE assertion (subject): with its ENTIRE registered pile off the battlefield the \
+         TokensCreated ∞ row must be dropped, got {subject_rows:?}"
+    );
+
+    // SCOPE: only the BACKED axis is dropped — the wire is exactly the marked set minus
+    // `TokensCreated`, so a guard that hid MORE than the unbacked axis fails here. Stated
+    // honestly: this rig marks few axes, so this row is weak on its own. The load-bearing
+    // control for the `None` (never-registered ⇒ badge unchanged) branch is
+    // `loop_shortcut_mana_engine::mana_engine_accept_still_renders_its_infinity_badge`, which
+    // reds if `object_growth_backing`'s catch-all arm returns `Some(false)` instead of `None`.
+    let expected_after: BTreeSet<ResourceAxis> = marked
+        .iter()
+        .copied()
+        .filter(|axis| *axis != ResourceAxis::TokensCreated)
+        .collect();
+    assert_eq!(
+        subject_rows.iter().copied().collect::<BTreeSet<_>>(),
+        expected_after,
+        "scope: exactly the backed axis leaves the wire; every unbacked axis keeps its ∞"
+    );
+
+    // STORE: a DISPLAY revocation only. Nothing here may touch the accepted-collapse stash,
+    // the mark, or the pile — the boundary and the zone-exit defuse still read all three.
+    assert!(
+        subject.pending_unbounded_materialization.contains_key(&P0),
+        "the accepted-collapse stash must SURVIVE — dropping a row may not cancel growth the \
+         table already unanimously accepted (CR 732.2c)"
+    );
+    assert!(
+        subject.pending_materialization_count.contains_key(&P0),
+        "…and so must its CR 732.2c accepted-count bound"
+    );
+    assert!(
+        subject
+            .unbounded_loop_pile
+            .get(&P0)
+            .is_some_and(|p| p.contains(&seed_id)),
+        "the STORE is not filtered: it still carries the departed member"
+    );
+    assert!(
+        subject
+            .unbounded_resources
+            .get(&P0)
+            .is_some_and(|axes| axes.contains(&ResourceAxis::TokensCreated)),
+        "the MARK survives too; only the projection stops rendering it"
     );
 }
 

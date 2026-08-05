@@ -2187,6 +2187,17 @@ fn activatable_mana_profiles_for_object(
             if ability.kind != AbilityKind::Activated || !mana_abilities::is_mana_ability(ability) {
                 return None;
             }
+            // CR 601.2g: A tap mana ability that itself needs mana (such as
+            // a filter land) must stay with the exact auto-tap payment probe.
+            // A standalone profile cannot represent the mana it consumes to
+            // activate, and would let that mana cover the spell as well. Plain
+            // tap sources remain here so they can combine with a manual-choice
+            // mana ability during the same cost-payment step.
+            if has_tap_component(&ability.cost)
+                && mana_abilities::mana_sub_cost_of(&ability.cost).is_some()
+            {
+                return None;
+            }
             if !mana_abilities::can_activate_mana_ability_now(
                 state, controller, object_id, idx, ability,
             ) {

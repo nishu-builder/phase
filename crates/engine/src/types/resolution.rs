@@ -137,7 +137,11 @@ pub struct PendingMutateMerge {
 pub struct ChangeZoneFrame {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending: Option<PendingChangeZoneIteration>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::types::deterministic_serde::option_hash_set"
+    )]
     pub devour_eligible_snapshot: Option<HashSet<ObjectId>>,
 }
 

@@ -1,0 +1,14 @@
+{
+  "unbounded_pile": [
+    402,
+    403,
+    404,
+    407
+  ],
+  "unbounded_resources": [
+    {
+      "axis": "TokensCreated",
+      "player": 0
+    }
+  ]
+}
