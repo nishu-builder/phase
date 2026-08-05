@@ -83,6 +83,7 @@ mod comeuppance;
 mod companion_special_action;
 mod consuming_vapors_life_gain_5925;
 mod consuming_vapors_rebound;
+mod converge_colors_spent_trigger_lifetime;
 mod copied_ability_transform_generation;
 mod copy_gy_creature_mana_value_x;
 mod copy_retarget_past_rider;
