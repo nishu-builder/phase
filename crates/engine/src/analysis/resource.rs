@@ -6428,6 +6428,7 @@ mod tests {
                 source_name: String::new(),
                 subject_match_count: None,
                 die_result: None,
+                provenance: None,
             },
         }
     }
@@ -6539,6 +6540,7 @@ mod tests {
                 // these rows test.
                 subject_match_count: Some(1),
                 die_result: None,
+                provenance: None,
             },
         }
     }
@@ -10622,6 +10624,7 @@ mod tests {
                     may_trigger_origin: None,
                     subject_match_count: None,
                     die_result: None,
+                    provenance: None,
                 },
             )
         };
@@ -13238,6 +13241,7 @@ mod tests {
                 source_name: String::new(),
                 subject_match_count: match_count,
                 die_result: None,
+                provenance: None,
             },
         }
     }
@@ -13607,6 +13611,7 @@ mod tests {
                 source_name: String::new(),
                 subject_match_count: None,
                 die_result: None,
+                provenance: None,
             },
         }
     }
@@ -14713,6 +14718,7 @@ mod tests {
                 source_name: String::new(),
                 subject_match_count: None,
                 die_result: None,
+                provenance: None,
             },
         }
     }
@@ -15324,6 +15330,7 @@ mod tests {
                     source_name: String::new(),
                     subject_match_count: None,
                     die_result: None,
+                    provenance: None,
                 },
             }
         };
@@ -15995,6 +16002,7 @@ mod tests {
                 source_name: String::new(),
                 subject_match_count: None,
                 die_result: None,
+                provenance: None,
             },
         }
     }

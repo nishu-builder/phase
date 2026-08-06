@@ -20,8 +20,8 @@ use crate::types::game_state::{
     AutoMayChoice, DamageRecord, DelayedTrigger, DistributionUnit, GameState,
     LatchedBatchedTrigger, LatchedSuppressTrigger, LogicalZoneChangeGroup,
     LogicalZoneChangeTerminalOutcome, MayTriggerAutoChoiceKey, MayTriggerOrigin, StackEntry,
-    StackEntryKind, TargetSelectionConstraint, TargetSelectionSlot, TriggerObservationTime,
-    TriggerSourceContext, WaitingFor,
+    StackEntryKind, SyntheticTriggerProvenance, TargetSelectionConstraint, TargetSelectionSlot,
+    TriggerObservationTime, TriggerSourceContext, WaitingFor,
 };
 use crate::types::identifiers::{
     DelayedInstallIdentity, DelayedTriggerInstanceId, DelayedTriggerOrigin, DelayedTriggerToken,
@@ -49,7 +49,7 @@ use super::conditions::{
 };
 use super::filter::{
     matches_target_filter, matches_target_filter_on_damage_record_source,
-    spell_record_matches_filter, FilterContext,
+    matches_target_filter_on_lki_snapshot, spell_record_matches_filter, FilterContext,
 };
 use super::game_object::GameObject;
 use super::speed::{
@@ -111,6 +111,9 @@ pub struct PendingTrigger {
     /// resolution scope cleared) can re-stamp `die_result_this_resolution`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub die_result: Option<i32>,
+    /// Typed presentation provenance for a synthesized keyword trigger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<SyntheticTriggerProvenance>,
 }
 
 impl PendingTrigger {
@@ -139,6 +142,7 @@ impl PendingTrigger {
             may_trigger_origin: None,
             subject_match_count: None,
             die_result: None,
+            provenance: None,
         }
     }
 }
@@ -2292,6 +2296,7 @@ fn collect_matching_triggers_inner(
                         },
                         subject_match_count,
                         die_result: None,
+                        provenance: None,
                     },
                     trigger_events,
                     batched: trig_def.batched,
@@ -3352,6 +3357,7 @@ fn collect_latched_batched_zone_triggers(
                 }),
                 subject_match_count,
                 die_result: None,
+                provenance: None,
             },
             trigger_events,
             batched: true,
@@ -3615,6 +3621,7 @@ fn collect_pending_triggers_with_collection(
                             may_trigger_origin: None,
                             subject_match_count: None,
                             die_result: None,
+                            provenance: None,
                         }));
                     }
                 }
@@ -3662,6 +3669,7 @@ fn collect_pending_triggers_with_collection(
                             may_trigger_origin: None,
                             subject_match_count: None,
                             die_result: None,
+                            provenance: None,
                         }));
                     }
                 }
@@ -3705,6 +3713,7 @@ fn collect_pending_triggers_with_collection(
                             }),
                             subject_match_count: None,
                             die_result: None,
+                            provenance: None,
                         }));
                     }
                 }
@@ -3750,6 +3759,7 @@ fn collect_pending_triggers_with_collection(
                         may_trigger_origin: None,
                         subject_match_count: None,
                         die_result: None,
+                        provenance: None,
                     }));
                 }
             }
@@ -3796,6 +3806,7 @@ fn collect_pending_triggers_with_collection(
                             }),
                             subject_match_count: None,
                             die_result: None,
+                            provenance: None,
                         }));
                     }
                 }
@@ -3873,6 +3884,7 @@ fn collect_pending_triggers_with_collection(
                                         may_trigger_origin: None,
                                         subject_match_count: None,
                                         die_result: None,
+                                        provenance: None,
                                     }));
                                 }
                             }
@@ -4209,16 +4221,21 @@ fn collect_pending_triggers_with_collection(
                 .get(cast_obj_id)
                 .map(|source| trigger_source_context_for_latch(state, source));
 
-            // CR 702.102b: NOT-PRE-PAYMENT — this reacts to `GameEvent::SpellCast`,
-            // emitted after payment, so the `fused_split_spell` marker is already
-            // set and the non-fuse-aware collector's marker OR-gate yields the
-            // combined projection. Representative of every `SpellCast`-reactive
-            // `effective_spell_keywords` read in this module.
-            let storm_instances =
-                super::casting::effective_spell_keywords(state, *caster, *cast_obj_id)
-                    .iter()
-                    .filter(|keyword| matches!(keyword, Keyword::Storm))
-                    .count();
+            // CR 702.40a/b: Storm is a triggered ability that functions on the
+            // stack, and its instances are fixed when the spell is cast. Do not
+            // re-evaluate live spell keywords after the cast event: a conditional
+            // grant may no longer match once the spell itself has entered the cast
+            // ledger.
+            let storm_instances = state
+                .objects
+                .get(cast_obj_id)
+                .map(|obj| {
+                    obj.cast_spell_keywords
+                        .iter()
+                        .filter(|keyword| matches!(keyword, Keyword::Storm))
+                        .count()
+                })
+                .unwrap_or_default();
             if storm_instances > 0 {
                 let copy_count = storm_copy_count_before_cast(state);
                 for _ in 0..storm_instances {
@@ -4262,6 +4279,9 @@ fn collect_pending_triggers_with_collection(
                         may_trigger_origin: None,
                         subject_match_count: None,
                         die_result: None,
+                        provenance: Some(SyntheticTriggerProvenance::Storm {
+                            copy_count: copy_count.max(0) as u32,
+                        }),
                     }));
                 }
             }
@@ -4324,6 +4344,7 @@ fn collect_pending_triggers_with_collection(
                     may_trigger_origin: None,
                     subject_match_count: None,
                     die_result: None,
+                    provenance: None,
                 }));
             }
 
@@ -4384,6 +4405,7 @@ fn collect_pending_triggers_with_collection(
                     may_trigger_origin: None,
                     subject_match_count: None,
                     die_result: None,
+                    provenance: None,
                 }));
             }
 
@@ -4505,6 +4527,7 @@ fn collect_pending_triggers_with_collection(
                     may_trigger_origin: None,
                     subject_match_count: None,
                     die_result: None,
+                    provenance: None,
                 }));
             }
 
@@ -4576,6 +4599,7 @@ fn collect_pending_triggers_with_collection(
                     may_trigger_origin: None,
                     subject_match_count: None,
                     die_result: None,
+                    provenance: None,
                 }));
             }
 
@@ -4648,6 +4672,7 @@ fn collect_pending_triggers_with_collection(
                         may_trigger_origin: None,
                         subject_match_count: None,
                         die_result: None,
+                        provenance: None,
                     }));
                 }
             }
@@ -4706,6 +4731,7 @@ fn collect_pending_triggers_with_collection(
                     may_trigger_origin: None,
                     subject_match_count: None,
                     die_result: None,
+                    provenance: None,
                 }));
             }
         }
@@ -4738,6 +4764,7 @@ fn collect_pending_triggers_with_collection(
                         may_trigger_origin: None,
                         subject_match_count: None,
                         die_result: None,
+                        provenance: None,
                     }));
                 }
             }
@@ -4773,6 +4800,7 @@ fn collect_pending_triggers_with_collection(
                         may_trigger_origin: None,
                         subject_match_count: None,
                         die_result: None,
+                        provenance: None,
                     }));
                 }
             }
@@ -4862,6 +4890,7 @@ fn collect_pending_triggers_with_collection(
                             may_trigger_origin: None,
                             subject_match_count: None,
                             die_result: None,
+                            provenance: None,
                         }));
                     }
                 }
@@ -4906,6 +4935,7 @@ fn collect_pending_triggers_with_collection(
                             may_trigger_origin: None,
                             subject_match_count: None,
                             die_result: None,
+                            provenance: None,
                         }));
                     }
                 }
@@ -4951,6 +4981,7 @@ fn collect_pending_triggers_with_collection(
                     may_trigger_origin: None,
                     subject_match_count: None,
                     die_result: None,
+                    provenance: None,
                 }));
                 session.mark_speed_trigger_used(state, trigger_controller);
             }
@@ -4998,6 +5029,7 @@ fn collect_pending_triggers_with_collection(
                     may_trigger_origin: None,
                     subject_match_count: None,
                     die_result: None,
+                    provenance: None,
                 }));
             }
         }
@@ -5241,6 +5273,7 @@ fn ring_pending_trigger(
         may_trigger_origin: None,
         subject_match_count: None,
         die_result: None,
+        provenance: None,
     })
 }
 
@@ -6765,6 +6798,7 @@ fn push_pending_trigger_to_stack_with_firing(
         may_trigger_origin,
         subject_match_count,
         die_result,
+        provenance,
         ..
     } = trigger;
 
@@ -6807,6 +6841,7 @@ fn push_pending_trigger_to_stack_with_firing(
             source_name,
             subject_match_count,
             die_result,
+            provenance,
         },
     };
     stack::push_triggered_to_stack(state, entry, firing, events);
@@ -7749,6 +7784,70 @@ fn filter_references_self(filter: &TargetFilter) -> bool {
     }
 }
 
+/// CR 403.3: A doubler's "ability of a permanent" scope refers to a source
+/// that was a battlefield permanent when it triggered. The `Permanent` type
+/// filter remains available for "permanent card" queries in other zones, so
+/// this trigger-source restriction lives at the doubler's CR 603.2d boundary.
+fn doubler_filter_requires_battlefield_permanent(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::Typed(typed) => typed.type_filters.contains(&TypeFilter::Permanent),
+        TargetFilter::And { filters } => filters
+            .iter()
+            .any(doubler_filter_requires_battlefield_permanent),
+        TargetFilter::Or { filters } => filters
+            .iter()
+            .all(doubler_filter_requires_battlefield_permanent),
+        TargetFilter::Not { .. } => false,
+        _ => false,
+    }
+}
+
+/// CR 403.3 + CR 608.2h: Match a trigger source against its doubler's scope.
+/// A source that has left the battlefield is checked from its captured source
+/// context, while a permanent spell observed on the stack cannot satisfy an
+/// "ability of a permanent" filter.
+fn trigger_source_matches_doubler_filter(
+    state: &GameState,
+    trigger: &PendingTrigger,
+    filter: &TargetFilter,
+    doubler_id: ObjectId,
+) -> bool {
+    let filter_context = FilterContext::from_source(state, doubler_id);
+    if !doubler_filter_requires_battlefield_permanent(filter) {
+        return matches_target_filter(state, trigger.source_id, filter, &filter_context);
+    }
+
+    let Some(source_context) = trigger.ability.trigger_source.as_ref() else {
+        // Built-in keyword triggers are collected only from battlefield
+        // candidates and do not capture a source context. Their source remains
+        // live during this collection pass, so evaluate its current object.
+        return state
+            .objects
+            .get(&trigger.source_id)
+            .is_some_and(|obj| obj.zone == Zone::Battlefield)
+            && matches_target_filter(state, trigger.source_id, filter, &filter_context);
+    };
+    if source_context.identity.expected_zone != Zone::Battlefield {
+        return false;
+    }
+
+    let source_is_still_on_battlefield = state.objects.get(&trigger.source_id).is_some_and(|obj| {
+        obj.zone == Zone::Battlefield
+            && ObjectIncarnationRef::from_object(obj) == source_context.identity.reference
+    });
+    if source_is_still_on_battlefield {
+        matches_target_filter(state, trigger.source_id, filter, &filter_context)
+    } else {
+        matches_target_filter_on_lki_snapshot(
+            state,
+            trigger.source_id,
+            &source_context.lki,
+            filter,
+            &filter_context,
+        )
+    }
+}
+
 fn apply_trigger_doubling(state: &GameState, pending: &mut Vec<PendingTriggerContext>) {
     // CR 702.26b + CR 604.1: `active_static_definitions` owns the gating so a
     // phased-out doubler no longer doubles triggers.
@@ -7809,12 +7908,7 @@ fn apply_trigger_doubling(state: &GameState, pending: &mut Vec<PendingTriggerCon
             // CR 603.2d: If the doubler specifies an affected filter (e.g. "creature you
             // control of the chosen type"), only double triggers from matching sources.
             if let Some(filter) = affected {
-                if !matches_target_filter(
-                    state,
-                    trigger.source_id,
-                    filter,
-                    &FilterContext::from_source(state, *doubler_id),
-                ) {
+                if !trigger_source_matches_doubler_filter(state, trigger, filter, *doubler_id) {
                     continue;
                 }
             }
@@ -8083,6 +8177,7 @@ pub fn check_state_triggers(state: &mut GameState) {
                     may_trigger_origin: None,
                     subject_match_count: None,
                     die_result: None,
+                    provenance: None,
                 });
             }
         }
@@ -8260,6 +8355,7 @@ fn delayed_trigger_to_context(
             may_trigger_origin: None,
             subject_match_count: None,
             die_result: None,
+            provenance: None,
         },
         trigger.provenance,
     )
@@ -11567,6 +11663,7 @@ pub mod tests {
             may_trigger_origin: None,
             subject_match_count: None,
             die_result: None,
+            provenance: None,
         };
 
         let disposition = dispatch_pending_trigger_context_with_origin(
@@ -11641,6 +11738,7 @@ pub mod tests {
             may_trigger_origin: None,
             subject_match_count: None,
             die_result: None,
+            provenance: None,
         };
         let mut pending = vec![PendingTriggerContext::delayed(
             pending,
@@ -12513,6 +12611,7 @@ pub mod tests {
             may_trigger_origin: None,
             subject_match_count: None,
             die_result: None,
+            provenance: None,
         }));
         state.waiting_for = WaitingFor::OptionalEffectChoice {
             player: controller,
@@ -15044,7 +15143,7 @@ pub mod tests {
         {
             let obj = state.objects.get_mut(&emblem).unwrap();
             obj.is_emblem = true;
-            obj.static_definitions = vec![StaticDefinition::new(StaticMode::CastWithKeyword {
+            let storm_grant = StaticDefinition::new(StaticMode::CastWithKeyword {
                 keyword: Keyword::Storm,
             })
             .affected(TargetFilter::Typed(
@@ -15053,8 +15152,8 @@ pub mod tests {
                     TypeFilter::Sorcery,
                 ]))
                 .controller(ControllerRef::You),
-            ))]
-            .into();
+            ));
+            obj.static_definitions = vec![storm_grant.clone(), storm_grant].into();
         }
 
         let spell = create_object(
@@ -15068,6 +15167,20 @@ pub mod tests {
             let obj = state.objects.get_mut(&spell).unwrap();
             obj.card_types.core_types.push(CoreType::Instant);
         }
+        // The real cast pipeline latches effective keyword grants here. This
+        // fixture bypasses that pipeline, so seed the same finalized snapshot
+        // and prove both independently functioning Storm grants survive it.
+        let snapshot =
+            crate::game::casting::effective_spell_keyword_instances(&state, player, spell);
+        assert_eq!(
+            snapshot
+                .iter()
+                .filter(|keyword| matches!(keyword, Keyword::Storm))
+                .count(),
+            2,
+            "cast snapshot must retain duplicate Storm instances"
+        );
+        state.objects.get_mut(&spell).unwrap().cast_spell_keywords = snapshot;
         state.stack.push_back(StackEntry {
             id: spell,
             source_id: spell,
@@ -15133,12 +15246,24 @@ pub mod tests {
             }],
         );
 
-        assert!(state.stack.iter().any(|entry| matches!(
-            &entry.kind,
-            StackEntryKind::TriggeredAbility { ability, .. }
-                if matches!(ability.effect, Effect::CopySpell { .. })
-                    && matches!(ability.repeat_for, Some(QuantityExpr::Fixed { value: 2 }))
-        )));
+        assert_eq!(
+            state
+                .stack
+                .iter()
+                .filter(|entry| matches!(
+                    &entry.kind,
+                    StackEntryKind::TriggeredAbility {
+                        ability,
+                        provenance: Some(SyntheticTriggerProvenance::Storm { copy_count: 2 }),
+                        ..
+                    }
+                        if matches!(ability.effect, Effect::CopySpell { .. })
+                            && matches!(ability.repeat_for, Some(QuantityExpr::Fixed { value: 2 }))
+                ))
+                .count(),
+            2,
+            "each finalized Storm instance must produce its own provenance-carrying trigger"
+        );
     }
 
     #[test]
@@ -17178,6 +17303,7 @@ pub mod tests {
             may_trigger_origin: None,
             subject_match_count: None,
             die_result: None,
+            provenance: None,
         };
 
         let mut events = Vec::new();
@@ -17257,6 +17383,7 @@ pub mod tests {
             may_trigger_origin: None,
             subject_match_count: None,
             die_result: None,
+            provenance: None,
         };
 
         let draw_trig = parse_trigger_line(DRAW_ETB, "Curiosity Crafter");
@@ -17280,6 +17407,7 @@ pub mod tests {
             may_trigger_origin: None,
             subject_match_count: None,
             die_result: None,
+            provenance: None,
         };
 
         dispatch_collected_triggers(
@@ -17889,6 +18017,7 @@ pub mod tests {
             may_trigger_origin: None,
             subject_match_count: None,
             die_result: None,
+            provenance: None,
         };
         let context = PendingTriggerContext::single(pending);
         let mut events_out = Vec::new();
@@ -28617,6 +28746,7 @@ pub mod tests {
             may_trigger_origin: None,
             subject_match_count: None,
             die_result: None,
+            provenance: None,
         })
     }
 
@@ -28734,6 +28864,7 @@ pub mod tests {
             may_trigger_origin: None,
             subject_match_count: None,
             die_result: None,
+            provenance: None,
         })
     }
 
@@ -28952,6 +29083,7 @@ pub mod tests {
             may_trigger_origin: None,
             subject_match_count: None,
             die_result: None,
+            provenance: None,
         })
     }
 
@@ -31280,6 +31412,7 @@ pub mod tests {
                 may_trigger_origin: None,
                 subject_match_count: None,
                 die_result: None,
+                provenance: None,
             },
             &mut Vec::new(),
         );
@@ -31528,6 +31661,7 @@ pub mod tests {
                 may_trigger_origin: None,
                 subject_match_count: None,
                 die_result: None,
+                provenance: None,
             },
             &mut Vec::new(),
         );
@@ -31630,6 +31764,7 @@ pub mod tests {
                 may_trigger_origin: None,
                 subject_match_count: None,
                 die_result: None,
+                provenance: None,
             },
             &mut Vec::new(),
         );
@@ -31822,6 +31957,7 @@ pub mod tests {
                 may_trigger_origin: None,
                 subject_match_count: None,
                 die_result: None,
+                provenance: None,
             },
             &mut Vec::new(),
         );
@@ -31912,6 +32048,7 @@ pub mod tests {
                 may_trigger_origin: None,
                 subject_match_count: None,
                 die_result: None,
+                provenance: None,
             },
             &mut Vec::new(),
         );

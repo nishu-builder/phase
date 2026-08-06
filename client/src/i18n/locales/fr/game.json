@@ -626,6 +626,10 @@
     "organizeLabel": "Organiser la main",
     "reorderPausedHint": "La réorganisation par glisser-déposer est en pause tant que la main est triée ou filtrée."
   },
+  "storm": {
+    "copies_one": "Déluge : {{count}} copie",
+    "copies_other": "Déluge : {{count}} copies"
+  },
   "opponentHud": {
     "ally": "Allié",
     "out": "Élim",

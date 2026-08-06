@@ -21,7 +21,7 @@ use crate::game::game_object::AttachTarget;
 use crate::game::stack::{effective_stack_ability, stack_display_groups, StackDisplayGroup};
 use crate::types::ability::{
     ContinuousModification, Duration, GameRestriction, KeywordAction, ProhibitedActivity,
-    RestrictionExpiry, RestrictionPlayerScope, TargetRef,
+    RestrictionExpiry, RestrictionPlayerScope, TargetFilter, TargetRef,
 };
 use crate::types::attribution::EffectRef;
 use crate::types::card::TokenImageRef;
@@ -30,13 +30,14 @@ use crate::types::events::GameEvent;
 use crate::types::format::GameFormat;
 use crate::types::game_state::{
     CastingVariant, GameState, StackEntry, StackEntryKind, StackPaidSnapshot,
+    SyntheticTriggerProvenance,
 };
 use crate::types::identifiers::ObjectId;
 use crate::types::keywords::Keyword;
 use crate::types::layers::Layer;
 use crate::types::mana::ManaCost;
 use crate::types::player::PlayerId;
-use crate::types::statics::StaticMode;
+use crate::types::statics::{StaticMode, StaticModeKind};
 use crate::types::zones::Zone;
 
 fn is_false(value: &bool) -> bool {
@@ -98,6 +99,10 @@ pub struct StackEntryDisplay {
     pub paid: Vec<StackPaidFactView>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trigger_context: Vec<TriggerContextDisplay>,
+    /// Typed synthesized-trigger presentation provenance. This is the only
+    /// stack provenance surface consumed by the frontend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<SyntheticTriggerProvenance>,
 }
 
 /// A single player-affecting condition the HUD surfaces as a status icon.
@@ -281,6 +286,12 @@ pub struct DerivedViews {
     /// paid cast facts, and public trigger context. Empty when the stack is empty.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub stack_entry_details: HashMap<ObjectId, StackEntryDisplay>,
+
+    /// CR 702.40a: copy counts for Storm spells in the viewing player's hand.
+    /// Keyed only by that viewer's hand object ids so hidden opponents' card
+    /// abilities and the table-wide spell ledger cannot leak through the view.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub prospective_storm_counts: HashMap<ObjectId, u32>,
 
     /// CR 303.4 + CR 702.5: Auras attached to each player (Curse cycle,
     /// Faith's Fetters-class). Players have no `attachments` back-link
@@ -720,8 +731,79 @@ pub fn derive_views(state: &GameState, viewer: Option<PlayerId>) -> DerivedViews
     // answer.
     views.copied_permanents.sort_unstable();
 
-    // CR 702.188a + 604.1: viewer-scoped web-slinging costs (own hand only → leak-proof).
+    // CR 702.40a: viewer-scoped prospective Storm copy counts (own hand only → leak-proof).
     if let Some(viewer) = viewer {
+        if let Some(player) = state.players.iter().find(|player| player.id == viewer) {
+            // `effective_spell_keywords` evaluates every keyword-grant source. Most
+            // snapshots have neither a Storm card nor a possible Storm grant, so only
+            // take that expensive path when one exists. The fallback remains necessary
+            // for CR 604.1 / CR 611.2c / CR 601.2f grants.
+            let may_have_granted_storm =
+                (crate::game::functioning_abilities::static_kind_present(
+                    state,
+                    StaticModeKind::CastWithKeyword,
+                ) && crate::game::functioning_abilities::game_active_statics(state).any(
+                    |(_, definition)| {
+                        matches!(
+                            &definition.mode,
+                            StaticMode::CastWithKeyword {
+                                keyword: Keyword::Storm
+                            }
+                        )
+                    },
+                )) || state.transient_continuous_effects.iter().any(|effect| {
+                    matches!(&effect.affected, TargetFilter::SpecificPlayer { id } if *id == viewer)
+                        && effect.modifications.iter().any(|modification| {
+                            matches!(
+                                modification,
+                                ContinuousModification::GrantStaticAbility { definition }
+                                    if matches!(
+                                        &definition.mode,
+                                        StaticMode::CastWithKeyword {
+                                            keyword: Keyword::Storm
+                                        }
+                                    )
+                            )
+                        })
+                }) || state.pending_next_spell_modifiers.iter().any(|modifier| {
+                    matches!(
+                        modifier,
+                        crate::types::game_state::PendingNextSpellModifier {
+                            player,
+                            modifier: crate::types::game_state::NextSpellModifier::HasKeyword {
+                                keyword: Keyword::Storm
+                            },
+                            ..
+                        } if *player == viewer
+                    )
+                });
+            let mut copy_count = None;
+            for &hand_id in player.hand.iter() {
+                let has_printed_storm = state.objects.get(&hand_id).is_some_and(|object| {
+                    object
+                        .keywords
+                        .iter()
+                        .any(|keyword| matches!(keyword, Keyword::Storm))
+                });
+                if has_printed_storm
+                    || (may_have_granted_storm
+                        && crate::game::casting::effective_spell_keywords(state, viewer, hand_id)
+                            .iter()
+                            .any(|keyword| matches!(keyword, Keyword::Storm)))
+                {
+                    let copy_count = *copy_count.get_or_insert_with(|| {
+                        state
+                            .spells_cast_this_turn_by_player
+                            .values()
+                            .map(|records| records.len())
+                            .sum::<usize>() as u32
+                    });
+                    views.prospective_storm_counts.insert(hand_id, copy_count);
+                }
+            }
+        }
+
+        // CR 702.188a + 604.1: viewer-scoped web-slinging costs (own hand only → leak-proof).
         let has_web_slinging_static =
             crate::game::functioning_abilities::game_active_statics(state).any(|(_, def)| {
                 matches!(
@@ -1398,6 +1480,12 @@ fn stack_entry_detail(state: &GameState, entry: &StackEntry) -> StackEntryDispla
         targets: stack_entry_targets(state, entry),
         paid: stack_paid_facts(state.stack_paid_facts.get(&entry.id)),
         trigger_context: stack_trigger_context(state, entry),
+        provenance: match &entry.kind {
+            StackEntryKind::TriggeredAbility { provenance, .. } => provenance.clone(),
+            StackEntryKind::Spell { .. }
+            | StackEntryKind::ActivatedAbility { .. }
+            | StackEntryKind::KeywordAction { .. } => None,
+        },
     }
 }
 
@@ -2484,6 +2572,7 @@ mod tests {
                     source_name: String::new(),
                     subject_match_count: None,
                     die_result: None,
+                    provenance: None,
                 },
             });
         }
@@ -2502,6 +2591,124 @@ mod tests {
             empty.stack_display_groups.is_empty(),
             "empty-stack short-circuit must leave the group vec empty"
         );
+    }
+
+    #[test]
+    fn prospective_storm_counts_are_viewer_scoped() {
+        use crate::types::identifiers::CardId;
+
+        let mut state = GameState::new_two_player(42);
+        let p0_storm = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Grapeshot".to_string(),
+            Zone::Hand,
+        );
+        let p1_storm = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Empty the Warrens".to_string(),
+            Zone::Hand,
+        );
+        state
+            .objects
+            .get_mut(&p0_storm)
+            .unwrap()
+            .keywords
+            .push(Keyword::Storm);
+        state
+            .objects
+            .get_mut(&p1_storm)
+            .unwrap()
+            .keywords
+            .push(Keyword::Storm);
+        state.players[0].hand.push_back(p0_storm);
+        state.players[1].hand.push_back(p1_storm);
+        state.spells_cast_this_turn_by_player.insert(
+            PlayerId(0),
+            im::Vector::from(vec![
+                crate::types::game_state::SpellCastRecord::default();
+                2
+            ]),
+        );
+
+        let views = derive_views(&state, Some(PlayerId(0)));
+        assert_eq!(views.prospective_storm_counts.get(&p0_storm), Some(&2));
+        assert!(!views.prospective_storm_counts.contains_key(&p1_storm));
+    }
+
+    #[test]
+    fn prospective_storm_counts_include_effectively_granted_storm() {
+        use crate::types::ability::{ControllerRef, StaticDefinition, TypeFilter, TypedFilter};
+
+        let mut state = GameState::new_two_player(42);
+        let grantor = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Storm Grantor".to_string(),
+            Zone::Battlefield,
+        );
+        state.objects.get_mut(&grantor).unwrap().static_definitions =
+            vec![StaticDefinition::new(StaticMode::CastWithKeyword {
+                keyword: Keyword::Storm,
+            })
+            .affected(TargetFilter::Typed(
+                TypedFilter::new(TypeFilter::Instant).controller(ControllerRef::You),
+            ))]
+            .into();
+        let spell = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Granted Storm Spell".to_string(),
+            Zone::Hand,
+        );
+        state
+            .objects
+            .get_mut(&spell)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Instant);
+        state.players[0].hand.push_back(spell);
+        state.spells_cast_this_turn_by_player.insert(
+            PlayerId(0),
+            im::Vector::from(vec![crate::types::game_state::SpellCastRecord::default()]),
+        );
+
+        let views = derive_views(&state, Some(PlayerId(0)));
+
+        assert_eq!(views.prospective_storm_counts.get(&spell), Some(&1));
+    }
+
+    #[test]
+    fn prospective_storm_counts_include_next_spell_granted_storm() {
+        let mut state = GameState::new_two_player(42);
+        let spell = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Next Storm Spell".to_string(),
+            Zone::Hand,
+        );
+        state.players[0].hand.push_back(spell);
+        state.pending_next_spell_modifiers.push(
+            crate::types::game_state::PendingNextSpellModifier {
+                player: PlayerId(0),
+                modifier: crate::types::game_state::NextSpellModifier::HasKeyword {
+                    keyword: Keyword::Storm,
+                },
+                spell_filter: None,
+                source_id: None,
+            },
+        );
+
+        let views = derive_views(&state, Some(PlayerId(0)));
+
+        assert_eq!(views.prospective_storm_counts.get(&spell), Some(&0));
     }
 
     /// SHAPE test (constructs `pending_cast`/pool directly, not via the cast
@@ -2657,6 +2864,58 @@ mod tests {
     }
 
     #[test]
+    fn stack_entry_details_projects_storm_provenance_to_the_client_wire() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Grapeshot".to_string(),
+            Zone::Stack,
+        );
+        let trigger = ObjectId(2);
+        state.stack.push_back(StackEntry {
+            id: trigger,
+            source_id: source,
+            controller: PlayerId(0),
+            kind: StackEntryKind::TriggeredAbility {
+                source_id: source,
+                ability: Box::new(ResolvedAbility::new(
+                    Effect::Unimplemented {
+                        name: "storm".to_string(),
+                        description: None,
+                    },
+                    Vec::new(),
+                    source,
+                    PlayerId(0),
+                )),
+                condition: None,
+                trigger_event: None,
+                description: Some("Storm".to_string()),
+                source_name: "Grapeshot".to_string(),
+                subject_match_count: None,
+                die_result: None,
+                provenance: Some(SyntheticTriggerProvenance::Storm { copy_count: 2 }),
+            },
+        });
+
+        let views = derive_views(&state, Some(PlayerId(0)));
+        assert_eq!(
+            views.stack_entry_details[&trigger].provenance,
+            Some(SyntheticTriggerProvenance::Storm { copy_count: 2 }),
+            "the stack detail projection carries typed Storm provenance"
+        );
+
+        let wire = serde_json::to_value(ClientGameStateRef::wrap(&state, Some(PlayerId(0))))
+            .expect("serialize client game state");
+        assert_eq!(
+            wire["derived"]["stack_entry_details"][trigger.0.to_string()]["provenance"],
+            serde_json::json!({"type": "Storm", "data": {"copy_count": 2}}),
+            "the frontend's derived stack-detail wire retains Storm provenance",
+        );
+    }
+
+    #[test]
     fn pending_modal_spell_details_survive_filtering_and_client_wire_round_trip() {
         let mut state = GameState::new_two_player(42);
         let spell = create_object(
@@ -2746,6 +3005,7 @@ mod tests {
             targets: Vec::new(),
             paid: Vec::new(),
             trigger_context: Vec::new(),
+            provenance: None,
         };
         let empty_json = serde_json::to_string(&empty).expect("serialize empty display");
         assert!(
@@ -2845,6 +3105,7 @@ mod tests {
                 source_name: "Watcher".to_string(),
                 subject_match_count: None,
                 die_result: None,
+                provenance: None,
             },
         });
 
@@ -2965,6 +3226,7 @@ mod tests {
                     may_trigger_origin: None,
                     subject_match_count: None,
                     die_result: None,
+                    provenance: None,
                 },
                 provenance,
             )

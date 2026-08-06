@@ -626,6 +626,10 @@
     "organizeLabel": "Uporządkuj rękę",
     "reorderPausedHint": "Zmiana kolejności przeciąganiem jest wstrzymana, gdy ręka jest posortowana lub przefiltrowana."
   },
+  "storm": {
+    "copies_one": "Sztorm: {{count}} kopia",
+    "copies_other": "Sztorm: {{count}} kopie"
+  },
   "opponentHud": {
     "ally": "Sojusznik",
     "out": "Poza grą",

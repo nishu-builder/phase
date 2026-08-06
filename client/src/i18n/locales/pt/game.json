@@ -626,6 +626,10 @@
     "organizeLabel": "Organizar mão",
     "reorderPausedHint": "Arrastar para reordenar está pausado enquanto a mão está ordenada ou filtrada."
   },
+  "storm": {
+    "copies_one": "Tempestade: {{count}} cópia",
+    "copies_other": "Tempestade: {{count}} cópias"
+  },
   "opponentHud": {
     "ally": "Aliado",
     "out": "Fora",

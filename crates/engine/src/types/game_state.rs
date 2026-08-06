@@ -12057,6 +12057,18 @@ pub struct StackEntry {
     pub kind: StackEntryKind,
 }
 
+/// Engine-authored identity for a synthesized triggered ability whose display
+/// needs a fact unavailable on ordinary Oracle-defined triggers.
+///
+/// This is presentation provenance, not a second rules implementation: the
+/// trigger's resolved ability remains the authority that actually resolves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum SyntheticTriggerProvenance {
+    /// CR 702.40a: The Storm trigger will copy its source spell this many times.
+    Storm { copy_count: u32 },
+}
+
 /// CR 400.7j: from→to record of a source object moved by its own resolving
 /// ability, so `source_is_current` can re-find it after the all-zone incarnation
 /// bump. `original_stamp` is the incarnation the resolving ability captured (fixed
@@ -12633,6 +12645,10 @@ pub enum StackEntryKind {
         /// `die_result_this_resolution`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         die_result: Option<i32>,
+        /// Typed identity for synthesized keyword triggers. The frontend reads
+        /// this only through `StackEntryDisplay`, never from raw stack state.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provenance: Option<SyntheticTriggerProvenance>,
     },
     /// CR 113.3b: Activated keyword abilities (Equip / Crew / Saddle / Station)
     /// enter the stack after cost-payment + target selection and resolve with
@@ -21982,6 +21998,7 @@ mod tests {
                 source_name: "Normal trigger source".to_string(),
                 subject_match_count: None,
                 die_result: None,
+                provenance: None,
             },
         });
         state
@@ -23166,6 +23183,7 @@ mod tests {
                 source_name: String::new(),
                 subject_match_count: None,
                 die_result: None,
+                provenance: None,
             },
         });
         a.lki_by_incarnation
@@ -26131,6 +26149,7 @@ mod tests {
             may_trigger_origin: None,
             subject_match_count: None,
             die_result: None,
+            provenance: None,
         };
         let json = serde_json::to_string(&trigger).unwrap();
         let deserialized: PendingTrigger = serde_json::from_str(&json).unwrap();
@@ -26197,6 +26216,7 @@ mod tests {
             may_trigger_origin: None,
             subject_match_count: None,
             die_result: None,
+            provenance: None,
         }));
         state.pending_trigger_firing = Some(TriggerFiring::Ordinary);
 
@@ -26681,6 +26701,7 @@ mod tests {
                 source_name: "Token".to_string(),
                 subject_match_count: None,
                 die_result: None,
+                provenance: None,
             },
         }
     }

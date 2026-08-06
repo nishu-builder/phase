@@ -665,6 +665,10 @@
     "organizeLabel": "Organize hand",
     "reorderPausedHint": "Drag-to-reorder is paused while the hand is sorted or filtered."
   },
+  "storm": {
+    "copies_one": "Storm: {{count}} copy",
+    "copies_other": "Storm: {{count}} copies"
+  },
   "opponentHud": {
     "ally": "Ally",
     "out": "Out",

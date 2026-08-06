@@ -626,6 +626,10 @@
     "organizeLabel": "Hand ordnen",
     "reorderPausedHint": "Das Umsortieren per Ziehen ist pausiert, solange die Hand sortiert oder gefiltert ist."
   },
+  "storm": {
+    "copies_one": "Sturm: {{count}} Kopie",
+    "copies_other": "Sturm: {{count}} Kopien"
+  },
   "opponentHud": {
     "ally": "Verbündeter",
     "out": "Raus",
