@@ -919,6 +919,7 @@ fn test_search_changezone_shuffle_continuation_completes() {
             source_name: String::new(),
             subject_match_count: None,
             die_result: None,
+            provenance: None,
         },
     };
     stack::push_to_stack(&mut state, entry, &mut vec![]);
@@ -1293,6 +1294,7 @@ fn test_earthbender_ascension_etb_completes_with_landfall() {
             source_name: String::new(),
             subject_match_count: None,
             die_result: None,
+            provenance: None,
         },
     };
     stack::push_to_stack(&mut state, entry, &mut vec![]);
@@ -1863,6 +1865,7 @@ fn earthbend_return_skips_shock_land_pay_life_prompt() {
         enter_transformed: false,
         face_down_profile: None,
         enter_as_copy: None,
+        discard_frame: None,
         applied: std::collections::HashSet::new(),
     };
 
@@ -1939,6 +1942,7 @@ fn plain_shock_land_etb_still_prompts_for_life_payment() {
         enter_transformed: false,
         face_down_profile: None,
         enter_as_copy: None,
+        discard_frame: None,
         applied: std::collections::HashSet::new(),
     };
 
@@ -2100,6 +2104,7 @@ fn cast_synthetic_earthbend(
             source_name: String::new(),
             subject_match_count: None,
             die_result: None,
+            provenance: None,
         },
     };
     stack::push_to_stack(state, entry, &mut vec![]);
@@ -2413,6 +2418,7 @@ fn earthbended_land_returns_tapped_after_exile() {
             source_name: String::new(),
             subject_match_count: None,
             die_result: None,
+            provenance: None,
         },
     };
     stack::push_to_stack(runner.state_mut(), entry, &mut vec![]);

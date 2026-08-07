@@ -9,15 +9,16 @@ use crate::types::ability::{
     StaticCondition, StaticDefinition, SubAbilityLink, TapCreaturesRequirement, TargetFilter,
     TargetRef,
 };
-use crate::types::actions::AlternativeCastDecision;
+use crate::types::actions::{AlternativeCastDecision, GameAction};
 use crate::types::card::LayoutKind;
 use crate::types::events::{ActivatedAbilityKind, GameEvent};
 use crate::types::game_state::{
     ActivationResidual, ActivationTargetSelection, CastOfferKind, CastPaymentMode,
     CastingPermissionIndex, CastingVariant, CastingVariantChoiceOption, ConvokeMode, CostResume,
-    GameState, ManaAbilityCostParent, ManaAbilityResume, NextSpellModifier, PayCostKind,
-    PendingCast, PendingCostMoveResume, SneakPlacement, SpellCostSource, StackEntry,
-    StackEntryKind, TargetEffectDetail, TargetSelectionSlot, WaitingFor,
+    GameState, ManaAbilityCostParent, ManaAbilityResume, ManaChoice, ManaChoiceContext,
+    ManaChoicePrompt, NextSpellModifier, PayCostKind, PendingCast, PendingCostMoveResume,
+    SneakPlacement, SpellCostSource, StackEntry, StackEntryKind, TargetEffectDetail,
+    TargetSelectionSlot, WaitingFor,
 };
 use crate::types::identifiers::{CardId, ObjectId, TrackedSetId};
 use crate::types::keywords::{FlashbackCost, Keyword, KeywordKind};
@@ -15155,6 +15156,23 @@ pub(crate) fn has_manual_mana_ability_for_spell_payment(
     )
 }
 
+/// Returns whether a cast that cannot be fully auto-paid has an engine-proven
+/// route into the normal mana-payment interaction.
+///
+/// CR 117.1d + CR 601.2g: In addition to the legacy manual non-tap ability
+/// path, a producer can fund a distinct costed-tap mana ability before the
+/// spell's remaining payment. The latter is admitted only when the bounded
+/// reducer witness proves the final cost is payable.
+pub(crate) fn has_manual_mana_payment_path_for_spell(
+    state: &GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+    cost: &ManaCost,
+ ) -> bool {
+    has_manual_mana_ability_for_spell_payment(state, player, source_id)
+        || has_exact_filter_land_payment_witness(state, player, source_id, cost)
+}
+
 /// CR 601.2g-h: Choose the payment mode for an already-prepared spell cost.
 /// Pool-payable costs may finish automatically; a cost whose only currently
 /// activatable mana sources are sacrificial must preserve the explicit source
@@ -15223,7 +15241,7 @@ pub(crate) fn prepared_spell_payment_verdict_with_probe(
     })
 }
 
-pub(crate) fn can_feasibly_pay_mana_cost_with_probe(
+pub(super) fn can_feasibly_pay_mana_cost_with_probe(
     state: &GameState,
     player: PlayerId,
     source_id: Option<ObjectId>,
@@ -15258,6 +15276,170 @@ fn can_feasibly_pay_mana_cost_without_x(
     cost: &crate::types::mana::ManaCost,
 ) -> bool {
     can_feasibly_pay_mana_cost_without_x_with_probe(state, player, source_id, cost, None)
+}
+
+/// Returns whether an activation is the filter-land shape that needs mana in
+/// addition to tapping its own source. The source selection is first resolved
+/// back to its live ability, so synthetic land fallback rows cannot be mistaken
+/// for an activated filter ability.
+fn is_costed_tap_mana_selection(state: &GameState, selection: &ManaSourceSelection) -> bool {
+    selection
+        .ability_index
+        .and_then(|ability_index| {
+            state
+                .objects
+                .get(&selection.source.object_id)
+                .and_then(|object| object.abilities.get(ability_index))
+        })
+        .is_some_and(|ability| {
+            super::mana_sources::has_tap_component(&ability.cost)
+                && super::mana_abilities::mana_sub_cost_of(&ability.cost).is_some()
+        })
+}
+
+/// Applies one exact Priority mana action on a clone, then follows only the
+/// mana-ability prompts that have a finite engine-authored answer set.
+///
+/// CR 605.3a + CR 605.3b: Mana abilities resolve inline. The witness therefore uses the
+/// ordinary reducer for both activation and every required mana choice rather
+/// than estimating a filter land's output from its source profile.
+fn exact_mana_ability_successors(
+    mut state: GameState,
+    player: PlayerId,
+    selection: &ManaSourceSelection,
+) -> Vec<GameState> {
+    let action = match super::mana_sources::priority_mana_route(&state, selection) {
+        Some(super::mana_sources::PriorityManaRoute::LandTap) => GameAction::TapLandForMana {
+            selection: selection.clone(),
+        },
+        Some(super::mana_sources::PriorityManaRoute::NonlandActivation) => {
+            GameAction::ActivateManaSource {
+                selection: selection.clone(),
+            }
+        }
+        None => return Vec::new(),
+    };
+    if super::engine::apply_for_simulation(&mut state, player, action).is_err() {
+        return Vec::new();
+    }
+    settle_exact_mana_ability_prompts(state, player, 3)
+}
+
+/// Continue a bounded mana-ability reducer walk. Any prompt outside this exact
+/// payment/color-choice subset fails closed: its choice could affect resources
+/// or legality in a way this castability witness does not model.
+fn settle_exact_mana_ability_prompts(
+    state: GameState,
+    player: PlayerId,
+    remaining_steps: u8,
+) -> Vec<GameState> {
+    if remaining_steps == 0 {
+        return Vec::new();
+    }
+
+    let actions = match &state.waiting_for {
+        WaitingFor::Priority {
+            player: waiting_player,
+        } if *waiting_player == player => return vec![state],
+        WaitingFor::PayManaAbilityMana {
+            player: waiting_player,
+            options,
+            ..
+        } if *waiting_player == player => options
+            .iter()
+            .cloned()
+            .map(|payment| GameAction::PayManaAbilityMana { payment })
+            .collect(),
+        WaitingFor::ChooseManaColor {
+            player: waiting_player,
+            choice,
+            context: ManaChoiceContext::ManaAbility(_),
+        } if *waiting_player == player => match choice {
+            ManaChoicePrompt::SingleColor { options } => options
+                .iter()
+                .copied()
+                .map(|color| GameAction::ChooseManaColor {
+                    choice: ManaChoice::SingleColor(color),
+                    count: 1,
+                })
+                .collect(),
+            ManaChoicePrompt::Combination { options } => options
+                .iter()
+                .cloned()
+                .map(|colors| GameAction::ChooseManaColor {
+                    choice: ManaChoice::Combination(colors),
+                    count: 1,
+                })
+                .collect(),
+            ManaChoicePrompt::AnyCombination { .. } => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+
+    actions
+        .into_iter()
+        .filter_map(|action| {
+            let mut next = state.clone();
+            super::engine::apply_for_simulation(&mut next, player, action)
+                .ok()
+                .map(|_| settle_exact_mana_ability_prompts(next, player, remaining_steps - 1))
+        })
+        .flatten()
+        .collect()
+}
+
+/// Visits each concrete two-step mana route where one ordinary producer funds a
+/// distinct filter-land activation. The caller decides what must hold after the
+/// exact reducer walk, allowing payment-mode entry and spell-cost feasibility to
+/// share the same bounded route authority.
+///
+/// CR 117.1d + CR 601.2g: A player may activate mana abilities while paying a
+/// spell's cost. This witness exposes that legal forward path without treating
+/// a filter-land profile as independently spendable mana.
+fn has_exact_filter_land_payment_successor(
+    state: &GameState,
+    player: PlayerId,
+    mut accepts: impl FnMut(&GameState) -> bool,
+) -> bool {
+    for producer in super::mana_sources::activatable_mana_source_selections(state, player) {
+        if is_costed_tap_mana_selection(state, &producer) {
+            continue;
+        }
+
+        for after_producer in exact_mana_ability_successors(state.clone(), player, &producer) {
+            for filter in
+                super::mana_sources::activatable_mana_source_selections(&after_producer, player)
+            {
+                if filter.source == producer.source
+                    || !is_costed_tap_mana_selection(&after_producer, &filter)
+                {
+                    continue;
+                }
+
+                for after_filter in
+                    exact_mana_ability_successors(after_producer.clone(), player, &filter)
+                {
+                    if accepts(&after_filter) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Finds a two-step producer -> filter-land route that leaves the spell
+/// payable under the ordinary exact auto-tap authority.
+fn has_exact_filter_land_payment_witness(
+    state: &GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+    cost: &ManaCost,
+) -> bool {
+    has_exact_filter_land_payment_successor(state, player, |after_filter| {
+        can_pay_cost_after_auto_tap_with_probe(after_filter, player, source_id, cost, None)
+    })
 }
 
 fn can_feasibly_pay_mana_cost_without_x_with_probe(
@@ -15311,6 +15493,29 @@ fn can_feasibly_pay_mana_cost_without_x_with_probe(
         | crate::types::mana::ManaCost::SelfManaCostReduced { .. } => return true,
         crate::types::mana::ManaCost::Cost { shards, generic } => (shards, *generic),
     };
+
+    // CR 117.1d + CR 601.2g + CR 605.3a + CR 605.3b: Before the residual approximation
+    // rejects the cast for lacking a manually activated non-tap source, prove
+    // the narrow producer -> filter-land route by executing both abilities on
+    // a clone through their normal reducer actions and exact choice prompts.
+    if let Some(sid) = source_id {
+        if has_exact_filter_land_payment_witness(state, player, sid, cost) {
+            return true;
+        }
+    }
+
+    // CR 601.2g: Once the exact auto-tap payment probe has failed, only a
+    // mana ability that requires a manual choice can make the cast reachable.
+    // Do not re-estimate tap-cost or unambiguous self-sacrifice sources here:
+    // their resource dependencies belong exclusively to the exact probe.
+    if !super::mana_sources::has_activatable_non_tap_mana_ability_for_payment(
+        state,
+        player,
+        source_id,
+        spell_ctx.as_ref(),
+    ) {
+        return false;
+    }
 
     // CR 117.1d + CR 601.2g: Residual shard feasibility under non-tap mana
     // sources (issue #583: Vivi Ornitier {0} combination mana; extends #1234).
@@ -16672,6 +16877,7 @@ fn apply_mana_spell_grants(
                     may_trigger_origin: None,
                     subject_match_count: None,
                     die_result: None,
+                    provenance: None,
                 },
             );
         }

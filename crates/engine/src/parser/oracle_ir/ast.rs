@@ -182,7 +182,28 @@ pub(crate) enum ClauseAst {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct SubjectPhraseAst {
-    pub(crate) affected: TargetFilter,
+    /// CR 608.2c ("read the whole text and apply the rules of English to the
+    /// text"): the subject the predicate applies to, or `None` when the
+    /// sentence printed a subject the subject grammar could not bind.
+    ///
+    /// **`Option`, not a permissive default (issue #6965).** Both sites that
+    /// re-derive a subject phrase used to substitute `TargetFilter::Any` when
+    /// [`super::SubjectApplication`] could not be produced. `TargetFilter::Any`
+    /// matches unconditionally (`game/filter.rs`), so a parse FAILURE emitted a
+    /// BOARD-WIDE effect — the grant landed on every permanent, lands and
+    /// artifacts included, while coverage still reported the card as supported.
+    /// Encoding the unbound state in the type makes that fail-open
+    /// unrepresentable: every consumer must say what it does with `None`.
+    /// `lower_subject_predicate_ast`'s `ImperativeFallback` arm — the only
+    /// predicate kind that applies the subject filter — is the only consumer
+    /// that treats `None` as a coverage GAP, failing closed to
+    /// `Effect::unimplemented`. The other readers
+    /// (`sync_subject_into_nested_shuffle_sub`, `inject_subject_target`) reach
+    /// it through `target.or(affected)` and treat `None` as "nothing to
+    /// rebind", returning early. `None` is therefore reachable in all three —
+    /// do not assume otherwise when editing them. Same shape, same reason, as
+    /// [`EntersUnderSpec::UnboundAnaphor`].
+    pub(crate) affected: Option<TargetFilter>,
     pub(crate) target: Option<TargetFilter>,
     pub(crate) multi_target: Option<MultiTargetSpec>,
     pub(crate) inherits_parent: bool,
@@ -588,6 +609,12 @@ pub(crate) enum ImperativeFamilyAst {
     Explore,
     /// CR 702.162a: Connive.
     Connive,
+    /// CR 701.70a + CR 608.2c: Recruit — draw, discard, then create the
+    /// contingent Soldier token when the card discarded by this instruction was
+    /// nonland. This remains a parser IR node because lowering must build the
+    /// three-step, direct-child chain rather than introduce a card-specific
+    /// runtime effect.
+    Recruit,
     /// CR 509.1c: Block this turn/combat if able.
     ForceBlock {
         attacker: Option<ForceBlockAttackerRef>,

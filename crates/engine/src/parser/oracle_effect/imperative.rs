@@ -33,14 +33,14 @@ use crate::parser::oracle_static::{
     parse_quoted_ability_modifications,
 };
 use crate::types::ability::{
-    AbilityCost, AbilityDefinition, AbilityKind, BounceSelection, CardSelectionMode,
-    CategoryChooserScope, ChoiceType, Chooser, ContinuousModification, ControlWindow,
-    ControllerRef, CopyRetargetPermission, CounterAdjustment, DigSource, DoorLockOp, Duration,
-    Effect, EffectScope, FaceDownProfile, FilterProp, ForceBlockAttackerRef, GrantedAbilityScope,
-    LibraryPosition, MultiTargetSpec, OutsideGameSourcePool, PlayerScope, PreventionAmount,
-    PreventionScope, PtStat, PtValue, QuantityExpr, QuantityRef, ReassembleControlMode,
-    SearchSelectionConstraint, StaticDefinition, StickerTicketCostPayment, TapStateChange,
-    TargetFilter, TargetSelectionMode, TypeFilter, TypedFilter, ZoneOwner,
+    AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, BounceSelection,
+    CardSelectionMode, CategoryChooserScope, ChoiceType, Chooser, ContinuousModification,
+    ControlWindow, ControllerRef, CopyRetargetPermission, CounterAdjustment, DigSource, DoorLockOp,
+    Duration, Effect, EffectScope, FaceDownProfile, FilterProp, ForceBlockAttackerRef,
+    GrantedAbilityScope, LibraryPosition, MultiTargetSpec, OutsideGameSourcePool, PlayerScope,
+    PreventionAmount, PreventionScope, PtStat, PtValue, QuantityExpr, QuantityRef,
+    ReassembleControlMode, SearchSelectionConstraint, StaticDefinition, StickerTicketCostPayment,
+    TapStateChange, TargetFilter, TargetSelectionMode, TypeFilter, TypedFilter, ZoneOwner,
 };
 use crate::types::card_type::CoreType;
 use crate::types::phase::Phase;
@@ -9746,6 +9746,19 @@ pub(super) fn parse_imperative_family_ast(
         return Some(ast);
     }
 
+    // CR 701.9a + CR 608.2c: Recruit is a standalone keyword action. Keep this
+    // an anchored nom production so `recruiter` and compound text do not become
+    // an accidental Recruit instruction.
+    if all_consuming(terminated(
+        tag::<_, _, OracleError<'_>>("recruit"),
+        opt(tag(".")),
+    ))
+    .parse(lower.trim())
+    .is_ok()
+    {
+        return Some(ImperativeFamilyAst::Recruit);
+    }
+
     // CR 724.1: "end the turn" (Time Stop, Sundial of the Infinite, Obeka,
     // Glorious End, Discontinuity, Day's Undoing). Whole-phrase imperative
     // with no target; parse it as an anchored nom production rather than a
@@ -11845,6 +11858,56 @@ pub(crate) fn try_parse_reflexive_coin_flip_branch<'a>(
 
 pub(super) fn lower_imperative_family_ast(ast: ImperativeFamilyAst) -> ParsedEffectClause {
     match ast {
+        // CR 701.9a + CR 608.2c: Recruit's contingent token sees exactly the
+        // immediately preceding discard result. The typed condition is carried
+        // by the direct child, so no later chain step can consume stale discard
+        // provenance.
+        ImperativeFamilyAst::Recruit => {
+            let nonland = TargetFilter::Not {
+                filter: Box::new(TargetFilter::Typed(TypedFilter::land())),
+            };
+            let token = AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Token {
+                    name: "Human Soldier".to_string(),
+                    power: PtValue::Fixed(1),
+                    toughness: PtValue::Fixed(1),
+                    types: vec![
+                        "Creature".to_string(),
+                        "Human".to_string(),
+                        "Soldier".to_string(),
+                    ],
+                    colors: vec![crate::types::mana::ManaColor::White],
+                    keywords: Vec::new(),
+                    tapped: false,
+                    count: QuantityExpr::Fixed { value: 1 },
+                    owner: TargetFilter::Controller,
+                    attach_to: None,
+                    enters_attacking: false,
+                    supertypes: Vec::new(),
+                    static_abilities: Vec::new(),
+                    enter_with_counters: Vec::new(),
+                },
+            )
+            .condition(AbilityCondition::DiscardedCardMatchesFilter { filter: nonland });
+            let discard = AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Discard {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                    selection: CardSelectionMode::Chosen,
+                    unless_filter: None,
+                    filter: None,
+                },
+            )
+            .sub_ability(token);
+            let mut clause = parsed_clause(Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            });
+            clause.sub_ability = Some(Box::new(discard));
+            clause
+        }
         // CR 118.12: A Counter with an "unless [player] pays [cost]" modifier
         // — intercepted here so the modifier propagates to
         // `ParsedEffectClause.unless_pay`. The Effect itself becomes the
@@ -12543,6 +12606,9 @@ fn lower_imperative_family_effect(ast: ImperativeFamilyAst) -> Effect {
             target: TargetFilter::Any,
             count: QuantityExpr::Fixed { value: 1 },
         },
+        ImperativeFamilyAst::Recruit => {
+            unreachable!("Recruit lowering constructs a sub-ability chain")
+        }
         ImperativeFamilyAst::ForceBlock { attacker, duration } => Effect::ForceBlock {
             target: TargetFilter::Any,
             attacker,
@@ -20596,10 +20662,18 @@ mod tests {
         let def = super::super::parse_effect_chain("Roll a six-sided die.", AbilityKind::Spell);
         match &*def.effect {
             Effect::RollDie {
-                sides, modifier, ..
+                count,
+                sides,
+                modifier,
+                ..
             } => {
                 assert_eq!(*sides, 6);
                 assert!(modifier.is_none());
+                // Singular "a ... die" lowers to an explicit count of 1.
+                assert_eq!(
+                    *count,
+                    crate::types::ability::QuantityExpr::Fixed { value: 1 }
+                );
             }
             other => panic!("expected RollDie, got {other:?}"),
         }
@@ -20624,24 +20698,6 @@ mod tests {
                     crate::types::ability::QuantityExpr::Fixed { value: 2 }
                 );
                 assert!(modifier.is_none());
-            }
-            other => panic!("expected RollDie, got {other:?}"),
-        }
-    }
-
-    /// CR 706.1: The single-die path is unchanged — "Roll a six-sided die"
-    /// still lowers to `count: Fixed(1)` so back-compat with existing
-    /// single-die cards holds.
-    #[test]
-    fn roll_a_six_sided_die_lowers_to_count_one() {
-        let def = super::super::parse_effect_chain("Roll a six-sided die.", AbilityKind::Spell);
-        match &*def.effect {
-            Effect::RollDie { count, sides, .. } => {
-                assert_eq!(*sides, 6);
-                assert_eq!(
-                    *count,
-                    crate::types::ability::QuantityExpr::Fixed { value: 1 }
-                );
             }
             other => panic!("expected RollDie, got {other:?}"),
         }
@@ -21987,6 +22043,44 @@ mod tests {
             def.multi_target, None,
             "a bare singular return must not gain a multi_target, got {:?}",
             def.multi_target
+        );
+    }
+
+    #[test]
+    fn recruit_lowers_to_direct_discard_contingent_chain() {
+        let ast = parse_imperative_family_ast("recruit", "recruit", &mut ParseContext::default())
+            .expect("Recruit should parse as its standalone keyword action");
+        let draw = lower_imperative_family_ast(ast);
+        assert!(matches!(draw.effect, Effect::Draw { .. }));
+        let discard = draw
+            .sub_ability
+            .expect("Recruit draw must chain to discard");
+        assert!(matches!(&*discard.effect, Effect::Discard { .. }));
+        let token = discard
+            .sub_ability
+            .expect("Recruit discard must have the contingent token as its direct child");
+        assert!(matches!(
+            token.condition.as_ref(),
+            Some(AbilityCondition::DiscardedCardMatchesFilter {
+                filter: TargetFilter::Not { .. }
+            })
+        ));
+        assert!(matches!(
+            &*token.effect,
+            Effect::Token {
+                power: PtValue::Fixed(1),
+                toughness: PtValue::Fixed(1),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn recruiter_is_not_recruit() {
+        assert!(
+            parse_imperative_family_ast("recruiter", "recruiter", &mut ParseContext::default())
+                .is_none(),
+            "the anchored Recruit grammar must not accept a longer word"
         );
     }
 }

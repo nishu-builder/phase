@@ -1,4 +1,5 @@
 pub mod ability;
+pub mod ability_visit;
 pub mod action_stable_order;
 pub mod actions;
 pub mod attribution;
@@ -6,6 +7,7 @@ pub mod card;
 pub mod card_type;
 pub mod counter;
 pub mod definitions;
+pub(crate) mod deterministic_serde;
 pub mod events;
 pub mod format;
 pub mod game_state;
