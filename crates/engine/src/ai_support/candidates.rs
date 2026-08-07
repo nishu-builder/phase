@@ -4219,9 +4219,9 @@ pub(crate) fn priority_actions_with_probe(
                 if keywords::effective_sneak_cost(state, hand_id).is_none() {
                     continue;
                 }
-                // CR 601.2f: Mana-cost affordability must consider mana that
-                // can be produced by activating mana abilities during the cost
-                // step, including irreversible manual activations.
+                // CR 601.2g-h: Mana abilities are activated before the total
+                // cost is paid, so affordability must consider mana that those
+                // activations can produce, including irreversible manual ones.
                 let Some(card_id) = state.objects.get(&hand_id).map(|o| o.card_id) else {
                     continue;
                 };
