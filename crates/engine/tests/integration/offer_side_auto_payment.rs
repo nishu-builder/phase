@@ -78,18 +78,28 @@ fn self_sacrificing_mana_ability(color: ManaColor) -> AbilityDefinition {
 fn setup_sneak_with_sacrificial_mana(
     sneak_cost: u32,
 ) -> (GameRunner, ObjectId, ObjectId, ObjectId) {
+    setup_sneak_with_sacrificial_mana_cost(ManaCost::generic(sneak_cost), false)
+}
+
+fn setup_sneak_with_sacrificial_mana_cost(
+    sneak_cost: ManaCost,
+    add_irrelevant_red_source: bool,
+) -> (GameRunner, ObjectId, ObjectId, ObjectId) {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::DeclareBlockers);
     let attacker = scenario.add_creature(P0, "Sneak Return Witness", 2, 2).id();
     let spell = scenario
         .add_spell_to_hand(P0, "Sacrificial Sneak Witness", true)
         .with_mana_cost(ManaCost::generic(7))
-        .with_keyword(Keyword::Sneak(ManaCost::generic(sneak_cost)))
+        .with_keyword(Keyword::Sneak(sneak_cost))
         .id();
     let mana_source = scenario
         .add_creature(P0, "Sneak Blood Pet Witness", 1, 1)
         .with_ability_definition(self_sacrificing_mana_ability(ManaColor::Black))
         .id();
+    if add_irrelevant_red_source {
+        scenario.add_basic_land(P0, ManaColor::Red);
+    }
     let mut runner = scenario.build();
     runner.state_mut().phase = Phase::DeclareBlockers;
     runner.state_mut().active_player = P0;
@@ -113,6 +123,13 @@ fn setup_sneak_with_sacrificial_mana(
 fn setup_web_slinging_with_sacrificial_mana(
     web_slinging_cost: u32,
 ) -> (GameRunner, ObjectId, ObjectId, ObjectId) {
+    setup_web_slinging_with_sacrificial_mana_cost(ManaCost::generic(web_slinging_cost), false)
+}
+
+fn setup_web_slinging_with_sacrificial_mana_cost(
+    web_slinging_cost: ManaCost,
+    add_irrelevant_red_source: bool,
+) -> (GameRunner, ObjectId, ObjectId, ObjectId) {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     let returned_creature = scenario
@@ -121,12 +138,15 @@ fn setup_web_slinging_with_sacrificial_mana(
     let spell = scenario
         .add_spell_to_hand(P0, "Sacrificial Web-Slinging Witness", true)
         .with_mana_cost(ManaCost::generic(7))
-        .with_keyword(Keyword::WebSlinging(ManaCost::generic(web_slinging_cost)))
+        .with_keyword(Keyword::WebSlinging(web_slinging_cost))
         .id();
     let mana_source = scenario
         .add_creature(P0, "Web-Slinging Blood Pet Witness", 1, 1)
         .with_ability_definition(self_sacrificing_mana_ability(ManaColor::Black))
         .id();
+    if add_irrelevant_red_source {
+        scenario.add_basic_land(P0, ManaColor::Red);
+    }
     let mut runner = scenario.build();
     runner
         .state_mut()
@@ -172,6 +192,52 @@ fn complete_sacrificial_mana_cast(
     assert_eq!(runner.state().objects[&spell].zone, Zone::Stack);
 }
 
+fn black_mana_cost() -> ManaCost {
+    ManaCost::Cost {
+        shards: vec![ManaCostShard::Black],
+        generic: 0,
+    }
+}
+
+fn setup_black_spell_with_sacrificial_mana_and_irrelevant_red() -> (GameRunner, ObjectId, ObjectId)
+{
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let spell = scenario
+        .add_spell_to_hand(P0, "Sacrificial Black Witness", true)
+        .with_mana_cost(black_mana_cost())
+        .id();
+    let mana_source = scenario
+        .add_creature(P0, "Black Blood Pet Witness", 1, 1)
+        .with_ability_definition(self_sacrificing_mana_ability(ManaColor::Black))
+        .id();
+    scenario.add_basic_land(P0, ManaColor::Red);
+    (scenario.build(), spell, mana_source)
+}
+
+/// CR 601.2g-h: An ordinary cast retains explicit sacrificial-mana consent
+/// when another activatable source cannot pay its remaining colored cost.
+#[test]
+fn irrelevant_non_sacrificial_mana_preserves_regular_source_choice() {
+    let (mut runner, spell, mana_source) =
+        setup_black_spell_with_sacrificial_mana_and_irrelevant_red();
+    let action = legal_actions(runner.state())
+        .into_iter()
+        .find(|action| {
+            matches!(
+                action,
+                GameAction::CastSpell {
+                    object_id,
+                    payment_mode: CastPaymentMode::AutoExceptSacrificialMana,
+                    ..
+                } if *object_id == spell
+            )
+        })
+        .expect("an irrelevant red source must not enable automatic sacrifice");
+
+    complete_sacrificial_mana_cast(&mut runner, action, spell, mana_source);
+}
+
 /// CR 702.190a + CR 601.2g-h: Sneak's exact alternative cost remains offered
 /// when only an explicitly chosen self-sacrificing mana ability can pay it.
 #[test]
@@ -194,6 +260,30 @@ fn sneak_sacrificial_only_cost_is_offered_and_completes_manually() {
 
     complete_sacrificial_mana_cast(&mut runner, action, spell, mana_source);
     assert_eq!(runner.state().objects[&attacker].zone, Zone::Hand);
+}
+
+/// CR 702.190a + CR 601.2g-h: Sneak uses its prepared alternative cost when
+/// deciding whether a non-sacrificial source can actually replace source choice.
+#[test]
+fn irrelevant_non_sacrificial_mana_preserves_sneak_source_choice() {
+    let (mut runner, spell, attacker, mana_source) =
+        setup_sneak_with_sacrificial_mana_cost(black_mana_cost(), true);
+    let action = legal_actions(runner.state())
+        .into_iter()
+        .find(|action| {
+            matches!(
+                action,
+                GameAction::CastSpellAsSneak {
+                    hand_object,
+                    creature_to_return,
+                    payment_mode: CastPaymentMode::AutoExceptSacrificialMana,
+                    ..
+                } if *hand_object == spell && *creature_to_return == attacker
+            )
+        })
+        .expect("an irrelevant red source must not automate a Sneak sacrifice");
+
+    complete_sacrificial_mana_cast(&mut runner, action, spell, mana_source);
 }
 
 /// CR 702.190a + CR 601.2h: A Sneak action whose prepared alternative cost
@@ -239,6 +329,30 @@ fn web_slinging_sacrificial_only_cost_is_offered_and_completes_manually() {
 
     complete_sacrificial_mana_cast(&mut runner, action, spell, mana_source);
     assert_eq!(runner.state().objects[&returned_creature].zone, Zone::Hand);
+}
+
+/// CR 702.188a + CR 601.2g-h: Web-slinging uses its prepared alternative cost
+/// when deciding whether a non-sacrificial source can replace source choice.
+#[test]
+fn irrelevant_non_sacrificial_mana_preserves_web_slinging_source_choice() {
+    let (mut runner, spell, returned_creature, mana_source) =
+        setup_web_slinging_with_sacrificial_mana_cost(black_mana_cost(), true);
+    let action = legal_actions(runner.state())
+        .into_iter()
+        .find(|action| {
+            matches!(
+                action,
+                GameAction::CastSpellAsWebSlinging {
+                    hand_object,
+                    creature_to_return,
+                    payment_mode: CastPaymentMode::AutoExceptSacrificialMana,
+                    ..
+                } if *hand_object == spell && *creature_to_return == returned_creature
+            )
+        })
+        .expect("an irrelevant red source must not automate a Web-slinging sacrifice");
+
+    complete_sacrificial_mana_cast(&mut runner, action, spell, mana_source);
 }
 
 /// CR 702.188a + CR 601.2h: A Web-slinging action whose prepared alternative
@@ -711,14 +825,13 @@ fn setup_face_of_boe(add_plain_red_source: bool) -> Option<(GameRunner, ObjectId
         .act(activate)
         .expect("The Face of Boe activation must enter the stack");
     runner.resolve_top();
-    if matches!(
+    assert!(matches!(
         runner.state().waiting_for,
         WaitingFor::OptionalEffectChoice { .. }
-    ) {
-        runner
-            .act(GameAction::DecideOptionalEffect { accept: true })
-            .expect("the production 'you may cast' choice must be accepted");
-    }
+    ));
+    runner
+        .act(GameAction::DecideOptionalEffect { accept: true })
+        .expect("the production 'you may cast' choice must be accepted");
     let WaitingFor::EffectZoneChoice { cards, .. } = &runner.state().waiting_for else {
         panic!(
             "The Face of Boe must resolve to EffectZoneChoice, got {:?}",

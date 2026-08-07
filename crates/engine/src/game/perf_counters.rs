@@ -143,33 +143,14 @@ pub fn record_state_clone_for_legality() {
     with_mut(|s| s.state_clone_for_legality += 1);
 }
 
-pub(crate) fn record_phase_owned_state_clone() {
-    let phase = LEGALITY_CLONE_PHASE.with(Cell::get);
-    with_mut(|s| match phase {
-        Some(LegalityClonePhase::Generation) => s.generation_state_clones += 1,
-        Some(LegalityClonePhase::StrictFastPath) => s.strict_fast_path_state_clones += 1,
-        Some(LegalityClonePhase::RawValidation) => s.raw_validation_state_clones += 1,
-        Some(LegalityClonePhase::GroupedManaReadiness) => {
-            s.grouped_mana_readiness_state_clones += 1;
-        }
-        Some(LegalityClonePhase::PostApplyCore) => {
-            s.post_apply_auto_payment_core_state_clones += 1;
-        }
-        None => {}
-    });
-}
-
-pub(crate) fn record_mana_readiness_state_clone() {
-    let phase = LEGALITY_CLONE_PHASE.with(Cell::get);
-    with_mut(|snapshot| match phase {
+fn record_phase_owned_state_clone_for(
+    snapshot: &mut PerfCounterSnapshot,
+    phase: Option<LegalityClonePhase>,
+) {
+    match phase {
         Some(LegalityClonePhase::Generation) => snapshot.generation_state_clones += 1,
-        Some(LegalityClonePhase::StrictFastPath) => {
-            snapshot.strict_fast_path_state_clones += 1;
-            snapshot.strict_fast_path_mana_readiness_state_clones += 1;
-        }
-        Some(LegalityClonePhase::RawValidation) => {
-            snapshot.raw_validation_state_clones += 1;
-        }
+        Some(LegalityClonePhase::StrictFastPath) => snapshot.strict_fast_path_state_clones += 1,
+        Some(LegalityClonePhase::RawValidation) => snapshot.raw_validation_state_clones += 1,
         Some(LegalityClonePhase::GroupedManaReadiness) => {
             snapshot.grouped_mana_readiness_state_clones += 1;
         }
@@ -177,6 +158,21 @@ pub(crate) fn record_mana_readiness_state_clone() {
             snapshot.post_apply_auto_payment_core_state_clones += 1;
         }
         None => {}
+    }
+}
+
+pub(crate) fn record_phase_owned_state_clone() {
+    let phase = LEGALITY_CLONE_PHASE.with(Cell::get);
+    with_mut(|snapshot| record_phase_owned_state_clone_for(snapshot, phase));
+}
+
+pub(crate) fn record_mana_readiness_state_clone() {
+    let phase = LEGALITY_CLONE_PHASE.with(Cell::get);
+    with_mut(|snapshot| {
+        record_phase_owned_state_clone_for(snapshot, phase);
+        if phase == Some(LegalityClonePhase::StrictFastPath) {
+            snapshot.strict_fast_path_mana_readiness_state_clones += 1;
+        }
     });
 }
 
@@ -208,7 +204,9 @@ pub(crate) fn record_priority_cast_probe_state_clone() {
 }
 
 pub(crate) fn record_post_apply_auto_payment_core_call() {
-    with_mut(|s| s.post_apply_auto_payment_core_calls += 1);
+    if LEGALITY_CLONE_PHASE.with(Cell::get) == Some(LegalityClonePhase::PostApplyCore) {
+        with_mut(|s| s.post_apply_auto_payment_core_calls += 1);
+    }
 }
 
 pub(crate) fn record_post_apply_uncached_source_collection() {

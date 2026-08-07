@@ -6286,13 +6286,18 @@ mod tests {
         assert_eq!(counters.post_apply_auto_payment_core_calls, N);
         assert_eq!(counters.post_apply_auto_payment_core_state_clones, 0);
         assert_eq!(counters.post_apply_uncached_source_collections, N);
+        let expected_raw_validation_clones = N + 1;
+        let expected_priority_probe_state_clones = 1;
         let total = counters.generation_state_clones
             + counters.strict_fast_path_state_clones
             + counters.raw_validation_state_clones
             + counters.grouped_mana_readiness_state_clones
             + counters.priority_cast_probe_state_clones
             + counters.post_apply_auto_payment_core_state_clones;
-        assert_eq!(total, N + g + s + r + 2);
+        assert_eq!(
+            total,
+            g + s + expected_raw_validation_clones + r + expected_priority_probe_state_clones
+        );
         assert!(spell_ids.iter().all(|spell| !actions.iter().any(|action| {
             matches!(action, GameAction::CastSpell { object_id, .. } if object_id == spell)
         })));

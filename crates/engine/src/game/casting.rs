@@ -23,8 +23,8 @@ use crate::types::game_state::{
 use crate::types::identifiers::{CardId, ObjectId, TrackedSetId};
 use crate::types::keywords::{FlashbackCost, Keyword, KeywordKind};
 use crate::types::mana::{
-    ActivationManaColorConstraint, ManaColor, ManaCost, ManaCostShard, ManaSourceSelection,
-    ManaSpellGrant, PaymentContext, SpecialAction, SpellMeta,
+    ActivationManaColorConstraint, ManaColor, ManaCost, ManaCostShard, ManaSourceOutput,
+    ManaSourceSelection, ManaSpellGrant, ManaType, PaymentContext, SpecialAction, SpellMeta,
 };
 use crate::types::player::PlayerId;
 use crate::types::resolved_commands::ManaPaymentRecipient;
@@ -14024,21 +14024,32 @@ fn can_feasibly_pay_mana_cost_with_assist(
         return false;
     };
 
-    (1..=generic).any(|contribution| {
-        let helper_cost = ManaCost::generic(contribution);
-        candidates.iter().any(|helper| {
-            can_feasibly_pay_mana_cost_with_probe(state, *helper, None, &helper_cost, None)
-                && can_feasibly_pay_mana_cost_with_probe(
-                    state,
-                    player,
-                    Some(source_id),
-                    &ManaCost::Cost {
-                        shards: shards.clone(),
-                        generic: generic - contribution,
-                    },
-                    probe,
-                )
-        })
+    candidates.iter().any(|helper| {
+        // CR 702.132a: A helper's generic contribution is monotone: if they
+        // can pay {N}, they can pay every smaller generic amount. Probe their
+        // largest contribution once, then test the caster's remaining cost.
+        // This reuses the bounded monotone search used for X affordability
+        // rather than simulating every split during legal-action generation.
+        let contribution = casting_costs::largest_x_satisfying_at_most(generic, |amount| {
+            can_feasibly_pay_mana_cost_with_probe(
+                state,
+                *helper,
+                None,
+                &ManaCost::generic(amount),
+                None,
+            )
+        });
+        contribution > 0
+            && can_feasibly_pay_mana_cost_with_probe(
+                state,
+                player,
+                Some(source_id),
+                &ManaCost::Cost {
+                    shards: shards.clone(),
+                    generic: generic - contribution,
+                },
+                probe,
+            )
     })
 }
 
@@ -15168,7 +15179,7 @@ pub(crate) fn has_manual_mana_payment_path_for_spell(
     player: PlayerId,
     source_id: ObjectId,
     cost: &ManaCost,
- ) -> bool {
+) -> bool {
     has_manual_mana_ability_for_spell_payment(state, player, source_id)
         || has_exact_filter_land_payment_witness(state, player, source_id, cost)
 }
@@ -15187,15 +15198,98 @@ pub(crate) fn payment_mode_for_prepared_spell_cost(
     if super::casting_costs::spell_cost_is_payable_from_pool(state, player, source_id, cost) {
         return CastPaymentMode::Auto;
     }
-    if !mana_source_selections.is_empty()
-        && mana_source_selections.iter().all(|selection| {
-            selection.penalty == super::mana_sources::ManaSourcePenalty::Sacrifices
+    let Some(spell_meta) = build_spell_meta(state, player, source_id) else {
+        return CastPaymentMode::Auto;
+    };
+    let spell_ctx = PaymentContext::Spell(&spell_meta);
+    let any_color =
+        player_can_spend_as_any_color_for_payment(state, player, Some(source_id), Some(&spell_ctx));
+    let residual = state
+        .players
+        .iter()
+        .find(|player_data| player_data.id == player)
+        .map(|player_data| {
+            mana_payment::reduce_cost_by_pool(
+                &player_data.mana_pool,
+                cost,
+                Some(&spell_ctx),
+                any_color,
+                None,
+            )
+        })
+        .unwrap_or_else(|| cost.clone());
+    let mut relevant_sources = mana_source_selections.iter().filter(|selection| {
+        selection
+            .restrictions
+            .iter()
+            .all(|restriction| restriction.allows(&spell_ctx))
+            && mana_source_selection_can_contribute_to_cost(selection, &residual, any_color)
+    });
+    if relevant_sources
+        .any(|selection| selection.penalty == super::mana_sources::ManaSourcePenalty::Sacrifices)
+        && !mana_source_selections.iter().any(|selection| {
+            selection.penalty != super::mana_sources::ManaSourcePenalty::Sacrifices
+                && selection
+                    .restrictions
+                    .iter()
+                    .all(|restriction| restriction.allows(&spell_ctx))
+                && mana_source_selection_can_contribute_to_cost(selection, &residual, any_color)
         })
     {
         CastPaymentMode::AutoExceptSacrificialMana
     } else {
         CastPaymentMode::Auto
     }
+}
+
+/// CR 601.2g-h + CR 106.6: Classify a mana-source row by whether its output
+/// can pay any unpaid part of a prepared spell's exact residual cost.
+fn mana_source_selection_can_contribute_to_cost(
+    selection: &ManaSourceSelection,
+    cost: &ManaCost,
+    any_color: bool,
+) -> bool {
+    let ManaCost::Cost { shards, generic } = cost else {
+        return false;
+    };
+    if *generic > 0 {
+        return true;
+    }
+    let produces = |required| match selection.output {
+        ManaSourceOutput::Concrete(output) => {
+            output == required
+                || selection
+                    .atomic_combination
+                    .as_ref()
+                    .is_some_and(|outputs| outputs.contains(&required))
+        }
+        ManaSourceOutput::DeferredColorChoice => required != ManaType::Colorless,
+    };
+    let pays = |required| (any_color && required != ManaType::Colorless) || produces(required);
+    shards.iter().any(|shard| {
+        use mana_payment::ShardRequirement;
+
+        match mana_payment::shard_to_mana_type(*shard) {
+            ShardRequirement::Single(mana_type) | ShardRequirement::Phyrexian(mana_type) => {
+                pays(mana_type)
+            }
+            ShardRequirement::Hybrid(first, second)
+            | ShardRequirement::HybridPhyrexian(first, second) => pays(first) || pays(second),
+            ShardRequirement::TwoGenericHybrid(_)
+            | ShardRequirement::TwoGenericHybridPhyrexian(_) => true,
+            ShardRequirement::ColorlessHybrid(mana_type) => {
+                pays(ManaType::Colorless) || pays(mana_type)
+            }
+            ShardRequirement::TwoOrMoreColorSource => selection
+                .atomic_combination
+                .as_ref()
+                .is_some_and(|outputs| outputs.len() >= 2),
+            // Snow and X need information outside the selected source row.
+            // Treat them as non-contributing here, preserving manual selection
+            // whenever a sacrificial source is otherwise the only payer.
+            ShardRequirement::Snow | ShardRequirement::X => false,
+        }
+    })
 }
 
 /// CR 601.2g-h: Admit an ordinary cast and derive its payment mode from the

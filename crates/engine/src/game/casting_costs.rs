@@ -11768,15 +11768,28 @@ fn largest_x_satisfying(formula_max: u32, predicate: impl Fn(u32) -> bool) -> u3
         hi = hi.saturating_mul(2).max(hi.saturating_add(1));
     }
 
-    // Bisect `[lo, hi]` with invariant `predicate(lo)` true, `predicate(hi)`
-    // false. `lo` starts at 0 (proven true above). Returns the top of the prefix.
+    largest_x_satisfying_at_most(hi - 1, predicate)
+}
+
+/// Largest `x` not exceeding `max` for which a monotone true-prefix predicate
+/// holds. Unlike `largest_x_satisfying`, this never probes above the caller's
+/// declared bound, which is required when a payment contribution is capped by
+/// a spell's remaining generic cost.
+pub(super) fn largest_x_satisfying_at_most(max: u32, predicate: impl Fn(u32) -> bool) -> u32 {
+    if !predicate(0) {
+        return 0;
+    }
+
+    // Bisect `[lo, hi]` with invariant `predicate(lo)` true; `hi` is the
+    // caller-provided inclusive cap and need not itself fail.
     let mut lo = 0u32;
-    while hi - lo > 1 {
-        let mid = lo + (hi - lo) / 2;
+    let mut hi = max;
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
         if predicate(mid) {
             lo = mid;
         } else {
-            hi = mid;
+            hi = mid - 1;
         }
     }
     lo
@@ -12127,13 +12140,9 @@ pub fn enter_payment_step(
 
     // CR 601.2h: Auto-finalize only when the shared choice-free classifier
     // proves the real Auto payer can complete the locked obligation.
-    if let Some(pending) = state
-        .pending_cast
-        .as_ref()
-        .map(|pending| pending.as_ref().clone())
-    {
-        let tap_payment_mode = eligible_tap_payment_mode(state, player, &pending, convoke_mode);
-        if choice_free_auto_payment_verdict(&pending, tap_payment_mode, || {
+    let should_auto_finalize = state.pending_cast.as_ref().is_some_and(|pending| {
+        let tap_payment_mode = eligible_tap_payment_mode(state, player, pending, convoke_mode);
+        choice_free_auto_payment_verdict(pending, tap_payment_mode, || {
             super::casting::can_pay_cost_after_auto_tap(
                 state,
                 player,
@@ -12141,9 +12150,9 @@ pub fn enter_payment_step(
                 &pending.cost,
             )
         }) == Some(true)
-        {
-            return finalize_automatic_mana_payment(state, player, events);
-        }
+    });
+    if should_auto_finalize {
+        return finalize_automatic_mana_payment(state, player, events);
     }
 
     Ok(WaitingFor::ManaPayment {
