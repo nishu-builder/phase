@@ -227,7 +227,7 @@ impl SimulationFilter {
             // cost that permits casting without paying the spell's mana cost.
             // Its resolver, rather than ordinary post-origin mana payment, is
             // authoritative for that action's affordability.
-            if !matches!(candidate.action, GameAction::CastSpell { .. }) {
+            if matches!(candidate.action, GameAction::CastSpellForFree { .. }) {
                 return true;
             }
 
