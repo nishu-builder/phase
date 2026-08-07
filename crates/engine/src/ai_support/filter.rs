@@ -223,6 +223,14 @@ impl SimulationFilter {
                 return false;
             }
 
+            // CR 118.6a: `CastSpellForFree` has already selected an alternative
+            // cost that permits casting without paying the spell's mana cost.
+            // Its resolver, rather than ordinary post-origin mana payment, is
+            // authoritative for that action's affordability.
+            if !matches!(candidate.action, GameAction::CastSpell { .. }) {
+                return true;
+            }
+
             let Some((after, pending)) = pending_spell_root(&sim) else {
                 return true;
             };

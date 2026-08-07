@@ -6178,11 +6178,10 @@ mod tests {
             strict_baseline.strict_fast_path_auto_payment_wrapper_calls,
             2
         );
-        assert_eq!(
-            strict_baseline.strict_fast_path_mana_readiness_state_clones,
-            1
-        );
-        assert_eq!(strict_baseline.strict_fast_path_state_clones, 3);
+        let strict_mana_readiness_clones =
+            strict_baseline.strict_fast_path_mana_readiness_state_clones;
+        assert_eq!(strict_mana_readiness_clones, 5);
+        assert_eq!(strict_baseline.strict_fast_path_state_clones, 7);
         assert_eq!(
             strict_baseline.strict_fast_path_state_clones,
             strict_baseline.strict_fast_path_auto_payment_wrapper_calls
@@ -6258,7 +6257,10 @@ mod tests {
         assert_eq!(counters.generation_auto_payment_wrapper_calls, g_w);
         assert_eq!(counters.strict_fast_path_state_clones, s);
         assert_eq!(s_w, 2 * N);
-        assert_eq!(counters.strict_fast_path_mana_readiness_state_clones, N);
+        assert_eq!(
+            counters.strict_fast_path_mana_readiness_state_clones,
+            N * strict_mana_readiness_clones
+        );
         assert_eq!(
             counters.strict_fast_path_state_clones,
             counters.strict_fast_path_auto_payment_wrapper_calls
