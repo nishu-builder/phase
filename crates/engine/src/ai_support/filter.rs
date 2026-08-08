@@ -36,7 +36,7 @@ use std::sync::Arc;
 use crate::game::combat::AttackTarget;
 use crate::game::engine::SimulationProbeGuard;
 use crate::game::functioning_abilities::game_functioning_statics;
-use crate::game::{casting, keywords, turn_control};
+use crate::game::{casting, casting_costs, keywords, turn_control};
 use crate::types::ability::{
     AbilityCost, AbilityDefinition, AbilityKind, ActivationRestriction, Effect, FilterProp,
     ParitySource, ParsedCondition, QuantityExpr, ReplacementDefinition, ResolvedAbility,
@@ -229,6 +229,18 @@ impl SimulationFilter {
             // auto-payment probe below applies only to paid cast surfaces.
             if matches!(candidate.action, GameAction::CastSpellForFree { .. }) {
                 return true;
+            }
+
+            // A payable alternative cost makes the ordinary CastSpell announcement
+            // legal even when target selection precedes the eventual OptionalCostChoice.
+            // The shared cost authority evaluates both the parsed condition and payment
+            // feasibility, so do not infer this from the action or pending cost.
+            if let GameAction::CastSpell { object_id, .. } = &candidate.action {
+                if casting_costs::payable_spell_alternative_cost(state, semantic_owner, *object_id)
+                    .is_some()
+                {
+                    return true;
+                }
             }
 
             let Some((after, pending)) = pending_spell_root(&sim) else {
