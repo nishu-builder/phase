@@ -5,11 +5,7 @@
   "base_seed": 2654435769,
   "action_cap": 3000,
   "sample_count": 5,
-  "scenarios": [
-    "red-mirror",
-    "affinity-mirror",
-    "enchantress-mirror"
-  ],
+  "scenarios": ["red-mirror", "affinity-mirror", "enchantress-mirror"],
   "counters": {
     "attackable_player_sweeps": 1349,
     "auto_payment_borrowed_wrapper_calls": 11318,

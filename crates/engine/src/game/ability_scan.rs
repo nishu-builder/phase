@@ -229,6 +229,7 @@ fn resolved_ability_axes(a: &ResolvedAbility, mode: ScanMode) -> Axes {
         targets: _,                // concrete announced target refs (already resolved)
         source_id: _,              // object id
         source_incarnation: _,     // self-transform epoch latch, no dynamic read
+        noted_mana_payment: _,     // concrete activation-payment snapshot, no dynamic read
         trigger_source: _,         // exact triggered-source authority, no dynamic read
         trigger_definition_ref: _, // exact trigger occurrence, no dynamic read
         force_block_attacker: _,   // exact force-block referent, no dynamic read
@@ -798,6 +799,8 @@ fn scan_effect(x: &Effect, mode: ScanMode) -> Axes {
         Effect::TimeTravel => Axes::NONE,
         Effect::BecomeMonarch => Axes::NONE,
         Effect::NoOp => Axes::NONE,
+        // Captured at activation time; no resolution-time dynamic read.
+        Effect::NoteManaSpent => Axes::NONE,
         Effect::Proliferate => Axes::NONE,
         Effect::ProliferateTarget { target } => {
             let mut acc = Axes::NONE;
@@ -4999,6 +5002,14 @@ fn scan_mana_production(p: &ManaProduction, mode: ScanMode) -> Axes {
         | ManaProduction::AnyInCommandersColorIdentity { count, .. } => {
             scan_quantity_expr(count, mode)
         }
+        // `NotedManaSpent` is mutable per-object state written by a companion
+        // `Effect::NoteManaSpent`, so sibling activations can affect its value.
+        ManaProduction::NotedType { count } => Axes {
+            event: false,
+            sibling: true,
+            projected: false,
+        }
+        .or(scan_quantity_expr(count, mode)),
         // SCOPED-OBJECT (Omnath, Locus of All): a SINGLE scoped object's colors,
         // NOT a board aggregate — the scope's own read surface is the sole sibling
         // source (CR 202.2c). NO own sibling literal.
@@ -5363,6 +5374,7 @@ fn effect_target_ctx(e: &Effect, mode: ScanMode) -> FilterReadContext {
         | Effect::TimeTravel
         | Effect::BecomeMonarch
         | Effect::NoOp
+        | Effect::NoteManaSpent
         | Effect::Proliferate
         | Effect::ProliferateTarget { .. }
         | Effect::Populate
@@ -5767,6 +5779,7 @@ fn effect_census_role(e: &Effect) -> CensusRole {
         | Effect::TimeTravel
         | Effect::BecomeMonarch
         | Effect::NoOp
+        | Effect::NoteManaSpent
         | Effect::Proliferate
         | Effect::ProliferateTarget { .. }
         | Effect::Populate
@@ -6000,6 +6013,7 @@ pub(crate) fn effect_is_randomness_bearing(e: &Effect) -> bool {
         | Effect::TimeTravel
         | Effect::BecomeMonarch
         | Effect::NoOp
+        | Effect::NoteManaSpent
         | Effect::Proliferate
         | Effect::ProliferateTarget { .. }
         | Effect::Populate
@@ -7358,6 +7372,22 @@ mod tests {
         // by comparing revealed mana values — unpredictable at pin time (CR 732.2a) ⇒ true.
         // Revert-probe: moving `Effect::Clash` back to the non-randomness arm flips this to false.
         assert!(effect_is_randomness_bearing(&Effect::Clash));
+    }
+
+    #[test]
+    fn noted_mana_effect_is_read_free_and_deterministic() {
+        let effect = Effect::NoteManaSpent;
+        let axes = scan_effect(&effect, ScanMode::LoopFirewall);
+        assert!(!axes.event && !axes.sibling && !axes.projected);
+        assert_eq!(
+            effect_target_ctx(&effect, ScanMode::LoopFirewall),
+            FilterReadContext::SnapshotOrEvent
+        );
+        assert_eq!(
+            effect_census_role(&effect),
+            CensusRole::Relax(RelaxReason::BoundedOrNoPopulation)
+        );
+        assert!(!effect_is_randomness_bearing(&effect));
     }
 
     #[test]

@@ -3409,6 +3409,7 @@ fn legacy_effect(x: &Effect) -> bool {
         | Effect::RegisterBending { .. }
         | Effect::Cleanup { .. }
         | Effect::Learn
+        | Effect::NoteManaSpent
         | Effect::Forage
         | Effect::Harness
         | Effect::CollectEvidence { .. }
@@ -3743,6 +3744,7 @@ fn walk_ability(
         distribution: _,
         chosen_x: _,
         cost_paid_object: _,
+        noted_mana_payment: _, // concrete captured payment snapshot, no read/write effect
         cost_paid_object_ids: _,
         effect_context_object: _,
         amassed_army_object: _,
@@ -5654,6 +5656,7 @@ fn rw_effect(
         | Effect::Harness
         | Effect::ChooseAndSacrificeRest { .. }
         | Effect::RememberCard { .. }
+        | Effect::NoteManaSpent
         | Effect::ForEachCategory { .. }
         | Effect::VentureInto { .. }
         | Effect::TakeTheInitiative
