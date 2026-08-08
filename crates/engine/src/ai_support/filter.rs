@@ -223,6 +223,14 @@ impl SimulationFilter {
                 return false;
             }
 
+            // CR 118.9a: This action entered through a named permission whose
+            // casting pipeline has already replaced the mana cost. Its successful
+            // simulation is the legality authority; the ordinary post-origin
+            // auto-payment probe below applies only to paid cast surfaces.
+            if matches!(candidate.action, GameAction::CastSpellForFree { .. }) {
+                return true;
+            }
+
             let Some((after, pending)) = pending_spell_root(&sim) else {
                 return true;
             };
