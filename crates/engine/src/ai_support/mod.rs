@@ -6342,7 +6342,11 @@ mod tests {
                 + counters.strict_fast_path_mana_readiness_state_clones,
             "the full strict path must preserve the fixed owner composition"
         );
-        assert_eq!(counters.raw_validation_state_clones, N + 1);
+        assert_eq!(
+            counters.raw_validation_state_clones, N,
+            "each cast reaches the fallback simulation; the mana activation uses its \
+             structural fast path"
+        );
         assert_eq!(counters.grouped_mana_readiness_state_clones, r);
         assert!(grouped_actions.get(&source).is_some_and(|actions| {
             actions.iter().any(|action| {

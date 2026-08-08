@@ -223,17 +223,16 @@ impl SimulationFilter {
                 return false;
             }
 
-            // CR 118.6a: `CastSpellForFree` has already selected an alternative
-            // cost that permits casting without paying the spell's mana cost.
-            // Its resolver, rather than ordinary post-origin mana payment, is
-            // authoritative for that action's affordability.
-            if matches!(candidate.action, GameAction::CastSpellForFree { .. }) {
-                return true;
-            }
-
             let Some((after, pending)) = pending_spell_root(&sim) else {
                 return true;
             };
+            // CR 118.6a: A selected free-cast permission is represented by the
+            // prepared spell's `NoCost`, including silent unlimited permissions
+            // that arrive through the ordinary `CastSpell` action. The prepared
+            // cost, rather than the action variant, is authoritative here.
+            if matches!(pending.cost, ManaCost::NoCost) {
+                return true;
+            }
             if before == Some(after) {
                 return true;
             }
