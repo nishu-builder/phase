@@ -6367,7 +6367,9 @@ mod tests {
         assert_eq!(counters.post_apply_auto_payment_core_calls, N);
         assert_eq!(counters.post_apply_auto_payment_core_state_clones, 0);
         assert_eq!(counters.post_apply_uncached_source_collections, N);
-        let expected_raw_validation_clones = N + 1;
+        // The mana activation is accepted by its structural fast path, so only
+        // the N spell candidates reach fallback simulation.
+        let expected_raw_validation_clones = N;
         let expected_priority_probe_state_clones = 1;
         let total = counters.generation_state_clones
             + counters.strict_fast_path_state_clones

@@ -226,6 +226,13 @@ impl SimulationFilter {
             let Some((after, pending)) = pending_spell_root(&sim) else {
                 return true;
             };
+            // CR 601.2b: An optional alternative-cost choice is part of the
+            // casting process. The announced spell is legal when it reaches
+            // this decision, even when paying its printed cost would not be.
+            // The selected free branch will replace that cost before payment.
+            if matches!(sim.waiting_for, WaitingFor::OptionalCostChoice { .. }) {
+                return true;
+            }
             // CR 118.6a: A selected free-cast permission is represented by the
             // prepared spell's `NoCost`, including silent unlimited permissions
             // that arrive through the ordinary `CastSpell` action. The prepared
