@@ -4172,6 +4172,20 @@ mod tests {
     /// satisfiable, so a lone source classifies as `ManaSourcePenalty::Sacrifices`
     /// and is activatable. Colorless mana models the Eldrazi-Spawn/altar class.
     fn add_sac_for_mana_source(state: &mut GameState, controller: PlayerId) -> ObjectId {
+        add_sac_for_mana_source_producing(
+            state,
+            controller,
+            ManaProduction::Colorless {
+                count: QuantityExpr::Fixed { value: 1 },
+            },
+        )
+    }
+
+    fn add_sac_for_mana_source_producing(
+        state: &mut GameState,
+        controller: PlayerId,
+        produced: ManaProduction,
+    ) -> ObjectId {
         use crate::types::ability::{TypeFilter, TypedFilter};
         let id = create_object(
             state,
@@ -4186,9 +4200,7 @@ mod tests {
         let ability = AbilityDefinition::new(
             AbilityKind::Activated,
             Effect::Mana {
-                produced: ManaProduction::Colorless {
-                    count: QuantityExpr::Fixed { value: 1 },
-                },
+                produced,
                 restrictions: vec![],
                 grants: vec![],
                 expiry: None,
@@ -4260,6 +4272,69 @@ mod tests {
                 .object_id,
             spell
         );
+    }
+
+    #[test]
+    fn sacrificial_colored_requirement_preserves_source_choice_despite_generic_mana() {
+        let mut state = setup_priority();
+        state.phase = Phase::PreCombatMain;
+        let source = add_sac_for_mana_source_producing(
+            &mut state,
+            PlayerId(0),
+            ManaProduction::Fixed {
+                colors: vec![ManaColor::Red],
+                contribution: ManaContribution::Base,
+            },
+        );
+        let forest = create_land(&mut state, "Forest", &[]);
+        add_fixed_mana_ability(&mut state, forest, ManaColor::Green);
+        let spell = create_object(
+            &mut state,
+            CardId(7_011),
+            PlayerId(0),
+            "Sacrificial Red Requirement".to_string(),
+            Zone::Hand,
+        );
+        {
+            let object = state.objects.get_mut(&spell).unwrap();
+            object.card_types.core_types.push(CoreType::Instant);
+            object.base_card_types = object.card_types.clone();
+            object.mana_cost = ManaCost::Cost {
+                shards: vec![ManaCostShard::Red],
+                generic: 1,
+            };
+            let definition = AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Draw {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                },
+            );
+            Arc::make_mut(&mut object.abilities).push(definition.clone());
+            Arc::make_mut(&mut object.base_abilities).push(definition);
+        }
+
+        let action = candidate_actions(&state)
+            .into_iter()
+            .find_map(|candidate| match candidate.action {
+                action @ GameAction::CastSpell {
+                    object_id,
+                    payment_mode:
+                        crate::types::game_state::CastPaymentMode::AutoExceptSacrificialMana,
+                    ..
+                } if object_id == spell => Some(action),
+                _ => None,
+            })
+            .expect("a mandatory sacrificial color source must preserve source choice");
+        assert!(legal_actions_full(&state).0.contains(&action));
+        apply_as_current(&mut state, action).expect("cast must reach mana-source choice");
+        let WaitingFor::ManaSourceSelection { options, .. } = &state.waiting_for else {
+            panic!("the generic-only Forest must not make the sacrificial red source automatic")
+        };
+        assert!(state.objects[&forest].tapped);
+        assert!(options
+            .iter()
+            .any(|option| option.source.object_id == source));
     }
 
     #[test]

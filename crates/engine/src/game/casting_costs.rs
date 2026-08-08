@@ -10601,6 +10601,22 @@ pub(super) fn auto_tap_non_sacrificial_mana_sources(
     );
 }
 
+/// CR 601.2g-h + CR 605.3b: Test the production first leg of
+/// `AutoExceptSacrificialMana` without committing its irreversible choices.
+/// A cost that remains unpaid here requires an explicit sacrificial-source
+/// selection rather than the ordinary automatic finalizer.
+pub(crate) fn spell_cost_is_payable_after_non_sacrificial_auto_tap(
+    state: &GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+    cost: &ManaCost,
+) -> bool {
+    let mut simulated = state.clone();
+    let mut events = Vec::new();
+    auto_tap_non_sacrificial_mana_sources(&mut simulated, player, cost, &mut events, source_id);
+    spell_cost_is_payable_from_pool(&simulated, player, source_id, cost)
+}
+
 pub(crate) fn spell_cost_is_payable_from_pool(
     state: &GameState,
     player: PlayerId,

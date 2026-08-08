@@ -15218,23 +15218,18 @@ pub(crate) fn payment_mode_for_prepared_spell_cost(
             )
         })
         .unwrap_or_else(|| cost.clone());
-    let mut relevant_sources = mana_source_selections.iter().filter(|selection| {
+    let has_relevant_sacrificial_source = mana_source_selections.iter().any(|selection| {
         selection
             .restrictions
             .iter()
             .all(|restriction| restriction.allows(&spell_ctx))
             && mana_source_selection_can_contribute_to_cost(selection, &residual, any_color)
+            && selection.penalty == super::mana_sources::ManaSourcePenalty::Sacrifices
     });
-    if relevant_sources
-        .any(|selection| selection.penalty == super::mana_sources::ManaSourcePenalty::Sacrifices)
-        && !mana_source_selections.iter().any(|selection| {
-            selection.penalty != super::mana_sources::ManaSourcePenalty::Sacrifices
-                && selection
-                    .restrictions
-                    .iter()
-                    .all(|restriction| restriction.allows(&spell_ctx))
-                && mana_source_selection_can_contribute_to_cost(selection, &residual, any_color)
-        })
+    if has_relevant_sacrificial_source
+        && !super::casting_costs::spell_cost_is_payable_after_non_sacrificial_auto_tap(
+            state, player, source_id, cost,
+        )
     {
         CastPaymentMode::AutoExceptSacrificialMana
     } else {
