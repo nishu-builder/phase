@@ -221,6 +221,96 @@ fn tchaka_monarch_activation_gated_on_owning_commander() {
     );
 }
 
+const DEADLY_ROLLICK_ORACLE: &str =
+    "If you control a commander, you may cast this spell without paying its mana cost.\nExile target creature.";
+
+const DEADLY_ROLLICK_NAME: &str = "Deadly Rollick";
+
+#[derive(Clone, Copy)]
+enum AnyCommanderSetup {
+    OwnOnBattlefield,
+    StolenOnBattlefield,
+    NoCommander,
+}
+
+fn deadly_rollick_scenario(setup: AnyCommanderSetup) -> (GameRunner, ObjectId, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+
+    let rollick = scenario
+        .add_spell_to_hand_from_oracle(P0, DEADLY_ROLLICK_NAME, true, DEADLY_ROLLICK_ORACLE)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Black],
+            generic: 3,
+        })
+        .id();
+    let bystander = scenario.add_creature(P1, "Bystander", 1, 1).id();
+
+    let battlefield_commander = match setup {
+        AnyCommanderSetup::OwnOnBattlefield | AnyCommanderSetup::StolenOnBattlefield => {
+            Some(scenario.add_creature(P0, "Regal Vanguard", 3, 3).id())
+        }
+        AnyCommanderSetup::NoCommander => None,
+    };
+
+    let mut runner = scenario.build();
+    if let Some(commander) = battlefield_commander {
+        let commander = runner
+            .state_mut()
+            .objects
+            .get_mut(&commander)
+            .expect("commander object exists");
+        commander.is_commander = true;
+        if matches!(setup, AnyCommanderSetup::StolenOnBattlefield) {
+            commander.owner = P1;
+        }
+    }
+
+    (runner, rollick, bystander)
+}
+
+fn ordinary_cast_offered(runner: &GameRunner, spell: ObjectId) -> bool {
+    legal_actions(runner.state()).iter().any(|action| {
+        matches!(
+            action,
+            GameAction::CastSpell { object_id, .. } if *object_id == spell
+        )
+    })
+}
+
+#[test]
+fn deadly_rollick_ordinary_cast_offer_requires_controlling_any_commander() {
+    let (runner, rollick, _) = deadly_rollick_scenario(AnyCommanderSetup::OwnOnBattlefield);
+    assert!(
+        ordinary_cast_offered(&runner, rollick),
+        "an owned commander must enable the ordinary CastSpell offer with an empty mana pool"
+    );
+
+    let (runner, rollick, _) = deadly_rollick_scenario(AnyCommanderSetup::NoCommander);
+    assert!(
+        !ordinary_cast_offered(&runner, rollick),
+        "without a commander, Deadly Rollick's unpayable printed cost must not be offered"
+    );
+}
+
+#[test]
+fn deadly_rollick_stolen_commander_enables_ordinary_free_cast_and_resolution() {
+    let (mut runner, rollick, bystander) =
+        deadly_rollick_scenario(AnyCommanderSetup::StolenOnBattlefield);
+    assert!(
+        ordinary_cast_offered(&runner, rollick),
+        "a controlled opponent-owned commander must enable the ordinary CastSpell offer"
+    );
+
+    let outcome = runner
+        .cast(rollick)
+        .accept_optional()
+        .target_object(bystander)
+        .resolve();
+
+    outcome.assert_zone(&[bystander], Zone::Exile);
+}
+
 /// Stage three cards atop P0's library: an artifact and a land (both eligible for
 /// the "artifact or land card" filter) and a sorcery (ineligible). Types are set
 /// via double-cast so each card carries exactly one core type.
