@@ -18163,7 +18163,7 @@ mod stage2_injector_tests {
 
         assert_eq!(
             producers.len() + readers.len() + in_test,
-            42,
+            41,
             "CR 603.5 prompt census drifted. A new PRODUCER must have its recipient bound \
              somewhere — the mint's conjunct (a) covers exactly ONE of them. A new READER is \
              the benign case (U4's own consumption arm was one): adjudicate it in this doc and \
@@ -18192,9 +18192,9 @@ mod stage2_injector_tests {
         // partition assert below before this total could absorb it.
         assert_eq!(
             (producers.len(), readers.len(), in_test),
-            (5, 8, 29),
+            (5, 8, 28),
             "the partition, not just the total: five PRODUCTION producers, eight PRODUCTION \
-             readers (they read `state.waiting_for` and never write it), 29 `#[cfg(test)]` lines.\nproducers={producers:#?}\n\
+             readers (they read `state.waiting_for` and never write it), 28 `#[cfg(test)]` lines.\nproducers={producers:#?}\n\
              readers={readers:#?}"
         );
         assert_eq!(
