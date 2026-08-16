@@ -18673,9 +18673,9 @@ mod stage2_injector_tests {
                 // trust looks like — and it is why the two prose entries are BOTH kept
                 // rather than one overwriting the other: they are separate witnesses, not
                 // duplicates.
-                "game/effects/mod.rs:6922".to_string(),
-                "game/effects/mod.rs:6999".to_string(),
-                "game/effects/mod.rs:10237".to_string(),
+                "game/effects/mod.rs:6923".to_string(),
+                "game/effects/mod.rs:7000".to_string(),
+                "game/effects/mod.rs:10238".to_string(),
                 // UNMOVED across the rebase, and that is itself evidence the SET did not
                 // move: a census that had gained or lost a producer would not leave this
                 // entry both byte-identical AND at the same coordinate.
