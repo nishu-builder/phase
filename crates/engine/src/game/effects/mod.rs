@@ -2307,6 +2307,9 @@ fn build_reflexive_pending_trigger(
         .description
         .clone()
         .or_else(|| parent.and_then(|parent| parent.description.clone()));
+    // CR 603.3b: a reflexive joins the same APNAP ordering machinery as every
+    // other pending trigger, so it needs its own live ordering timestamp.
+    let timestamp = u32::try_from(state.next_timestamp()).unwrap_or(u32::MAX);
     crate::game::triggers::PendingTrigger {
         source_id,
         controller,
@@ -2322,10 +2325,7 @@ fn build_reflexive_pending_trigger(
         die_result: state.die_result_this_resolution,
         provenance: None,
         ability: Box::new(ability),
-        // CR 603.3b: reflexives from one collection share a turn key; the
-        // stable APNAP sort preserves their collection order without consuming
-        // the global timestamp allocator.
-        timestamp: state.turn_number,
+        timestamp,
     }
 }
 
@@ -14011,8 +14011,23 @@ mod tests {
         assert_eq!(pending.distribute, reflexive.distribute);
         assert_eq!(pending.ability.distribute, reflexive.distribute);
         assert!(pending.ability.condition.is_none());
-        assert_eq!(pending.timestamp, state.turn_number);
-        assert_eq!(state.next_timestamp, 41);
+        assert_eq!(pending.timestamp, 41);
+        assert_eq!(state.next_timestamp, 42);
+    }
+
+    #[test]
+    fn reflexive_construction_preserves_same_controller_ordering_timestamps() {
+        let mut state = GameState::new_two_player(42);
+        state.next_timestamp = 41;
+        let reflexive = reflexive_counter_ability(ObjectId(100));
+
+        let first = build_reflexive_pending_trigger(&mut state, &reflexive, None);
+        let second = build_reflexive_pending_trigger(&mut state, &reflexive, None);
+
+        assert!(
+            first.timestamp < second.timestamp,
+            "CR 603.3b same-controller ordering must retain the distinct live timestamps the trigger sorter consumes"
+        );
     }
 
     // CR 608.2h (#6486): Volcanic Vision — "Return target instant or sorcery card

@@ -21784,16 +21784,25 @@ impl GameState {
                 ability.clear_trigger_identity_recursive();
             }
         }
+        // `PendingTrigger::timestamp` is a live CR 603.3b ordering key. It is
+        // monotonic allocation history, not a difference in the recurring game
+        // position, so normalize it only in this CR 104.4b snapshot. Keeping
+        // the live values preserves APNAP/same-controller ordering in
+        // `game::triggers`.
+        let normalize_pending_trigger = |pending: &mut crate::game::triggers::PendingTrigger| {
+            pending.timestamp = 0;
+            pending.ability.clear_trigger_identity_recursive();
+        };
         if let Some(pt) = clone.pending_trigger.as_mut() {
-            pt.ability.clear_trigger_identity_recursive();
+            normalize_pending_trigger(pt);
         }
         for ctx in clone.deferred_triggers.iter_mut() {
-            ctx.pending.ability.clear_trigger_identity_recursive();
+            normalize_pending_trigger(&mut ctx.pending);
         }
         if let Some(order) = clone.pending_trigger_order.as_mut() {
             for group in order.groups.iter_mut() {
                 for ctx in group.triggers.iter_mut() {
-                    ctx.pending.ability.clear_trigger_identity_recursive();
+                    normalize_pending_trigger(&mut ctx.pending);
                 }
             }
         }
@@ -21808,17 +21817,13 @@ impl GameState {
         // normalization keeps that a non-load-bearing coincidence rather than a
         // hidden precondition of CR 104.4b detection.
         if let Some(resume) = clone.pending_triggered_mana_resume.as_mut() {
-            resume
-                .current
-                .pending
-                .ability
-                .clear_trigger_identity_recursive();
+            normalize_pending_trigger(&mut resume.current.pending);
             for ctx in resume.accepted_tail.iter_mut() {
-                ctx.pending.ability.clear_trigger_identity_recursive();
+                normalize_pending_trigger(&mut ctx.pending);
             }
             for batch in resume.collected_batches.iter_mut() {
                 for ctx in batch.contexts.iter_mut() {
-                    ctx.pending.ability.clear_trigger_identity_recursive();
+                    normalize_pending_trigger(&mut ctx.pending);
                 }
             }
             resume.rules_execution_node =
@@ -27772,6 +27777,36 @@ mod tests {
         assert!(
             loop_states_equal(&base.normalize_for_loop(), &later.normalize_for_loop()),
             "states differing only in volatile counters must confirm as a repeat"
+        );
+    }
+
+    /// CR 104.4b: deferred-trigger timestamps are CR 603.3b scheduling history,
+    /// not a changed recurring position. Their live values must remain distinct
+    /// for ordering, while loop snapshots compare the same pending trigger
+    /// regardless of the allocator position that produced it.
+    #[test]
+    fn normalize_for_loop_canonicalizes_deferred_trigger_timestamps() {
+        let mut first = GameState::new_two_player(7);
+        let source = ObjectId(90_001);
+        first
+            .deferred_triggers
+            .push(PendingTriggerContext::single(ordinary_pending_trigger(
+                source, 11,
+            )));
+        let mut later = first.clone();
+        later.deferred_triggers[0].pending.timestamp = 97;
+
+        assert_ne!(
+            first, later,
+            "fixture must differ in the Eq-compared deferred scheduling timestamp"
+        );
+        let first_normalized = first.normalize_for_loop();
+        let later_normalized = later.normalize_for_loop();
+        assert_eq!(first_normalized.deferred_triggers[0].pending.timestamp, 0);
+        assert_eq!(later_normalized.deferred_triggers[0].pending.timestamp, 0);
+        assert!(
+            loop_states_equal(&first_normalized, &later_normalized),
+            "the volatile deferred ordering timestamp must not hide a recurring state"
         );
     }
 
