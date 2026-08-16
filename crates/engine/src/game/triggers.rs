@@ -34252,6 +34252,7 @@ pub mod tests {
                 options: vec!["P2".to_string()],
                 source: None,
                 persist_player: None,
+                free_entry: None,
             },
             WaitingFor::OptionalEffectChoice {
                 player: PlayerId(0),
