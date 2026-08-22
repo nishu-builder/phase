@@ -599,6 +599,40 @@ impl GameScenario {
         builder
     }
 
+    /// CR 301.1: Add an artifact to the battlefield with abilities parsed from
+    /// Oracle text. Mirrors [`Self::add_land_from_oracle`]; needed when an
+    /// artifact's own registered activated ability is under test.
+    pub fn add_artifact_from_oracle(
+        &mut self,
+        player: PlayerId,
+        name: &str,
+        oracle_text: &str,
+    ) -> CardBuilder<'_> {
+        let card_id = CardId(self.state.next_object_id);
+        let id = create_object(
+            &mut self.state,
+            card_id,
+            player,
+            name.to_string(),
+            Zone::Battlefield,
+        );
+        let ts = self.state.next_timestamp();
+        let entered_turn = self.state.turn_number.saturating_sub(1);
+        let obj = self.state.objects.get_mut(&id).unwrap();
+        obj.card_types.core_types.push(CoreType::Artifact);
+        obj.base_card_types = obj.card_types.clone();
+        obj.timestamp = ts;
+        obj.entered_battlefield_turn = Some(entered_turn);
+        obj.summoning_sick = false;
+
+        let mut builder = CardBuilder {
+            state: &mut self.state,
+            id,
+        };
+        builder.from_oracle_text(oracle_text);
+        builder
+    }
+
     /// Add a creature to hand with abilities parsed from Oracle text.
     pub fn add_creature_to_hand_from_oracle(
         &mut self,

@@ -1354,12 +1354,16 @@ fn scan_effect(x: &Effect) -> Axes {
         Effect::Manifest {
             target,
             count,
+            object_source,
             enters_under,
             profile: _,
         } => {
             let mut acc = Axes::NONE;
             acc = acc.or(scan_target_filter(target));
             acc = acc.or(scan_quantity_expr(count));
+            if let Some(filter) = object_source {
+                acc = acc.or(scan_target_filter(filter));
+            }
             if let Some(x) = enters_under {
                 acc = acc.or(scan_controller_ref(x));
             }

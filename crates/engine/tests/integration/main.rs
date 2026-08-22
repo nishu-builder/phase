@@ -646,6 +646,7 @@ mod saruman_white_hand_amass;
 mod sba_lethal_damage_redirect_single_application;
 mod scarab_god_regression;
 mod screaming_nemesis_life_lock;
+mod scroll_of_fate_manifest_from_hand;
 mod season_points_budget_modal;
 mod seasoned_dungeoneer_initiative_room_trigger;
 mod selenia_vigilance_grant;

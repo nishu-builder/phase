@@ -17486,6 +17486,7 @@ fn lower_subject_predicate_ast(
                 return parsed_clause(Effect::Manifest {
                     target: subject.affected,
                     count,
+                    object_source: None,
                     profile: None,
                     enters_under: None,
                 });

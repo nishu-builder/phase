@@ -11981,6 +11981,11 @@ pub enum Effect {
     Manifest {
         target: TargetFilter,
         count: QuantityExpr,
+        /// CR 701.40a: The objects to manifest. `None` is the library-top
+        /// source. `Some(filter)` names objects selected by an upstream
+        /// `ChooseFromZone` effect, such as Scroll of Fate's hand selection.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        object_source: Option<TargetFilter>,
         /// CR 708.2a: Effect-specified face-down characteristics override
         /// ("They're 2/2 Cyberman artifact creatures."). `None` = the vanilla
         /// 2/2 manifest default (CR 701.40a). The put-clause seeds
