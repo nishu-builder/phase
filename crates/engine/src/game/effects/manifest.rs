@@ -1,5 +1,5 @@
 use crate::game::quantity::resolve_quantity_with_targets;
-use crate::types::ability::{Effect, EffectError, EffectKind, ResolvedAbility};
+use crate::types::ability::{Effect, EffectError, EffectKind, ResolvedAbility, TargetFilter};
 use crate::types::events::GameEvent;
 use crate::types::game_state::GameState;
 
@@ -57,6 +57,53 @@ pub fn resolve(
     let profile = profile.unwrap_or_else(crate::types::ability::FaceDownProfile::vanilla_2_2);
 
     match object_source {
+        // CR 701.40a + CR 101.4: Manifest the chain's accumulated TRACKED SET —
+        // the per-player picks an `Each*`-owned `ChooseFromZone` collected
+        // ("up to two target players each manifest two cards from their
+        // hands", Kozilek, the Broken Reality). Unlike Cloak's tracked-set arm
+        // (Expose the Culprit), the members live in non-battlefield zones
+        // (their owners' hands), so `manifest_card` is a real move with no
+        // exile dance. `controller: None` keeps the CR 701.40a owner default —
+        // each card enters under the control of the player who chose it from
+        // their own hand.
+        Some(TargetFilter::TrackedSet { .. }) => {
+            // CR 608.2c: bind the `TrackedSetId(0)` sentinel to the chain's
+            // published pick set (mirrors the Cloak arm).
+            let member_ids: Vec<crate::types::identifiers::ObjectId> =
+                match crate::game::targeting::resolve_tracked_set_sentinel(
+                    state,
+                    TargetFilter::TrackedSet {
+                        id: crate::types::identifiers::TrackedSetId(0),
+                    },
+                ) {
+                    TargetFilter::TrackedSet { id } => state
+                        .tracked_object_sets
+                        .get(&id)
+                        .cloned()
+                        .unwrap_or_default(),
+                    _ => Vec::new(),
+                };
+            // CR 608.2c: the chain's referent now changes hands — the picks
+            // have been read, and what follows ("for each card manifested this
+            // way") must count the MANIFESTED cards, not the chosen ones. Rebind
+            // to a fresh chain set so the shared post-effect publisher records
+            // exactly the manifest results; leaving the pick set in place would
+            // double-count every card (mirrors the fresh-set rebind in
+            // `choose_from_zone::drain_active_per_player_zone_choice`).
+            super::publish_fresh_tracked_set(state, Vec::new());
+            for object_id in member_ids {
+                crate::game::morph::manifest_card(
+                    state,
+                    player,
+                    object_id,
+                    ability.source_id,
+                    profile.clone(),
+                    controller,
+                    events,
+                )
+                .map_err(|e| EffectError::MissingParam(format!("{e}")))?;
+            }
+        }
         // CR 701.40a: Manifest explicit objects forwarded onto
         // `ability.targets` by a parent `ChooseFromZone` (Scroll of Fate's
         // "manifest a card from your hand"). Those cards live in a

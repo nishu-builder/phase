@@ -100,7 +100,7 @@ use crate::types::ability::{
     DoubleTarget, Duration, Effect, EffectOutcomeSignal, EffectScope, FilterProp, GameRestriction,
     GuessSubject, IntensityScope, IterationKindBinding, LibraryPosition, ManaProduction,
     ManaSpendPermission, MultiTargetSpec, NumberDistinctness, ObjectProperty, ObjectScope,
-    OriginConstraint, PlayPermissionInvalidation, PlayerFilter, PlayerRelation, PlayerScope,
+    OriginConstraint, PerPlayerScope, PlayPermissionInvalidation, PlayerFilter, PlayerRelation, PlayerScope,
     PreventionAmount, PreventionScope, ProhibitedActivity, PtValue, QuantityExpr, QuantityRef,
     ReplacementCondition, ReplacementDefinition, RestrictionExpiry, RestrictionPlayerScope,
     RevealUntilDisposition, RoundingMode, SharedQuality, SharedQualityRelation, SkipScope,
@@ -17491,6 +17491,91 @@ fn lower_subject_predicate_ast(
                     enters_under: None,
                 });
             }
+            // CR 701.40a + CR 101.4 + CR 608.2c: "<target players> [each]
+            // manifest[s] <N> card[s] from their hand[s]" (Kozilek, the Broken
+            // Reality). Each targeted player picks the cards from their OWN
+            // hidden hand during resolution: a `ChooseFromZone` iterated over
+            // the chosen player targets (`ZoneOwner::Each(PerPlayerScope::TargetedPlayers)`),
+            // each iteration's choice made by that owner
+            // (`Chooser::OwningPlayer`), accumulating the picks into the
+            // chain's tracked set. The `Manifest` sub-ability then manifests
+            // the accumulated set — each card under its chooser's control
+            // (CR 701.40a owner default) — and a trailing "for each card
+            // manifested this way" rider reads `TrackedSetSize`. Gated to the
+            // targeted-player subject; other from-hand subjects stay honest
+            // gaps.
+            if matches!(affected, TargetFilter::Player) {
+                if let Ok((after_verb, _)) =
+                    alt((tag::<_, _, OracleError<'_>>("manifest "), tag("manifests ")))
+                        .parse(pred_lower.as_str())
+                {
+                    if let Ok((after_count, n)) = nom_primitives::parse_number.parse(after_verb) {
+                        let from_their_hand = all_consuming((
+                            alt((tag::<_, _, OracleError<'_>>(" cards"), tag(" card"))),
+                            tag(" from their hand"),
+                            opt(tag("s")),
+                            opt(tag(".")),
+                        ))
+                        .parse(after_count)
+                        .is_ok();
+                        if from_their_hand {
+                            // CR 115.1 + CR 601.2c: the
+                            // `EachTargetedPlayer` choose declares the player
+                            // slots itself (see `Effect::target_filter`) and
+                            // iterates them in APNAP order, accumulating every
+                            // player's picks into ONE chain tracked set that
+                            // the manifest sub-chain then consumes.
+                            let mut clause = parsed_clause(Effect::ChooseFromZone {
+                                count: n,
+                                zone: Zone::Hand,
+                                additional_zones: Vec::new(),
+                                // CR 115.1 + CR 101.4: the shared
+                                // multi-target PLAYER fan-out already
+                                // resolves this chain once per chosen
+                                // player in APNAP order, narrowing
+                                // `targets` to that one player — so the
+                                // per-iteration zone is simply "the
+                                // targeted player's".
+                                zone_owner: crate::types::ability::ZoneOwner::Each(
+                                    PerPlayerScope::TargetedPlayers,
+                                ),
+                                filter: None,
+                                chooser: crate::types::ability::Chooser::OwningPlayer,
+                                up_to: false,
+                                selection: crate::types::ability::CardSelectionMode::Chosen,
+                                constraint: None,
+                            });
+                            clause.sub_ability = Some(Box::new(AbilityDefinition::new(
+                                AbilityKind::Spell,
+                                Effect::Manifest {
+                                    target: affected.clone(),
+                                    count: QuantityExpr::Fixed { value: n as i32 },
+                                    object_source: Some(TargetFilter::TrackedSet {
+                                        id: crate::types::identifiers::TrackedSetId(0),
+                                    }),
+                                    profile: None,
+                                    enters_under: None,
+                                },
+                            )));
+                            // CR 115.1d: the subject phrase's target count
+                            // ("up to two target players") opens both slots.
+                            clause.multi_target = multi_target.clone();
+                            clause.optional = subject.is_optional;
+                            return clause;
+                        }
+                    }
+                }
+            }
+            // NOTE (issue #6505, review follow-up): the predicate is lowered with
+            // NO parse-time relative-scope pin. An earlier revision pinned
+            // `relative_player_scope = ScopedPlayer` around this whole call, which
+            // re-scoped EVERY "they control" predicate (Sacrifice / Bounce /
+            // PutCounter / UntapAll …) — including non-ChangeZone effects the
+            // runtime `scoped_player` stamp does not cover, leaving them latently
+            // broken. The `ScopedPlayer` rebind is now applied post-lowering to the
+            // moved-object ChangeZone/ChangeZoneAll leg ALONE (see the resolution-
+            // pick rewrite in the player-target wrapper below), so sibling
+            // predicates keep their original scope.
             let mut clause = lower_imperative_clause(&text, ctx);
             // CR 608.2c + CR 109.4 + CR 115.1: "target <filter>'s controller/owner
             // <verb>s it" (Arcum Dagsson, Mercy Killing). `parse_subject_application`

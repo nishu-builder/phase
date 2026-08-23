@@ -46,11 +46,43 @@ pub enum Chooser {
     /// An opponent of the controller makes the choice (CR 608.2e).
     /// In 2-player, the single opponent. In multiplayer, controller chooses which opponent.
     Opponent,
+    /// CR 608.2c + CR 101.4: The player whose zone is being scanned makes the
+    /// choice — the per-iteration owner under an `Each*` zone owner (each
+    /// targeted player picks from their OWN hand, hidden from everyone else:
+    /// Kozilek, the Broken Reality), or the single resolved zone owner
+    /// otherwise.
+    OwningPlayer,
+}
+
+/// CR 101.4 + CR 102.3 + CR 115.1: Which players a [`ZoneOwner::Each`]
+/// iteration walks, in APNAP order. This is the population axis of the
+/// per-player iteration — the machinery (one parked choice per player,
+/// accumulating into the chain's tracked set) is identical for every leaf, so
+/// the population is a parameter rather than a sibling variant.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PerPlayerScope {
+    /// CR 101.4: every player in the game.
+    #[default]
+    AllPlayers,
+    /// CR 102.3: every player OTHER than the ability's controller — the
+    /// population of "for each other player" (Kaya, Spirits' Justice).
+    /// Deliberately NOT "each opponent": CR 102.3 makes a teammate one of the
+    /// "other players on their team" while excluding them from that player's
+    /// opponents, so in a team format a teammate belongs in this population and
+    /// would be wrongly dropped by `players::opponents`. An opponent-scoped
+    /// population is a different leaf, to be added here (resolved through
+    /// `players::opponents`) when a card's wording asks for one.
+    OtherPlayers,
+    /// CR 115.1: every player chosen as a `Player` target of the resolving
+    /// ability. CR 601.2c: an "up to N" selection may be empty, which disposes
+    /// the iteration immediately.
+    TargetedPlayers,
 }
 
 /// CR 400.1 + CR 608.2c: Which player's zone supplies cards for a direct
 /// zone choice during resolution.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(from = "ZoneOwnerRepr", into = "ZoneOwnerRepr")]
 pub enum ZoneOwner {
     /// The controller of the spell/ability owns the referenced zone.
     #[default]
@@ -64,21 +96,14 @@ pub enum ZoneOwner {
     /// pool is "permanents owned by the voter". For Battlefield, filters
     /// by `obj.owner` (ownership) rather than `obj.controller` (control).
     ScopedPlayer,
-    /// CR 101.4 + CR 608.2c: Every player owns a referenced zone, iterated in
-    /// APNAP order. A `ChooseFromZone { zone_owner: EachPlayer }` parks one
-    /// choice per player, drawing candidates from THAT player's zone, and
-    /// accumulates each pick into the resolution chain's tracked object set.
-    /// Building block for Breach the Multiverse ("For each player, choose a
-    /// creature or planeswalker card in that player's graveyard").
-    EachPlayer,
-    /// CR 101.4 + CR 102.2 + CR 608.2c: Every OPPONENT of the controller owns a
-    /// referenced zone, iterated in APNAP order (the controller is excluded).
-    /// The each-opponent leaf of the per-player iteration axis — same
-    /// accumulate-into-tracked-set machinery as [`ZoneOwner::EachPlayer`], but
-    /// the controller's own permanents are never offered. Building block for
-    /// Kaya, Spirits' Justice's −2 ("For each other player, exile up to one
-    /// target creature that player controls").
-    EachOpponent,
+    /// CR 101.4 + CR 608.2c: A per-player iteration — one choice per player of
+    /// the named population, parked in APNAP order, each pick accumulating into
+    /// the resolution chain's tracked object set. The population is the
+    /// variant's own parameter rather than a separate sibling per population
+    /// (Breach the Multiverse iterates every player; Kaya, Spirits' Justice
+    /// every other player; Kozilek, the Broken Reality the chosen player
+    /// targets).
+    Each(PerPlayerScope),
     /// CR 400.1 + CR 607.2a: The referenced zone is scanned across ALL owners —
     /// ownership imposes no restriction, and the effect's `TargetFilter`
     /// performs every bit of scoping. Used when the candidate pool's membership
@@ -90,13 +115,114 @@ pub enum ZoneOwner {
     /// regardless of who owns each card — and Koh typically exiles *opponents'*
     /// creatures, so gating to the controller's own exiled cards empties the
     /// pool. This is the single-pool owner-agnostic leaf of the scope axis:
-    /// distinct from [`ZoneOwner::EachPlayer`]/[`ZoneOwner::EachOpponent`],
+    /// distinct from [`ZoneOwner::Each(PerPlayerScope::AllPlayers)`]/[`ZoneOwner::Each(PerPlayerScope::OtherPlayers)`],
     /// which iterate one prompt per player and accumulate into a tracked set —
     /// this raises ONE prompt over the whole-zone union. Mirrors the
     /// `ScopedPlayer`-on-Battlefield branch in `collect_direct_zone_cards`
     /// (scan broadly, let the filter narrow), but with no owner restriction at
     /// all.
     AllOwners,
+}
+
+/// Serialized form of [`ZoneOwner`], carrying the pre-parameterization unit
+/// names so stored data (game states, generated card data) written before the
+/// per-player population became a parameter still deserializes. Only the
+/// parameterized `Each` form is ever WRITTEN; the three legacy names are
+/// read-only inputs that map onto it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+enum ZoneOwnerRepr {
+    Controller,
+    TargetedPlayer,
+    Opponent,
+    ScopedPlayer,
+    Each(PerPlayerScope),
+    AllOwners,
+    // ---- legacy names (deserialize-only) ----
+    EachPlayer,
+    EachOpponent,
+    EachTargetedPlayer,
+}
+
+impl From<ZoneOwnerRepr> for ZoneOwner {
+    fn from(repr: ZoneOwnerRepr) -> Self {
+        match repr {
+            ZoneOwnerRepr::Controller => ZoneOwner::Controller,
+            ZoneOwnerRepr::TargetedPlayer => ZoneOwner::TargetedPlayer,
+            ZoneOwnerRepr::Opponent => ZoneOwner::Opponent,
+            ZoneOwnerRepr::ScopedPlayer => ZoneOwner::ScopedPlayer,
+            ZoneOwnerRepr::Each(scope) => ZoneOwner::Each(scope),
+            ZoneOwnerRepr::AllOwners => ZoneOwner::AllOwners,
+            ZoneOwnerRepr::EachPlayer => ZoneOwner::Each(PerPlayerScope::AllPlayers),
+            // The legacy name said "Opponent", but the only wording that ever
+            // produced it is "for each other player" — CR 102.3 keeps those
+            // apart, so the migration maps it onto the population it always had.
+            ZoneOwnerRepr::EachOpponent => ZoneOwner::Each(PerPlayerScope::OtherPlayers),
+            ZoneOwnerRepr::EachTargetedPlayer => ZoneOwner::Each(PerPlayerScope::TargetedPlayers),
+        }
+    }
+}
+
+impl From<ZoneOwner> for ZoneOwnerRepr {
+    fn from(owner: ZoneOwner) -> Self {
+        match owner {
+            ZoneOwner::Controller => ZoneOwnerRepr::Controller,
+            ZoneOwner::TargetedPlayer => ZoneOwnerRepr::TargetedPlayer,
+            ZoneOwner::Opponent => ZoneOwnerRepr::Opponent,
+            ZoneOwner::ScopedPlayer => ZoneOwnerRepr::ScopedPlayer,
+            ZoneOwner::Each(scope) => ZoneOwnerRepr::Each(scope),
+            ZoneOwner::AllOwners => ZoneOwnerRepr::AllOwners,
+        }
+    }
+}
+
+#[cfg(test)]
+mod zone_owner_migration_tests {
+    use super::*;
+
+    /// The three pre-parameterization unit names must still deserialize onto
+    /// the parameterized `Each` form — stored game states and generated card
+    /// data written before the refactor carry them.
+    #[test]
+    fn legacy_per_player_zone_owner_names_migrate_onto_the_parameterized_form() {
+        for (legacy, expected) in [
+            (
+                "\"EachPlayer\"",
+                ZoneOwner::Each(PerPlayerScope::AllPlayers),
+            ),
+            (
+                "\"EachOpponent\"",
+                ZoneOwner::Each(PerPlayerScope::OtherPlayers),
+            ),
+            (
+                "\"EachTargetedPlayer\"",
+                ZoneOwner::Each(PerPlayerScope::TargetedPlayers),
+            ),
+        ] {
+            let parsed: ZoneOwner = serde_json::from_str(legacy)
+                .unwrap_or_else(|e| panic!("legacy {legacy} must still deserialize: {e}"));
+            assert_eq!(parsed, expected, "legacy {legacy} maps onto {expected:?}");
+        }
+    }
+
+    /// Only the parameterized form is ever written, and it round-trips.
+    #[test]
+    fn parameterized_zone_owner_round_trips_and_is_the_only_written_form() {
+        let owner = ZoneOwner::Each(PerPlayerScope::TargetedPlayers);
+        let json = serde_json::to_string(&owner).expect("serialize");
+        assert_eq!(
+            json, "{\"Each\":\"TargetedPlayers\"}",
+            "the parameterized form is what gets written"
+        );
+        assert_eq!(
+            serde_json::from_str::<ZoneOwner>(&json).expect("round trip"),
+            owner
+        );
+        // The non-iterating leaves are unchanged unit names.
+        assert_eq!(
+            serde_json::to_string(&ZoneOwner::Controller).expect("serialize"),
+            "\"Controller\""
+        );
+    }
 }
 
 /// CR 105.1 + CR 205.2: A fixed, closed enumeration whose members an effect
@@ -13391,6 +13517,17 @@ impl Effect {
 
     pub fn target_filter(&self) -> Option<&TargetFilter> {
         match self {
+            // CR 115.1 + CR 601.2c: a `ChooseFromZone` is normally a resolution
+            // CHOICE with no stack-declared target — EXCEPT the
+            // `EachTargetedPlayer` iteration, whose iterated set IS the
+            // ability's chosen player targets ("up to two target players each
+            // manifest two cards from their hands"). That form must declare the
+            // player slots so the targets exist to iterate.
+            Effect::ChooseFromZone {
+                zone_owner: ZoneOwner::Each(PerPlayerScope::TargetedPlayers),
+                ..
+            } => Some(&TargetFilter::Player),
+            Effect::ChooseFromZone { .. } => None,
             // --- Effects with a `target: TargetFilter` field ---
             Effect::DealDamage { target, .. }
             | Effect::Draw { target, .. }
@@ -13728,7 +13865,6 @@ impl Effect {
             // target) picked at resolution time via
             // `WaitingFor::ReturnAsAuraTarget`. No stack-push target slot.
             | Effect::ReturnAsAura { .. }
-            | Effect::ChooseFromZone { .. }
             | Effect::ForEachCategory { .. }
             | Effect::ChooseAndSacrificeRest { .. }
             | Effect::EachPlayerCopyChosen { .. }
@@ -20524,12 +20660,12 @@ mod tests {
         assert!(OriginConstraint::Any.matches_from(&Some(Zone::Battlefield)));
     }
 
-    /// CR 101.4 + CR 608.2c (issue #3302): `ZoneOwner::EachPlayer` is a shared
+    /// CR 101.4 + CR 608.2c (issue #3302): `ZoneOwner::Each(PerPlayerScope::AllPlayers)` is a shared
     /// serialized engine type (card-data export, WASM/IPC transport). A
     /// serialize→deserialize round-trip must reproduce the exact variant so a
-    /// Breach the Multiverse `ChooseFromZone { zone_owner: EachPlayer }` survives
-    /// the wire. Every variant is checked so adding `EachPlayer` did not perturb
-    /// the others' tags.
+    /// Breach the Multiverse `ChooseFromZone { zone_owner: Each(AllPlayers) }`
+    /// survives the wire. Every variant is checked so parameterizing the
+    /// per-player population did not perturb the other variants' tags.
     #[test]
     fn zone_owner_serde_round_trips_each_variant() {
         for owner in [
@@ -20537,8 +20673,9 @@ mod tests {
             ZoneOwner::TargetedPlayer,
             ZoneOwner::Opponent,
             ZoneOwner::ScopedPlayer,
-            ZoneOwner::EachPlayer,
-            ZoneOwner::EachOpponent,
+            ZoneOwner::Each(PerPlayerScope::AllPlayers),
+            ZoneOwner::Each(PerPlayerScope::OtherPlayers),
+            ZoneOwner::Each(PerPlayerScope::TargetedPlayers),
             ZoneOwner::AllOwners,
         ] {
             let json = serde_json::to_string(&owner).expect("ZoneOwner serializes");
@@ -20546,14 +20683,18 @@ mod tests {
                 serde_json::from_str(&json).expect("ZoneOwner deserializes");
             assert_eq!(round_tripped, owner, "round-trip must preserve {owner:?}");
         }
-        // The new variant's external tag is its identifier (default enum repr).
+        // The per-player form now carries its population as a parameter, so
+        // its wire shape is the tagged `Each` variant. The pre-parameterization
+        // unit name still DESERIALIZES onto it (see
+        // `zone_owner_migration_tests`), which is what keeps stored data
+        // readable.
         assert_eq!(
-            serde_json::to_string(&ZoneOwner::EachPlayer).unwrap(),
-            "\"EachPlayer\""
+            serde_json::to_string(&ZoneOwner::Each(PerPlayerScope::AllPlayers)).unwrap(),
+            "{\"Each\":\"AllPlayers\"}"
         );
         assert_eq!(
             serde_json::from_str::<ZoneOwner>("\"EachPlayer\"").unwrap(),
-            ZoneOwner::EachPlayer
+            ZoneOwner::Each(PerPlayerScope::AllPlayers)
         );
     }
 

@@ -535,6 +535,7 @@ mod kaysa_green_anthem;
 mod knighthood_first_strike_grant;
 mod knollspine_dragon_target_damage_draw;
 mod kodama_anti_recursion_intervening_if;
+mod kozilek_broken_reality_manifest_from_hands;
 mod krark_clan_ironworks_castability;
 mod krark_thumb_coin_flip;
 mod kutzils_flanker_mode_one_counter;
