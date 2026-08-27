@@ -337,10 +337,57 @@ jobs:
         # PR #2802 ratchet deadlock). PR and merge_group runs remain blocking.
         continue-on-error: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         run: |
+          args=(--fail-on-engine)
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # A fork can legitimately diverge from phase-rs/main's parser
+            # diagnostics. Engine support still gates against the published
+            # baseline here; the next step ratchets diagnostics against this
+            # PR's exact base using the same current MTGJSON corpus.
+            args+=(--skip-diagnostic-ratchet)
+          fi
           ./scripts/coverage-regression-check.sh \
             "https://data.phase-rs.dev/preview/coverage-data.json" \
             data/coverage-data.json \
-            --fail-on-engine
+            "${args[@]}"
+
+      - name: Diagnostic regression check vs PR base
+        if: github.event_name == 'pull_request'
+        run: |
+          BASE="${{ github.event.pull_request.base.sha }}"
+          git fetch --no-tags --depth=1 origin "$BASE"
+
+          base_root="$(mktemp -d)"
+          base_tree="$base_root/tree"
+          cleanup_base() {
+            git worktree remove --force "$base_tree" 2>/dev/null || true
+            rm -rf "$base_root"
+          }
+          trap cleanup_base EXIT
+
+          git worktree add --detach "$base_tree" "$BASE"
+          mkdir -p "$base_tree/data/mtgjson"
+          ln -s "$GITHUB_WORKSPACE/data/mtgjson/AtomicCards.json" \
+            "$base_tree/data/mtgjson/AtomicCards.json"
+
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/base-coverage-target"
+          cargo run \
+            --manifest-path "$base_tree/Cargo.toml" \
+            --profile tool \
+            --features cli \
+            --bin oracle-gen -- \
+            "$base_tree/data/" --stats \
+            > "$base_tree/data/card-data.json"
+          cargo run \
+            --manifest-path "$base_tree/Cargo.toml" \
+            --profile tool \
+            --features cli \
+            --bin coverage-report -- \
+            "$base_tree/data/" --all \
+            > "$RUNNER_TEMP/base-coverage-data.json"
+
+          ./scripts/coverage-regression-check.sh \
+            "$RUNNER_TEMP/base-coverage-data.json" \
+            data/coverage-data.json
 
       - name: Parse-detail diff vs base baseline
         # PR-only review aid (NEVER blocks — continue-on-error): surfaces the

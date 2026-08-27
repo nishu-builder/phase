@@ -8788,11 +8788,26 @@ fn mandatory_additional_cost_preview_classifier_is_deliberately_narrow() {
         zone: Some(Zone::Graveyard),
         filter: None,
     };
+    let fixed_pay_life = AbilityCost::PayLife {
+        amount: QuantityExpr::Fixed { value: 2 },
+    };
+    let fixed_hand_discard = AbilityCost::Discard {
+        count: QuantityExpr::Fixed { value: 1 },
+        filter: None,
+        selection: crate::types::ability::CardSelectionMode::Chosen,
+        self_scope: crate::types::ability::DiscardSelfScope::FromHand,
+    };
     assert!(mandatory_additional_cost_preview_shape_is_supported(
         &fixed_mana
     ));
     assert!(mandatory_additional_cost_preview_shape_is_supported(
         &graveyard_exile
+    ));
+    assert!(mandatory_additional_cost_preview_shape_is_supported(
+        &fixed_pay_life
+    ));
+    assert!(mandatory_additional_cost_preview_shape_is_supported(
+        &fixed_hand_discard
     ));
 
     let excluded = [
@@ -8833,9 +8848,6 @@ fn mandatory_additional_cost_preview_classifier_is_deliberately_narrow() {
         AbilityCost::OneOf {
             costs: vec![fixed_mana],
         },
-        AbilityCost::PayLife {
-            amount: QuantityExpr::Fixed { value: 2 },
-        },
     ];
     for cost in excluded {
         assert!(
@@ -8854,8 +8866,10 @@ fn choice_preview_is_not_applicable_when_either_branch_is_unsupported() {
         AbilityCost::Mana {
             cost: ManaCost::generic(2),
         },
-        AbilityCost::PayLife {
-            amount: QuantityExpr::Fixed { value: 50 },
+        AbilityCost::Exile {
+            count: 1,
+            zone: None,
+            filter: None,
         },
     ));
     add_mana(&mut state, PlayerId(0), ManaType::Colorless, 1);
@@ -8927,7 +8941,7 @@ fn target_constraints_make_the_preview_fail_closed_at_the_legal_action_boundary(
 }
 
 #[test]
-fn required_pay_life_keeps_the_existing_life_gate() {
+fn required_pay_life_is_preview_supported_and_remains_unoffered_when_unpayable() {
     let mut state = setup_game_at_main_phase();
     state.players[0].life = 1;
     let spell = create_generic_creature_in_hand(
@@ -8944,13 +8958,13 @@ fn required_pay_life_keeps_the_existing_life_gate() {
     add_mana(&mut state, PlayerId(0), ManaType::Colorless, 1);
 
     assert!(
-        !mandatory_additional_cost_preview_shape_is_supported(
+        mandatory_additional_cost_preview_shape_is_supported(
             match state.objects[&spell].additional_cost.as_ref().unwrap() {
                 AdditionalCost::Required(cost) => cost,
                 other => panic!("expected Required cost, got {other:?}"),
             }
         ),
-        "PayLife must remain outside the new preview classifier"
+        "fixed PayLife must participate in targeted-spell affordability previews"
     );
     assert!(
         !normal_cast_is_offered(&state, spell),

@@ -10221,7 +10221,7 @@ mod tests {
     #[test]
     fn breach_multiverse_assembles_per_player_reanimation_chain() {
         use super::super::parse_effect_chain;
-        use crate::types::ability::ZoneOwner;
+        use crate::types::ability::{PerPlayerScope, ZoneOwner};
 
         let def = parse_effect_chain(
             "Each player mills ten cards. For each player, choose a creature or planeswalker card in that player's graveyard. Put those cards onto the battlefield under your control. Then each creature you control becomes a Phyrexian in addition to its other types.",
@@ -10279,7 +10279,7 @@ mod tests {
         assert_eq!(*zone, Zone::Graveyard);
         assert_eq!(
             *zone_owner,
-            ZoneOwner::EachPlayer,
+            ZoneOwner::Each(PerPlayerScope::AllPlayers),
             "BLOCKER: 'for each player ... in that player's graveyard' must iterate every player"
         );
         assert_eq!(

@@ -543,8 +543,14 @@ pub fn build_trigger_registry() -> HashMap<TriggerMode, TriggerMatcher> {
 
     // CR 702.49a: Ninjutsu activation trigger
     r.insert(TriggerMode::NinjutsuActivated, match_ninjutsu_activated);
-    // CR 702.107a + CR 702.142b + CR 702.177a: keyword ability activation triggers
-    for tag in [AbilityTag::Boast, AbilityTag::Exhaust, AbilityTag::Outlast] {
+    // CR 702.107a + CR 702.142b + CR 702.177a + CR 702.193a:
+    // keyword ability activation triggers
+    for tag in [
+        AbilityTag::Boast,
+        AbilityTag::Exhaust,
+        AbilityTag::Outlast,
+        AbilityTag::PowerUp,
+    ] {
         r.insert(
             TriggerMode::KeywordAbilityActivated(tag),
             match_keyword_ability_activated,

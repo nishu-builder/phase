@@ -1512,6 +1512,14 @@ fn target_selection_actions_without_simulation(state: &GameState) -> Option<Vec<
         actions.push(GameAction::ChooseTarget { target: None });
     }
 
+    // CR 601.2i: If a cast cannot be completed after target selection begins,
+    // the player must be able to reverse the casting process. The validated
+    // candidate path already adds this action; keep it on the target-selection
+    // fast path as well so transport clients never receive an inescapable cast.
+    if state.waiting_for.has_pending_cast() {
+        actions.push(GameAction::CancelCast);
+    }
+
     Some(actions)
 }
 
@@ -5141,12 +5149,13 @@ mod tests {
 
         assert_eq!(counters.state_clone_for_legality, 0);
         assert_eq!(counters.priority_cast_probe_builds, 0);
-        assert_eq!(actions.len(), 26);
+        assert_eq!(actions.len(), 27);
         assert!(spell_costs.is_empty());
         assert!(grouped.is_empty());
         assert!(actions
             .iter()
             .any(|action| matches!(action, GameAction::ChooseTarget { target: None })));
+        assert!(actions.contains(&GameAction::CancelCast));
     }
 
     #[test]
@@ -5244,7 +5253,13 @@ mod tests {
             crate::game::perf_counters::snapshot().state_clone_for_legality,
             0
         );
-        assert_eq!(actions, vec![GameAction::ChooseTarget { target: None }]);
+        assert_eq!(
+            actions,
+            vec![
+                GameAction::ChooseTarget { target: None },
+                GameAction::CancelCast
+            ]
+        );
     }
 
     /// False-positive sweep (CR 103.5 / TL:R 906.6a): the simultaneous

@@ -687,6 +687,8 @@ export type CastChoice = { type: "Cast" } | { type: "Decline" };
 
 export type AutoMayChoice = { type: "Accept" } | { type: "Decline" };
 
+export type FullControlMode = "Off" | "Held" | "Locked";
+
 export type MayTriggerOrigin =
   | { type: "Printed"; trigger_index: number }
   | { type: "Keyword"; keyword: string };
@@ -1918,6 +1920,7 @@ export type GameAction =
       };
     }
   | { type: "CancelAutoPass" }
+  | { type: "SetFullControl"; data: { mode: FullControlMode } }
   | { type: "SetPhaseStops"; data: { stops: PhaseStop[] } }
   | { type: "SetPriorityYield"; data: { op: PriorityYieldOp } }
   | { type: "SetMayTriggerAutoChoice"; data: { op: MayTriggerAutoChoiceOp } }

@@ -26,11 +26,14 @@
 #                        unexpected wording changes.
 #
 # Usage:
-#   scripts/coverage-regression-check.sh <baseline> <current> [--fail-on-engine]
+#   scripts/coverage-regression-check.sh <baseline> <current> [options]
 #
 #   <baseline>  path OR https URL to main-branch coverage-data.json
 #   <current>   path to the newly produced coverage-data.json
 #   --fail-on-engine  exit 1 if REGRESSED (engine) bucket is non-empty
+#   --skip-diagnostic-ratchet
+#                     report support deltas only; use when diagnostics are
+#                     checked separately against the exact PR base
 #
 # The coverage-data.json layout comes from `coverage-report` (see
 # crates/engine/src/bin/coverage_report.rs): .cards[] with .card_name,
@@ -46,9 +49,21 @@ fi
 BASELINE="$1"
 CURRENT="$2"
 FAIL_ON_ENGINE=0
-if [[ "${3:-}" == "--fail-on-engine" ]]; then
-    FAIL_ON_ENGINE=1
-fi
+SKIP_DIAGNOSTIC_RATCHET=0
+for option in "${@:3}"; do
+    case "$option" in
+        --fail-on-engine)
+            FAIL_ON_ENGINE=1
+            ;;
+        --skip-diagnostic-ratchet)
+            SKIP_DIAGNOSTIC_RATCHET=1
+            ;;
+        *)
+            echo "Unknown option: $option" >&2
+            exit 2
+            ;;
+    esac
+done
 
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT
@@ -186,6 +201,10 @@ if [[ "$FAIL_ON_ENGINE" -eq 1 && "$engine_count" -gt 0 ]]; then
     echo "FAIL: $engine_count cards regressed with new engine-level gaps." >&2
     echo "      Either restore the handler or update the baseline if intentional." >&2
     exit 1
+fi
+
+if [[ "$SKIP_DIAGNOSTIC_RATCHET" -eq 1 ]]; then
+    exit 0
 fi
 
 # Diagnostic count ratchet (D-09): flag regressions in diagnostic categories.

@@ -3,7 +3,7 @@ use crate::parser::parse_oracle_text;
 use crate::types::ability::CardPlayMode::{Cast, Play};
 use crate::types::ability::CastFromZoneDriver::{DuringResolution, LingeringPermission};
 use crate::types::ability::{
-    AttachmentKind, CastManaObjectScope, CastManaSpentMetric, ExcessRecipient,
+    AttachmentKind, CardSelectionMode, CastManaObjectScope, CastManaSpentMetric, ExcessRecipient,
     ForEachCategoryAction, PerpetualModification,
 };
 use crate::types::card_type::CoreType;
@@ -10962,6 +10962,154 @@ fn effect_cloak_a_card_from_your_hand_lowers_to_choose_from_zone_then_cloak() {
 }
 
 #[test]
+fn effect_manifest_a_card_from_your_hand_lowers_to_choose_from_zone_then_manifest() {
+    // CR 701.40a: Scroll of Fate's "Manifest a card from your hand" is NOT a
+    // library-top manifest — it is the manifest twin of Vannifar's cloak form
+    // above: a ChooseFromZone{Hand} parent whose Manifest sub-ability
+    // manifests the chosen object. Reverting the from-hand parser alt() drops
+    // it to Effect::Unimplemented → this fails.
+    let def = parse_effect_chain("Manifest a card from your hand", AbilityKind::Spell);
+    assert!(
+        matches!(
+            def.effect.as_ref(),
+            Effect::ChooseFromZone {
+                count: 1,
+                zone: Zone::Hand,
+                ..
+            }
+        ),
+        "expected ChooseFromZone{{Hand,count:1}} parent, got: {:?}",
+        def.effect
+    );
+    let sub = def
+        .sub_ability
+        .as_ref()
+        .expect("from-hand manifest must chain a Manifest sub-ability");
+    assert!(
+        matches!(
+            sub.effect.as_ref(),
+            Effect::Manifest {
+                object_source: Some(TargetFilter::ParentTarget),
+                enters_under: Some(ControllerRef::You),
+                ..
+            }
+        ),
+        "sub-ability must be Manifest with an explicit object_source and the \
+         CR 110.2a manifester-controls entry (enters_under: You), got: {:?}",
+        sub.effect
+    );
+}
+
+#[test]
+fn kozilek_target_players_each_manifest_two_from_their_hands_parses() {
+    // CR 701.40a: "up to two target players each manifest two cards from
+    // their hands" (Kozilek, the Broken Reality). The subject machinery
+    // already captures the up-to-two player multi-target and the
+    // "For each card manifested this way, you draw a card" rider
+    // (repeat_for: TrackedSetSize); only the per-player from-hand manifest
+    // predicate must lower to a real effect chain. Reverting the predicate
+    // arm drops it to Effect::Unimplemented → this fails.
+    let parsed = parse_oracle_text(
+        "When you cast this spell, up to two target players each manifest two cards from their hands. For each card manifested this way, you draw a card.",
+        "Kozilek, the Broken Reality",
+        &[],
+        &["Creature".to_string()],
+        &["Eldrazi".to_string()],
+    );
+    let trigger = parsed
+        .triggers
+        .first()
+        .expect("the cast trigger must parse");
+    let execute = trigger
+        .execute
+        .as_ref()
+        .expect("the cast trigger must carry a body");
+
+    // CR 115.1 + CR 101.4 + CR 608.2c: the head is the per-player hand
+    // choose — two cards, from HAND, iterated over the chosen player TARGETS,
+    // each pick made by that player (not the caster).
+    assert!(
+        matches!(
+            execute.effect.as_ref(),
+            Effect::ChooseFromZone {
+                count: 2,
+                zone: Zone::Hand,
+                zone_owner: ZoneOwner::Each(PerPlayerScope::TargetedPlayers),
+                chooser: Chooser::OwningPlayer,
+                up_to: false,
+                // CR 608.2d: each player CHOOSES — a regression to a random
+                // or non-choice selection mode must fail here.
+                selection: CardSelectionMode::Chosen,
+                ..
+            }
+        ),
+        "expected the per-player from-hand choose, got: {:?}",
+        execute.effect
+    );
+    // CR 115.1d: both "up to two target players" slots.
+    assert_eq!(
+        execute.multi_target,
+        Some(MultiTargetSpec::up_to(QuantityExpr::Fixed { value: 2 })),
+        "the up-to-two player target slots must survive onto the clause"
+    );
+
+    // CR 701.40a: the sub-chain manifests the accumulated picks.
+    let manifest = execute
+        .sub_ability
+        .as_ref()
+        .expect("the choose must chain a Manifest sub-ability");
+    assert!(
+        matches!(
+            manifest.effect.as_ref(),
+            Effect::Manifest {
+                target: TargetFilter::Player,
+                count: QuantityExpr::Fixed { value: 2 },
+                // CR 608.2c: the manifest must consume THIS chain's picks —
+                // the `TrackedSetId(0)` sentinel the choose publishes into.
+                object_source: Some(TargetFilter::TrackedSet {
+                    id: TrackedSetId(0)
+                }),
+                enters_under: None,
+                ..
+            }
+        ),
+        "the sub-ability must manifest the chain's tracked picks under their \
+         own owners' control, got: {:?}",
+        manifest.effect
+    );
+
+    // CR 608.2c: the pre-existing "for each card manifested this way, you
+    // draw a card" rider still rides behind the manifest, counting the
+    // chain's tracked set.
+    let draw = manifest
+        .sub_ability
+        .as_ref()
+        .expect("the draw rider must survive behind the manifest");
+    assert!(
+        matches!(
+            draw.effect.as_ref(),
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+                ..
+            }
+        ),
+        "expected the one-card draw rider, got: {:?}",
+        draw.effect
+    );
+    assert!(
+        matches!(
+            draw.repeat_for,
+            Some(QuantityExpr::Ref {
+                qty: QuantityRef::TrackedSetSize
+            })
+        ),
+        "the rider must repeat once per tracked (manifested) card, got: {:?}",
+        draw.repeat_for
+    );
+}
+
+#[test]
 fn turn_face_up_then_conditional_put_keeps_follow_up_clause() {
     // CR 406.3 + CR 701.20a: Clone Shell / Summoner's Egg dies-trigger effect. The
     // "turn the exiled card face up" clause must NOT swallow the trailing
@@ -11107,6 +11255,7 @@ fn effect_put_top_onto_battlefield_face_down_lowers_to_manifest() {
     let Effect::Manifest {
         target,
         count,
+        object_source: None,
         profile,
         enters_under,
     } = &*def.effect
@@ -11130,6 +11279,7 @@ fn effect_put_top_onto_battlefield_face_down_lowers_to_manifest() {
             Effect::Manifest {
                 target: TargetFilter::Controller,
                 count: QuantityExpr::Fixed { value: 1 },
+                object_source: None,
                 profile: Some(_),
                 enters_under: None,
             }
@@ -11172,6 +11322,7 @@ fn effect_direct_manifest_top_library_parses_controller_override_only_for_impera
             Effect::Manifest {
                 target: TargetFilter::Controller,
                 count: QuantityExpr::Fixed { value: 1 },
+                object_source: None,
                 enters_under: Some(ControllerRef::You),
                 profile: None,
             }
@@ -11186,6 +11337,7 @@ fn effect_direct_manifest_top_library_parses_controller_override_only_for_impera
             Effect::Manifest {
                 target: TargetFilter::Controller,
                 count: QuantityExpr::Fixed { value: 2 },
+                object_source: None,
                 enters_under: Some(ControllerRef::You),
                 profile: None,
             }
@@ -11208,6 +11360,7 @@ fn effect_direct_manifest_top_library_parses_controller_override_only_for_impera
             Effect::Manifest {
                 target: TargetFilter::TriggeringPlayer,
                 count: QuantityExpr::Fixed { value: 1 },
+                object_source: None,
                 enters_under: Some(ControllerRef::You),
                 profile: None,
             }
@@ -11224,6 +11377,7 @@ fn effect_direct_manifest_top_library_parses_controller_override_only_for_impera
             Effect::Manifest {
                 target: TargetFilter::Controller,
                 count: QuantityExpr::Fixed { value: 1 },
+                object_source: None,
                 enters_under: Some(ControllerRef::You),
                 profile: None,
             }

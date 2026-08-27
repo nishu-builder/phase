@@ -6361,8 +6361,21 @@ fn resolve_chain_body(
     // rider (Court of Cunning — "each mill two … mills ten instead") clears
     // `multi_target` and changes the effect's target filter, which would
     // otherwise skip this branch and resolve only the first chosen player.
+    // CR 101.4: An effect that ALREADY iterates the chosen player targets on
+    // its own (`ChooseFromZone { zone_owner: EachTargetedPlayer }`) is not a
+    // single-player-recipient handler, so it needs no missing iteration layer —
+    // and must not get one: splitting it per player would give each iteration
+    // its own chain tracked set, breaking the single accumulated "this way" set
+    // its sub-chain reads (Kozilek, the Broken Reality).
     if ability.multi_target.is_some()
         && effect_target_filter(&ability.effect) == Some(&TargetFilter::Player)
+        && !matches!(
+            ability.effect,
+            Effect::ChooseFromZone {
+                zone_owner: crate::types::ability::ZoneOwner::Each(_),
+                ..
+            }
+        )
     {
         let chosen_players: Vec<PlayerId> = ability
             .targets
@@ -12000,6 +12013,7 @@ mod tests {
             Effect::Manifest {
                 target: TargetFilter::ParentTargetController,
                 count: QuantityExpr::Fixed { value: 1 },
+                object_source: None,
                 profile: None,
                 enters_under: None,
             },
