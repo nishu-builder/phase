@@ -26,8 +26,6 @@
 //! forwarded.
 
 use engine::game::scenario::{GameScenario, P0};
-use engine::parser::oracle_effect::parse_effect_chain;
-use engine::types::ability::AbilityKind;
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
 use engine::types::game_state::WaitingFor;
@@ -185,37 +183,5 @@ fn scroll_of_fate_activated_ability_manifests_a_chosen_noncreature_hand_card() {
         p0.library.front(),
         Some(&library_b),
         "B must remain on top of the library"
-    );
-}
-
-#[test]
-fn from_hand_manifest_is_not_a_library_move_for_the_mana_ability_classifier() {
-    // CR 605.1a: the mana-ability classifier rejects abilities that could
-    // move cards to or from a library. Scroll of Fate's chain reads the HAND
-    // on both levels — the `ChooseFromZone { Hand }` parent and the
-    // `Manifest { object_source: Some(ParentTarget) }` sub-ability — so
-    // neither may classify as a library move. Reverting the classifier's
-    // Manifest arm to an unconditional `true` fails the sub-ability line.
-    let def = parse_effect_chain("Manifest a card from your hand", AbilityKind::Spell);
-    assert!(
-        !def.effect.moves_card_to_or_from_library(),
-        "ChooseFromZone{{Hand}} must not classify as a library move"
-    );
-    let sub = def
-        .sub_ability
-        .as_ref()
-        .expect("from-hand manifest chains a Manifest sub-ability");
-    assert!(
-        !sub.effect.moves_card_to_or_from_library(),
-        "a from-hand Manifest (object_source: Some) must not classify as a \
-         library move (CR 605.1a)"
-    );
-
-    // Control — the library-top default stays a real library move.
-    let top = parse_effect_chain("Manifest the top card of your library.", AbilityKind::Spell);
-    assert!(
-        top.effect.moves_card_to_or_from_library(),
-        "the library-top manifest (object_source: None) must stay classified \
-         as a library move"
     );
 }

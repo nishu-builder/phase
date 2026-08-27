@@ -100,14 +100,14 @@ use crate::types::ability::{
     DoubleTarget, Duration, Effect, EffectOutcomeSignal, EffectScope, FilterProp, GameRestriction,
     GuessSubject, IntensityScope, IterationKindBinding, LibraryPosition, ManaProduction,
     ManaSpendPermission, MultiTargetSpec, NumberDistinctness, ObjectProperty, ObjectScope,
-    OriginConstraint, PerPlayerScope, PlayPermissionInvalidation, PlayerFilter, PlayerRelation, PlayerScope,
-    PreventionAmount, PreventionScope, ProhibitedActivity, PtValue, QuantityExpr, QuantityRef,
-    ReplacementCondition, ReplacementDefinition, RestrictionExpiry, RestrictionPlayerScope,
-    RevealUntilDisposition, RoundingMode, SharedQuality, SharedQualityRelation, SkipScope,
-    SpellStackToGraveyardReplacement, StaticCondition, StaticDefinition, StepSkipTarget,
-    SubAbilityLink, TapStateChange, TargetFilter, TargetSelectionMode, ThisWayCause,
-    TrackedAnaphorSource, TriggerCondition, TriggerDefinition, TypeFilter, TypedFilter,
-    UnlessPayModifier, UntilCondition, ZoneOwner,
+    OriginConstraint, PerPlayerScope, PlayPermissionInvalidation, PlayerFilter, PlayerRelation,
+    PlayerScope, PreventionAmount, PreventionScope, ProhibitedActivity, PtValue, QuantityExpr,
+    QuantityRef, ReplacementCondition, ReplacementDefinition, RestrictionExpiry,
+    RestrictionPlayerScope, RevealUntilDisposition, RoundingMode, SharedQuality,
+    SharedQualityRelation, SkipScope, SpellStackToGraveyardReplacement, StaticCondition,
+    StaticDefinition, StepSkipTarget, SubAbilityLink, TapStateChange, TargetFilter,
+    TargetSelectionMode, ThisWayCause, TrackedAnaphorSource, TriggerCondition, TriggerDefinition,
+    TypeFilter, TypedFilter, UnlessPayModifier, UntilCondition, ZoneOwner,
 };
 #[cfg(test)]
 use crate::types::ability::{AttackScope, AttackSubject};
@@ -17504,7 +17504,7 @@ fn lower_subject_predicate_ast(
             // manifested this way" rider reads `TrackedSetSize`. Gated to the
             // targeted-player subject; other from-hand subjects stay honest
             // gaps.
-            if matches!(affected, TargetFilter::Player) {
+            if matches!(subject.affected, TargetFilter::Player) {
                 if let Ok((after_verb, _)) =
                     alt((tag::<_, _, OracleError<'_>>("manifest "), tag("manifests ")))
                         .parse(pred_lower.as_str())
@@ -17548,7 +17548,7 @@ fn lower_subject_predicate_ast(
                             clause.sub_ability = Some(Box::new(AbilityDefinition::new(
                                 AbilityKind::Spell,
                                 Effect::Manifest {
-                                    target: affected.clone(),
+                                    target: subject.affected.clone(),
                                     count: QuantityExpr::Fixed { value: n as i32 },
                                     object_source: Some(TargetFilter::TrackedSet {
                                         id: crate::types::identifiers::TrackedSetId(0),
