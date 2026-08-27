@@ -5149,12 +5149,13 @@ mod tests {
 
         assert_eq!(counters.state_clone_for_legality, 0);
         assert_eq!(counters.priority_cast_probe_builds, 0);
-        assert_eq!(actions.len(), 26);
+        assert_eq!(actions.len(), 27);
         assert!(spell_costs.is_empty());
         assert!(grouped.is_empty());
         assert!(actions
             .iter()
             .any(|action| matches!(action, GameAction::ChooseTarget { target: None })));
+        assert!(actions.contains(&GameAction::CancelCast));
     }
 
     #[test]
@@ -5252,7 +5253,13 @@ mod tests {
             crate::game::perf_counters::snapshot().state_clone_for_legality,
             0
         );
-        assert_eq!(actions, vec![GameAction::ChooseTarget { target: None }]);
+        assert_eq!(
+            actions,
+            vec![
+                GameAction::ChooseTarget { target: None },
+                GameAction::CancelCast
+            ]
+        );
     }
 
     /// False-positive sweep (CR 103.5 / TL:R 906.6a): the simultaneous
