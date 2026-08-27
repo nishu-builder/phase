@@ -369,14 +369,21 @@ jobs:
           ln -s "$GITHUB_WORKSPACE/data/mtgjson/AtomicCards.json" \
             "$base_tree/data/mtgjson/AtomicCards.json"
 
-          CARGO_TARGET_DIR="$RUNNER_TEMP/base-coverage-target" \
-            cargo run \
-              --manifest-path "$base_tree/Cargo.toml" \
-              --profile tool \
-              --features cli \
-              --bin coverage-report -- \
-              "$base_tree/data/" --all \
-              > "$RUNNER_TEMP/base-coverage-data.json"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/base-coverage-target"
+          cargo run \
+            --manifest-path "$base_tree/Cargo.toml" \
+            --profile tool \
+            --features cli \
+            --bin oracle-gen -- \
+            "$base_tree/data/" --stats \
+            > "$base_tree/data/card-data.json"
+          cargo run \
+            --manifest-path "$base_tree/Cargo.toml" \
+            --profile tool \
+            --features cli \
+            --bin coverage-report -- \
+            "$base_tree/data/" --all \
+            > "$RUNNER_TEMP/base-coverage-data.json"
 
           ./scripts/coverage-regression-check.sh \
             "$RUNNER_TEMP/base-coverage-data.json" \
