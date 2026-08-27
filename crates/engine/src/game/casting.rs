@@ -12228,6 +12228,7 @@ impl MandatoryObjectCostSearch<'_> {
             let mut simulated = self.state.clone();
             let mut events = Vec::new();
             for object_id in chosen.iter().copied() {
+                // allow-raw-zone: reserves a resource in an affordability-preview clone, not gameplay state
                 super::zones::move_to_zone(
                     &mut simulated,
                     object_id,
