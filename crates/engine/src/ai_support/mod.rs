@@ -1512,6 +1512,14 @@ fn target_selection_actions_without_simulation(state: &GameState) -> Option<Vec<
         actions.push(GameAction::ChooseTarget { target: None });
     }
 
+    // CR 601.2i: If a cast cannot be completed after target selection begins,
+    // the player must be able to reverse the casting process. The validated
+    // candidate path already adds this action; keep it on the target-selection
+    // fast path as well so transport clients never receive an inescapable cast.
+    if state.waiting_for.has_pending_cast() {
+        actions.push(GameAction::CancelCast);
+    }
+
     Some(actions)
 }
 

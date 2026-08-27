@@ -12027,10 +12027,6 @@ fn preview_pending_cast_for_mandatory_additional_cost(
         },
         |ability_def| build_resolved_from_def(ability_def, prepared.object_id, player),
     );
-    if !build_target_slots(state, &ability).ok()?.is_empty() {
-        return None;
-    }
-
     let mut pending = PendingCast::new(
         prepared.object_id,
         prepared.card_id,
@@ -12062,6 +12058,15 @@ fn mandatory_additional_cost_preview_shape_is_supported(cost: &AbilityCost) -> b
         AbilityCost::Exile {
             zone: Some(Zone::Graveyard),
             filter: None,
+            ..
+        } => true,
+        AbilityCost::PayLife {
+            amount: QuantityExpr::Fixed { .. },
+        }
+        | AbilityCost::Discard {
+            count: QuantityExpr::Fixed { .. },
+            filter: None,
+            self_scope: crate::types::ability::DiscardSelfScope::FromHand,
             ..
         } => true,
         AbilityCost::Mana { .. }
@@ -12914,21 +12919,6 @@ pub(super) fn can_feasibly_pay_mana_cost(
     cost: &crate::types::mana::ManaCost,
 ) -> bool {
     can_feasibly_pay_mana_cost_with_probe(state, player, source_id, cost, None)
-}
-
-pub(super) fn has_manual_mana_ability_for_spell_payment(
-    state: &GameState,
-    player: PlayerId,
-    source_id: ObjectId,
-) -> bool {
-    let spell_meta = build_spell_meta(state, player, source_id);
-    let spell_ctx = spell_meta.as_ref().map(PaymentContext::Spell);
-    super::mana_sources::has_activatable_non_tap_mana_ability_for_payment(
-        state,
-        player,
-        Some(source_id),
-        spell_ctx.as_ref(),
-    )
 }
 
 pub(super) fn can_feasibly_pay_mana_cost_with_probe(
