@@ -12113,16 +12113,187 @@ fn preview_mandatory_additional_cost_branch(
     if !mandatory_additional_cost_preview_shape_is_supported(cost) {
         return MandatoryAdditionalCostPreview::NotApplicable;
     }
-    match casting_costs::additional_cost_declaration_is_offerable(
-        state,
-        player,
-        pending,
-        cost.clone(),
-    ) {
-        Ok(true) => MandatoryAdditionalCostPreview::ApplicablePayable,
-        Ok(false) => MandatoryAdditionalCostPreview::ApplicableUnpayable,
-        Err(_) => MandatoryAdditionalCostPreview::NotApplicable,
+
+    // CR 118.3 + CR 601.2f/h: The additional cost and the spell's mana cost
+    // must be payable together, not merely in isolation. Fixed mana additions
+    // already use a combined total. For the supported resource costs, reserve
+    // each possible payment selection in a cloned state before checking the
+    // remaining mana path. This catches shared-resource conflicts such as
+    // exiling the same graveyard cards that a costed mana ability would need.
+    // Lock the total against the pre-payment state per CR 601.2f; moving
+    // resources during 601.2h must not retroactively change cost modifiers.
+    let locked_mana_total =
+        recompute_pending_mana_total(state, player, pending, pending.ability.chosen_x);
+    let jointly_payable = match cost {
+        AbilityCost::Mana { .. } => casting_costs::additional_cost_declaration_is_offerable(
+            state,
+            player,
+            pending,
+            cost.clone(),
+        )
+        .ok(),
+        AbilityCost::Exile {
+            count,
+            zone: Some(Zone::Graveyard),
+            filter: None,
+        } => {
+            let eligible = find_eligible_exile_for_cost_targets(
+                state,
+                player,
+                pending.object_id,
+                ExileCostSourceZone::Graveyard,
+                None,
+            );
+            mandatory_object_cost_selection_leaves_mana_path(
+                state,
+                player,
+                pending,
+                &eligible,
+                *count as usize,
+                Zone::Exile,
+                &locked_mana_total,
+            )
+        }
+        AbilityCost::Discard {
+            count: QuantityExpr::Fixed { value },
+            filter: None,
+            self_scope: crate::types::ability::DiscardSelfScope::FromHand,
+            ..
+        } => {
+            let eligible = find_eligible_discard_targets(state, player, pending.object_id, None);
+            mandatory_object_cost_selection_leaves_mana_path(
+                state,
+                player,
+                pending,
+                &eligible,
+                (*value).max(0) as usize,
+                Zone::Graveyard,
+                &locked_mana_total,
+            )
+        }
+        AbilityCost::PayLife {
+            amount: QuantityExpr::Fixed { value },
+        } => {
+            let mut simulated = state.clone();
+            let mut events = Vec::new();
+            let paid = super::life_costs::pay_life_as_cast_or_activation_cost(
+                &mut simulated,
+                player,
+                (*value).max(0) as u32,
+                &mut events,
+            );
+            Some(
+                matches!(paid, super::life_costs::PayLifeCostResult::Paid { .. })
+                    && mandatory_additional_cost_mana_path_exists(
+                        &simulated,
+                        player,
+                        pending.object_id,
+                        &locked_mana_total,
+                    ),
+            )
+        }
+        _ => None,
+    };
+
+    match jointly_payable {
+        Some(true) => MandatoryAdditionalCostPreview::ApplicablePayable,
+        Some(false) => MandatoryAdditionalCostPreview::ApplicableUnpayable,
+        None => MandatoryAdditionalCostPreview::NotApplicable,
     }
+}
+
+fn mandatory_additional_cost_mana_path_exists(
+    state: &GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+    total: &ManaCost,
+) -> bool {
+    total.is_without_paying_mana()
+        || can_feasibly_pay_mana_cost(state, player, Some(source_id), total)
+}
+
+struct MandatoryObjectCostSearch<'a> {
+    state: &'a GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+    eligible: &'a [ObjectId],
+    count: usize,
+    destination: Zone,
+    locked_mana_total: &'a ManaCost,
+}
+
+impl MandatoryObjectCostSearch<'_> {
+    fn has_mana_path(&self, start: usize, chosen: &mut Vec<ObjectId>) -> bool {
+        if chosen.len() == self.count {
+            let mut simulated = self.state.clone();
+            let mut events = Vec::new();
+            for object_id in chosen.iter().copied() {
+                super::zones::move_to_zone(
+                    &mut simulated,
+                    object_id,
+                    self.destination,
+                    &mut events,
+                );
+            }
+            return mandatory_additional_cost_mana_path_exists(
+                &simulated,
+                self.player,
+                self.source_id,
+                self.locked_mana_total,
+            );
+        }
+
+        let remaining = self.count - chosen.len();
+        for index in start..=self.eligible.len() - remaining {
+            chosen.push(self.eligible[index]);
+            if self.has_mana_path(index + 1, chosen) {
+                return true;
+            }
+            chosen.pop();
+        }
+        false
+    }
+}
+
+fn mandatory_object_cost_selection_leaves_mana_path(
+    state: &GameState,
+    player: PlayerId,
+    pending: &PendingCast,
+    eligible: &[ObjectId],
+    count: usize,
+    destination: Zone,
+    locked_mana_total: &ManaCost,
+) -> Option<bool> {
+    if eligible.len() < count {
+        return Some(false);
+    }
+
+    // Legal-action generation is a hot path. Preserve the legacy candidate
+    // rather than expanding an adversarially large N-choose-K search. Real
+    // fixed discard/exile costs are normally one or two cards; this bound
+    // covers those ordinary states while keeping the preview deterministic.
+    const MAX_SELECTIONS: usize = 512;
+    let smaller_side = count.min(eligible.len() - count);
+    let mut selection_count = 1usize;
+    for index in 0..smaller_side {
+        selection_count = selection_count.saturating_mul(eligible.len() - index) / (index + 1);
+        if selection_count > MAX_SELECTIONS {
+            return None;
+        }
+    }
+
+    Some(
+        MandatoryObjectCostSearch {
+            state,
+            player,
+            source_id: pending.object_id,
+            eligible,
+            count,
+            destination,
+            locked_mana_total,
+        }
+        .has_mana_path(0, &mut Vec::with_capacity(count)),
+    )
 }
 
 fn preview_mandatory_additional_cost(

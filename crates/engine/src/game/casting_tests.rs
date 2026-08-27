@@ -8583,6 +8583,187 @@ fn cast_spell_action(spell: ObjectId, card_id: u64) -> GameAction {
     }
 }
 
+fn create_rubble_rouser_mana_source(state: &mut GameState, card_id: u64) -> ObjectId {
+    let source = create_object(
+        state,
+        CardId(card_id),
+        PlayerId(0),
+        "Rubble Rouser".to_string(),
+        Zone::Battlefield,
+    );
+    let obj = state.objects.get_mut(&source).unwrap();
+    obj.card_types.core_types.push(CoreType::Creature);
+    obj.has_mana_ability = true;
+    obj.entered_battlefield_turn = Some(1);
+    Arc::make_mut(&mut obj.abilities).push(
+        AbilityDefinition::new(
+            AbilityKind::Activated,
+            Effect::Mana {
+                produced: ManaProduction::Fixed {
+                    colors: vec![ManaColor::Red],
+                    contribution: ManaContribution::Base,
+                },
+                restrictions: vec![],
+                grants: vec![],
+                expiry: None,
+                target: None,
+            },
+        )
+        .cost(AbilityCost::Composite {
+            costs: vec![
+                AbilityCost::Tap,
+                AbilityCost::Exile {
+                    count: 1,
+                    zone: Some(Zone::Graveyard),
+                    filter: None,
+                },
+            ],
+        }),
+    );
+    source
+}
+
+fn create_graveyard_cards(
+    state: &mut GameState,
+    first_card_id: u64,
+    count: usize,
+) -> Vec<ObjectId> {
+    (0..count)
+        .map(|index| {
+            create_object(
+                state,
+                CardId(first_card_id + index as u64),
+                PlayerId(0),
+                format!("Graveyard card {index}"),
+                Zone::Graveyard,
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn stoneglider_is_not_offered_when_exile_branch_consumes_mana_ability_resource() {
+    let mut state = setup_game_at_main_phase();
+    let spell = create_stoneglider_preview_fixture(&mut state, 40_090);
+    create_tap_mana_source(
+        &mut state,
+        "Plains",
+        ManaProduction::Fixed {
+            colors: vec![ManaColor::White],
+            contribution: ManaContribution::Base,
+        },
+    );
+    create_tap_mana_source(
+        &mut state,
+        "Mountain",
+        ManaProduction::Fixed {
+            colors: vec![ManaColor::Red],
+            contribution: ManaContribution::Base,
+        },
+    );
+    let rubble_rouser = create_rubble_rouser_mana_source(&mut state, 40_093);
+    create_graveyard_cards(&mut state, 40_094, 2);
+
+    let mana_ability = &state.objects[&rubble_rouser].abilities[0];
+    assert!(super::super::mana_abilities::is_mana_ability(mana_ability));
+    assert!(mana_ability
+        .cost
+        .as_ref()
+        .unwrap()
+        .is_payable_for_mana_ability(&state, PlayerId(0), rubble_rouser));
+    assert!(super::super::mana_abilities::can_activate_mana_ability_now(
+        &state,
+        PlayerId(0),
+        rubble_rouser,
+        0,
+        mana_ability,
+    ));
+    assert!(
+        can_feasibly_pay_mana_cost(
+            &state,
+            PlayerId(0),
+            Some(spell),
+            &state.objects[&spell].mana_cost,
+        ),
+        "before paying the additional cost, Rubble Rouser appears to supply the third mana"
+    );
+    assert!(
+        !normal_cast_is_offered(&state, spell),
+        "the cast must be suppressed because exiling both graveyard cards leaves Rubble Rouser unable to pay the printed cost"
+    );
+}
+
+#[test]
+fn stoneglider_is_offered_when_exile_branch_can_preserve_mana_ability_resource() {
+    let mut state = setup_game_at_main_phase();
+    let spell = create_stoneglider_preview_fixture(&mut state, 40_080);
+    let plains = create_tap_mana_source(
+        &mut state,
+        "Plains",
+        ManaProduction::Fixed {
+            colors: vec![ManaColor::White],
+            contribution: ManaContribution::Base,
+        },
+    );
+    let mountain = create_tap_mana_source(
+        &mut state,
+        "Mountain",
+        ManaProduction::Fixed {
+            colors: vec![ManaColor::Red],
+            contribution: ManaContribution::Base,
+        },
+    );
+    let rubble_rouser = create_rubble_rouser_mana_source(&mut state, 40_083);
+    let graveyard_cards = create_graveyard_cards(&mut state, 40_084, 3);
+
+    assert!(
+        normal_cast_is_offered(&state, spell),
+        "one graveyard card can remain for Rubble Rouser after the two-card additional cost"
+    );
+
+    apply_as_current(&mut state, cast_spell_action(spell, 40_080))
+        .expect("CastSpell must reach the additional-cost branch decision");
+    apply_as_current(&mut state, GameAction::DecideOptionalCost { pay: true })
+        .expect("choosing the graveyard-exile branch must reach object selection");
+    apply_as_current(
+        &mut state,
+        GameAction::SelectCards {
+            cards: graveyard_cards[..2].to_vec(),
+        },
+    )
+    .expect("preserving one graveyard card must leave a complete mana-payment path");
+    apply_as_current(
+        &mut state,
+        GameAction::ActivateAbility {
+            source_id: rubble_rouser,
+            ability_index: 0,
+        },
+    )
+    .expect("Rubble Rouser must remain activatable during mana payment");
+    apply_as_current(
+        &mut state,
+        GameAction::SelectCards {
+            cards: vec![graveyard_cards[2]],
+        },
+    )
+    .expect("exiling the preserved card for Rubble Rouser must finalize the cast");
+
+    apply_as_current(&mut state, GameAction::TapLandForMana { object_id: plains })
+        .expect("Plains must pay the white shard");
+    apply_as_current(
+        &mut state,
+        GameAction::TapLandForMana {
+            object_id: mountain,
+        },
+    )
+    .expect("Mountain must pay the remaining generic mana and finalize the cast");
+    apply_as_current(&mut state, GameAction::PassPriority)
+        .expect("the funded mana-payment step must finalize the cast");
+
+    assert_eq!(state.objects[&spell].zone, Zone::Stack);
+    assert_eq!(state.objects[&graveyard_cards[2]].zone, Zone::Exile);
+}
+
 #[test]
 fn stoneglider_is_not_offered_when_neither_additional_cost_branch_is_payable() {
     let mut state = setup_game_at_main_phase();
