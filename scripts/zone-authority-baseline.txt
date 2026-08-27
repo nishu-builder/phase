@@ -24,6 +24,7 @@ crates/engine/src/game/augment.rs	combine_card_with_host	mover	1
 crates/engine/src/game/augment.rs	combine_card_with_host	zone-assign	1
 crates/engine/src/game/casting.rs	handle_cancel_cast	mover	1
 crates/engine/src/game/casting.rs	handle_foretell	mover	1
+crates/engine/src/game/casting.rs	has_mana_path	exempt	1
 crates/engine/src/game/casting_costs.rs	finalize_cast_with_phyrexian_choices_inner	mover	1
 crates/engine/src/game/casting_costs.rs	finish_exile_selection_for_cost	mover	1
 crates/engine/src/game/casting_costs.rs	handle_behold_for_cost	mover	1
