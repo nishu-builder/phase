@@ -3,7 +3,7 @@ use crate::parser::parse_oracle_text;
 use crate::types::ability::CardPlayMode::{Cast, Play};
 use crate::types::ability::CastFromZoneDriver::{DuringResolution, LingeringPermission};
 use crate::types::ability::{
-    AttachmentKind, CastManaObjectScope, CastManaSpentMetric, ExcessRecipient,
+    AttachmentKind, CardSelectionMode, CastManaObjectScope, CastManaSpentMetric, ExcessRecipient,
     ForEachCategoryAction, PerpetualModification,
 };
 use crate::types::card_type::CoreType;
