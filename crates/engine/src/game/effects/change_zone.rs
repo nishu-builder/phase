@@ -1,7 +1,8 @@
+#[cfg(test)]
+use crate::game::zones;
 use rand::Rng;
 
 use crate::game::game_object::AttachTarget;
-use crate::game::zones;
 use crate::types::ability::{
     ControllerRef, Duration, Effect, EffectError, EffectKind, FilterProp, LibraryPosition,
     QuantityExpr, ResolvedAbility, TargetChoiceTiming, TargetFilter, TargetRef,
@@ -854,144 +855,161 @@ pub fn resolve(
     // Tracked the same way the mass `resolve_all` path counts, so the chained
     // sub-ability's `QuantityRef::EventContextAmount` resolves correctly.
     let mut moved_count: i32 = 0;
-    for (i, obj_id) in targeted_objects.iter().enumerate() {
-        if dest_zone == Zone::Exile {
-            let acting_player = state
-                .objects
-                .get(obj_id)
-                .map(|obj| obj.controller)
-                .unwrap_or(ability.controller);
-            if crate::game::static_abilities::triggered_cause_sacrifice_or_exile_muzzled(
-                state,
-                ability,
-                *obj_id,
-                acting_player,
-            ) {
-                continue;
-            }
-        }
+    let paused = crate::game::zones::with_departure_suppression(
+        state,
+        events,
+        &targeted_objects,
+        |state, events, owner| {
+            for (i, obj_id) in targeted_objects.iter().enumerate() {
+                if dest_zone == Zone::Exile {
+                    let acting_player = state
+                        .objects
+                        .get(obj_id)
+                        .map(|obj| obj.controller)
+                        .unwrap_or(ability.controller);
+                    if crate::game::static_abilities::triggered_cause_sacrifice_or_exile_muzzled(
+                        state,
+                        ability,
+                        *obj_id,
+                        acting_player,
+                    ) {
+                        continue;
+                    }
+                }
 
-        // CR 608.2c: snapshot the pre-move zone so the post-move check below
-        // counts only objects this move actually relocated to the destination
-        // (a no-op or replacement-prevented move returns `Done` without moving).
-        // Mirrors the mass path's `departed`/`moved_count` accounting and the
-        // drain's resume-side increment.
-        let before_zone = state.objects.get(obj_id).map(|object| object.zone);
-        let moved_to_dest = |state: &GameState| {
-            before_zone != Some(dest_zone)
-                && state
-                    .objects
-                    .get(obj_id)
-                    .is_some_and(|object| object.zone == dest_zone)
-        };
-        let per_obj_ctx = ChangeZoneIterationCtx {
-            enter_with_counters: enter_with_counters_for_object(
-                state,
-                ability,
-                *obj_id,
-                &effect_enter_with_counters,
-                &effect_conditional_enter_with_counters,
-            ),
-            ..ctx.clone()
-        };
-        match process_one_zone_move(state, &per_obj_ctx, *obj_id, events) {
-            ZoneMoveResult::Done => {
-                if moved_to_dest(state) {
-                    moved_count += 1;
+                // CR 608.2c: snapshot the pre-move zone so the post-move check below
+                // counts only objects this move actually relocated to the destination
+                // (a no-op or replacement-prevented move returns `Done` without moving).
+                // Mirrors the mass path's `departed`/`moved_count` accounting and the
+                // drain's resume-side increment.
+                let before_zone = state.objects.get(obj_id).map(|object| object.zone);
+                let moved_to_dest = |state: &GameState| {
+                    before_zone != Some(dest_zone)
+                        && state
+                            .objects
+                            .get(obj_id)
+                            .is_some_and(|object| object.zone == dest_zone)
+                };
+                let per_obj_ctx = ChangeZoneIterationCtx {
+                    enter_with_counters: enter_with_counters_for_object(
+                        state,
+                        ability,
+                        *obj_id,
+                        &effect_enter_with_counters,
+                        &effect_conditional_enter_with_counters,
+                    ),
+                    ..ctx.clone()
+                };
+                match crate::game::zones::with_departure_member(
+                    state,
+                    events,
+                    owner,
+                    *obj_id,
+                    |state, events| process_one_zone_move(state, &per_obj_ctx, *obj_id, events),
+                ) {
+                    ZoneMoveResult::Done => {
+                        if moved_to_dest(state) {
+                            moved_count += 1;
+                        }
+                    }
+                    ZoneMoveResult::NeedsAuraAttachmentChoice => {
+                        if moved_to_dest(state) {
+                            moved_count += 1;
+                        }
+                        state.pending_change_zone_iteration =
+                            Some(crate::types::game_state::PendingChangeZoneIteration {
+                                remaining: targeted_objects[i + 1..].to_vec(),
+                                source_id: ctx.source_id,
+                                controller: ctx.controller,
+                                origin: ctx.origin,
+                                destination: ctx.destination,
+                                enter_transformed: ctx.enter_transformed,
+                                enter_tapped: ctx.enter_tapped,
+                                enters_under_player: ctx.enters_under_player,
+                                enters_attacking: ctx.enters_attacking,
+                                enter_with_counters: ctx.enter_with_counters.clone(),
+                                conditional_enter_with_counters: ctx
+                                    .conditional_enter_with_counters
+                                    .clone(),
+                                duration: ctx.duration.clone(),
+                                track_exiled_by_source: ctx.track_exiled_by_source,
+                                // CR 608.2c: carry the running count so the drain stamps
+                                // `last_effect_count` with the full targeted-move total
+                                // when the resumed iteration completes.
+                                moved_count: Some(moved_count),
+                                // CR 708.2a + CR 708.3: preserve the face-down profile so
+                                // the resumed members of a paused face-down return still
+                                // enter face down.
+                                face_down_profile: ctx.face_down_profile.clone(),
+                                library_placement: ctx.library_placement,
+                                // CR 614.12: preserve the moved-object type gate across a
+                                // further as-enters / replacement pause.
+                                enters_modified_if: ctx.enters_modified_if.clone(),
+                                enter_attached_to: ctx.enter_attached_to,
+                                effect_kind: EffectKind::from(&ability.effect),
+                            });
+                        return true;
+                    }
+                    ZoneMoveResult::NeedsChoice(player) => {
+                        // CR 614.12b + CR 614.1c + CR 614.13: stash the unprocessed targets
+                        // so `drain_pending_change_zone_iteration` resumes the loop after
+                        // the player resolves this replacement. Without the stash, every
+                        // target after the first NeedsChoice would be silently dropped
+                        // (issue #535).
+                        state.pending_change_zone_iteration =
+                            Some(crate::types::game_state::PendingChangeZoneIteration {
+                                remaining: targeted_objects[i + 1..].to_vec(),
+                                source_id: ctx.source_id,
+                                controller: ctx.controller,
+                                origin: ctx.origin,
+                                destination: ctx.destination,
+                                enter_transformed: ctx.enter_transformed,
+                                enter_tapped: ctx.enter_tapped,
+                                enters_under_player: ctx.enters_under_player,
+                                enters_attacking: ctx.enters_attacking,
+                                enter_with_counters: ctx.enter_with_counters.clone(),
+                                conditional_enter_with_counters: ctx
+                                    .conditional_enter_with_counters
+                                    .clone(),
+                                duration: ctx.duration.clone(),
+                                track_exiled_by_source: ctx.track_exiled_by_source,
+                                // CR 608.2c: carry the running count so the drain stamps
+                                // `last_effect_count` with the full targeted-move total
+                                // when the resumed iteration completes.
+                                moved_count: Some(moved_count),
+                                // CR 708.2a + CR 708.3: preserve the face-down profile so
+                                // the resumed members of a paused face-down return still
+                                // enter face down.
+                                face_down_profile: ctx.face_down_profile.clone(),
+                                library_placement: ctx.library_placement,
+                                // CR 614.12: preserve the moved-object type gate across a
+                                // further as-enters / replacement pause.
+                                enters_modified_if: ctx.enters_modified_if.clone(),
+                                enter_attached_to: ctx.enter_attached_to,
+                                effect_kind: EffectKind::from(&ability.effect),
+                            });
+                        // CR 608.2c: this object is paused mid-move on a replacement choice
+                        // and will be delivered by the replacement resume (NOT by the drain's
+                        // `remaining` loop). Record it as in-flight, with its pre-move zone, so
+                        // the drain counts it toward `moved_count` once it reaches the
+                        // destination — otherwise a downstream "that many" undercounts by one.
+                        if let Some(before) = before_zone {
+                            state.pending_change_zone_in_flight = Some((*obj_id, before));
+                        }
+                        // CR 614.12a: park (don't clobber) — a Devour as-enters sacrifice
+                        // may already have surfaced its own `EffectZoneChoice`.
+                        crate::game::replacement::park_waiting_for(state, player);
+                        // EffectResolved is emitted by the drain after the loop completes —
+                        // do NOT emit here.
+                        return true;
+                    }
                 }
             }
-            ZoneMoveResult::NeedsAuraAttachmentChoice => {
-                if moved_to_dest(state) {
-                    moved_count += 1;
-                }
-                state.pending_change_zone_iteration =
-                    Some(crate::types::game_state::PendingChangeZoneIteration {
-                        remaining: targeted_objects[i + 1..].to_vec(),
-                        source_id: ctx.source_id,
-                        controller: ctx.controller,
-                        origin: ctx.origin,
-                        destination: ctx.destination,
-                        enter_transformed: ctx.enter_transformed,
-                        enter_tapped: ctx.enter_tapped,
-                        enters_under_player: ctx.enters_under_player,
-                        enters_attacking: ctx.enters_attacking,
-                        enter_with_counters: ctx.enter_with_counters.clone(),
-                        conditional_enter_with_counters: ctx
-                            .conditional_enter_with_counters
-                            .clone(),
-                        duration: ctx.duration.clone(),
-                        track_exiled_by_source: ctx.track_exiled_by_source,
-                        // CR 608.2c: carry the running count so the drain stamps
-                        // `last_effect_count` with the full targeted-move total
-                        // when the resumed iteration completes.
-                        moved_count: Some(moved_count),
-                        // CR 708.2a + CR 708.3: preserve the face-down profile so
-                        // the resumed members of a paused face-down return still
-                        // enter face down.
-                        face_down_profile: ctx.face_down_profile.clone(),
-                        library_placement: ctx.library_placement,
-                        // CR 614.12: preserve the moved-object type gate across a
-                        // further as-enters / replacement pause.
-                        enters_modified_if: ctx.enters_modified_if.clone(),
-                        enter_attached_to: ctx.enter_attached_to,
-                        effect_kind: EffectKind::from(&ability.effect),
-                    });
-                return Ok(());
-            }
-            ZoneMoveResult::NeedsChoice(player) => {
-                // CR 614.12b + CR 614.1c + CR 614.13: stash the unprocessed targets
-                // so `drain_pending_change_zone_iteration` resumes the loop after
-                // the player resolves this replacement. Without the stash, every
-                // target after the first NeedsChoice would be silently dropped
-                // (issue #535).
-                state.pending_change_zone_iteration =
-                    Some(crate::types::game_state::PendingChangeZoneIteration {
-                        remaining: targeted_objects[i + 1..].to_vec(),
-                        source_id: ctx.source_id,
-                        controller: ctx.controller,
-                        origin: ctx.origin,
-                        destination: ctx.destination,
-                        enter_transformed: ctx.enter_transformed,
-                        enter_tapped: ctx.enter_tapped,
-                        enters_under_player: ctx.enters_under_player,
-                        enters_attacking: ctx.enters_attacking,
-                        enter_with_counters: ctx.enter_with_counters.clone(),
-                        conditional_enter_with_counters: ctx
-                            .conditional_enter_with_counters
-                            .clone(),
-                        duration: ctx.duration.clone(),
-                        track_exiled_by_source: ctx.track_exiled_by_source,
-                        // CR 608.2c: carry the running count so the drain stamps
-                        // `last_effect_count` with the full targeted-move total
-                        // when the resumed iteration completes.
-                        moved_count: Some(moved_count),
-                        // CR 708.2a + CR 708.3: preserve the face-down profile so
-                        // the resumed members of a paused face-down return still
-                        // enter face down.
-                        face_down_profile: ctx.face_down_profile.clone(),
-                        library_placement: ctx.library_placement,
-                        // CR 614.12: preserve the moved-object type gate across a
-                        // further as-enters / replacement pause.
-                        enters_modified_if: ctx.enters_modified_if.clone(),
-                        enter_attached_to: ctx.enter_attached_to,
-                        effect_kind: EffectKind::from(&ability.effect),
-                    });
-                // CR 608.2c: this object is paused mid-move on a replacement choice
-                // and will be delivered by the replacement resume (NOT by the drain's
-                // `remaining` loop). Record it as in-flight, with its pre-move zone, so
-                // the drain counts it toward `moved_count` once it reaches the
-                // destination — otherwise a downstream "that many" undercounts by one.
-                if let Some(before) = before_zone {
-                    state.pending_change_zone_in_flight = Some((*obj_id, before));
-                }
-                // CR 614.12a: park (don't clobber) — a Devour as-enters sacrifice
-                // may already have surfaced its own `EffectZoneChoice`.
-                crate::game::replacement::park_waiting_for(state, player);
-                // EffectResolved is emitted by the drain after the loop completes —
-                // do NOT emit here.
-                return Ok(());
-            }
-        }
+            false
+        },
+    );
+    if paused {
+        return Ok(());
     }
 
     // CR 614.13a: targeted multi-ChangeZone co-entry completed without pausing —
@@ -1532,171 +1550,171 @@ pub fn resolve_all(
     }
 
     let mut moved_count: i32 = 0;
-    let mut departed: Vec<ObjectId> = Vec::new();
-    for (i, obj_id) in matching.iter().enumerate() {
-        let obj_id = *obj_id;
-        // CR 400.3: Each object's actual current zone is the source zone for the
-        // move. Single-zone callers pass `origin_zones = [zone]`; multi-zone
-        // callers (e.g. "search graveyard, hand, and library") let each object's
-        // own zone drive the move so per-zone replacements/triggers fire correctly.
-        let per_object_origin = state
-            .objects
-            .get(&obj_id)
-            .map(|o| o.zone)
-            .unwrap_or(origin_zone);
-        // Mass zone moves don't use enter_transformed; enter_tapped and
-        // controller override are carried for "return ... tapped/under your
-        // control" effects.
-        // CR 122.1 + CR 122.1h: each object enters with the resolved counters
-        // (e.g. a finality counter on Shilgengar's mass return).
-        match execute_zone_move(
-            state,
-            obj_id,
-            per_object_origin,
-            dest_zone,
-            ability.source_id,
-            ability.duration.as_ref(),
-            false,
-            enter_tapped,
-            enters_under_player,
-            &enter_with_counters,
-            face_down_profile.as_ref(),
-            track_exiled_by_source,
-            effect_library_position.clone(),
-            None,
-            events,
-        ) {
-            ZoneMoveResult::Done => {
-                moved_count += 1;
-                // CR 603.10a + CR 608.2f: Collect battlefield-origin objects that
-                // actually left (post-move zone != Battlefield). `execute_zone_move`
-                // returns `Done` even when a replacement Prevented the move, so the
-                // post-move zone check excludes prevented members from the
-                // co-departed group.
-                if per_object_origin == Zone::Battlefield
-                    && state
-                        .objects
-                        .get(&obj_id)
-                        .is_some_and(|o| o.zone != Zone::Battlefield)
-                {
-                    departed.push(obj_id);
-                }
-                // CR 400.7 + CR 608.2c: Track hand-origin exiles separately so
-                // QuantityRef::ExiledFromHandThisResolution can resolve "draws a
-                // card for each card exiled from their hand this way".
-                if per_object_origin == Zone::Hand && dest_zone == Zone::Exile {
-                    state.exiled_from_hand_this_resolution =
-                        state.exiled_from_hand_this_resolution.saturating_add(1);
-                }
-                // CR 610.3: Consume ExileLink after successfully moving the object,
-                // so check_exile_returns won't try to return it again.
-                if matches!(effective_filter, TargetFilter::ExiledBySource) {
-                    state.exile_links.retain(|link| link.exiled_id != obj_id);
+    let paused = crate::game::zones::with_departure_suppression(
+        state,
+        events,
+        &matching,
+        |state, events, owner| {
+            for (i, obj_id) in matching.iter().enumerate() {
+                let obj_id = *obj_id;
+                // Each object's actual current zone is the source zone for the
+                // move. Single-zone callers pass `origin_zones = [zone]`; multi-zone
+                // callers (e.g. "search graveyard, hand, and library") let each object's
+                // own zone drive the move so per-zone replacements/triggers fire correctly.
+                let per_object_origin = state
+                    .objects
+                    .get(&obj_id)
+                    .map(|o| o.zone)
+                    .unwrap_or(origin_zone);
+                // Mass zone moves don't use enter_transformed; enter_tapped and
+                // controller override are carried for "return ... tapped/under your
+                // control" effects.
+                // CR 122.1 + CR 122.1h: each object enters with the resolved counters
+                // (e.g. a finality counter on Shilgengar's mass return).
+                match crate::game::zones::with_departure_member(
+                    state,
+                    events,
+                    owner,
+                    obj_id,
+                    |state, events| {
+                        execute_zone_move(
+                            state,
+                            obj_id,
+                            per_object_origin,
+                            dest_zone,
+                            ability.source_id,
+                            ability.duration.as_ref(),
+                            false,
+                            enter_tapped,
+                            enters_under_player,
+                            &enter_with_counters,
+                            face_down_profile.as_ref(),
+                            track_exiled_by_source,
+                            effect_library_position.clone(),
+                            None,
+                            events,
+                        )
+                    },
+                ) {
+                    ZoneMoveResult::Done => {
+                        moved_count += 1;
+                        // CR 400.7 + CR 608.2c: Track hand-origin exiles separately so
+                        // QuantityRef::ExiledFromHandThisResolution can resolve "draws a
+                        // card for each card exiled from their hand this way".
+                        if per_object_origin == Zone::Hand && dest_zone == Zone::Exile {
+                            state.exiled_from_hand_this_resolution =
+                                state.exiled_from_hand_this_resolution.saturating_add(1);
+                        }
+                        // CR 610.3: Consume ExileLink after successfully moving the object,
+                        // so check_exile_returns won't try to return it again.
+                        if matches!(effective_filter, TargetFilter::ExiledBySource) {
+                            state.exile_links.retain(|link| link.exiled_id != obj_id);
+                        }
+                    }
+                    ZoneMoveResult::NeedsChoice(player) => {
+                        // CR 614.12a + CR 614.13: a Devour as-enters sacrifice surfaced its
+                        // own `EffectZoneChoice` (or a counter-pause replacement choice).
+                        // Stash the unprocessed co-entering members so
+                        // `drain_pending_change_zone_iteration` resumes the mass move after
+                        // the player resolves this choice — without the stash, every member
+                        // after the first NeedsChoice would be silently dropped (issue #535
+                        // class). The drain owns the single trailing EffectResolved, so we do
+                        // NOT emit it here (mirrors the targeted loop's contract).
+                        //
+                        // CR 708.2a + CR 708.3: carry the face-down profile through the
+                        // resume carrier so resumed members of a face-down mass entry (the
+                        // Cyber-Controller class) still enter face down — the drain's mover
+                        // (`process_one_zone_move`) now reads it from the ctx.
+                        state.pending_change_zone_iteration =
+                            Some(crate::types::game_state::PendingChangeZoneIteration {
+                                remaining: matching[i + 1..].to_vec(),
+                                source_id: ability.source_id,
+                                controller: ability.controller,
+                                origin: None,
+                                destination: dest_zone,
+                                enter_transformed: false,
+                                enter_tapped,
+                                enters_under_player,
+                                enters_attacking: false,
+                                // CR 122.1h: resumed members of a paused mass return still
+                                // receive their counters (Shilgengar's finality counter).
+                                enter_with_counters: enter_with_counters.clone(),
+                                conditional_enter_with_counters: vec![],
+                                duration: ability.duration.clone(),
+                                track_exiled_by_source,
+                                moved_count: Some(moved_count),
+                                face_down_profile: face_down_profile.clone(),
+                                library_placement: effect_library_position.clone(),
+                                // CR 614.12: mass zone moves carry no moved-object type gate.
+                                enters_modified_if: None,
+                                enter_attached_to: None,
+                                effect_kind: EffectKind::from(&ability.effect),
+                            });
+                        // CR 608.2c: record the replacement-paused member as in-flight (with
+                        // its pre-move zone) so the drain counts it once delivered — mirrors
+                        // the targeted loop, keeping "that many" correct across a mass-move
+                        // replacement pause.
+                        state.pending_change_zone_in_flight = Some((obj_id, per_object_origin));
+                        crate::game::replacement::park_waiting_for(state, player);
+                        return true;
+                    }
+                    ZoneMoveResult::NeedsAuraAttachmentChoice => {
+                        // CR 303.4f + CR 614.13a: returning an Aura to the battlefield
+                        // surfaces a host-choice prompt (the `ReturnAsAuraTarget`
+                        // WaitingFor is already installed by `execute_zone_move`). Stash
+                        // the unprocessed members so `drain_pending_change_zone_iteration`
+                        // resumes the mass move after the host is chosen — without the
+                        // stash, every member after the Aura was silently dropped, so a
+                        // "return all … from your graveyard" with an Aura among the cards
+                        // returned only the cards before it (issue #2858: Archangel
+                        // Elspeth's −6 "returned only one"). Mirrors the targeted
+                        // multi-object loop above; no `park_waiting_for` (the Aura prompt
+                        // is the pending WaitingFor) and the Devour snapshot is NOT
+                        // cleared — the mass-entry event is no longer terminal here and
+                        // the resumed members may still consume it.
+                        state.pending_change_zone_iteration =
+                            Some(crate::types::game_state::PendingChangeZoneIteration {
+                                remaining: matching[i + 1..].to_vec(),
+                                source_id: ability.source_id,
+                                controller: ability.controller,
+                                origin: None,
+                                destination: dest_zone,
+                                enter_transformed: false,
+                                enter_tapped,
+                                enters_under_player,
+                                enters_attacking: false,
+                                // CR 122.1h: resumed members of a paused mass return still
+                                // receive their counters (Shilgengar's finality counter).
+                                enter_with_counters: enter_with_counters.clone(),
+                                conditional_enter_with_counters: vec![],
+                                duration: ability.duration.clone(),
+                                track_exiled_by_source,
+                                moved_count: Some(moved_count + 1),
+                                // CR 708.2a + CR 708.3: preserve the face-down profile so
+                                // resumed members of a paused face-down mass return enter
+                                // face down.
+                                face_down_profile: face_down_profile.clone(),
+                                library_placement: effect_library_position.clone(),
+                                // CR 614.12: mass zone moves carry no moved-object type gate.
+                                enters_modified_if: None,
+                                enter_attached_to: None,
+                                effect_kind: EffectKind::from(&ability.effect),
+                            });
+                        return true;
+                    }
                 }
             }
-            ZoneMoveResult::NeedsChoice(player) => {
-                // CR 614.12a + CR 614.13: a Devour as-enters sacrifice surfaced its
-                // own `EffectZoneChoice` (or a counter-pause replacement choice).
-                // Stash the unprocessed co-entering members so
-                // `drain_pending_change_zone_iteration` resumes the mass move after
-                // the player resolves this choice — without the stash, every member
-                // after the first NeedsChoice would be silently dropped (issue #535
-                // class). The drain owns the single trailing EffectResolved, so we do
-                // NOT emit it here (mirrors the targeted loop's contract).
-                //
-                // CR 708.2a + CR 708.3: carry the face-down profile through the
-                // resume carrier so resumed members of a face-down mass entry (the
-                // Cyber-Controller class) still enter face down — the drain's mover
-                // (`process_one_zone_move`) now reads it from the ctx.
-                state.pending_change_zone_iteration =
-                    Some(crate::types::game_state::PendingChangeZoneIteration {
-                        remaining: matching[i + 1..].to_vec(),
-                        source_id: ability.source_id,
-                        controller: ability.controller,
-                        origin: None,
-                        destination: dest_zone,
-                        enter_transformed: false,
-                        enter_tapped,
-                        enters_under_player,
-                        enters_attacking: false,
-                        // CR 122.1h: resumed members of a paused mass return still
-                        // receive their counters (Shilgengar's finality counter).
-                        enter_with_counters: enter_with_counters.clone(),
-                        conditional_enter_with_counters: vec![],
-                        duration: ability.duration.clone(),
-                        track_exiled_by_source,
-                        moved_count: Some(moved_count),
-                        face_down_profile: face_down_profile.clone(),
-                        library_placement: effect_library_position.clone(),
-                        // CR 614.12: mass zone moves carry no moved-object type gate.
-                        enters_modified_if: None,
-                        enter_attached_to: None,
-                        effect_kind: EffectKind::from(&ability.effect),
-                    });
-                // CR 608.2c: record the replacement-paused member as in-flight (with
-                // its pre-move zone) so the drain counts it once delivered — mirrors
-                // the targeted loop, keeping "that many" correct across a mass-move
-                // replacement pause.
-                state.pending_change_zone_in_flight = Some((obj_id, per_object_origin));
-                crate::game::replacement::park_waiting_for(state, player);
-                return Ok(());
-            }
-            ZoneMoveResult::NeedsAuraAttachmentChoice => {
-                // CR 303.4f + CR 614.13a: returning an Aura to the battlefield
-                // surfaces a host-choice prompt (the `ReturnAsAuraTarget`
-                // WaitingFor is already installed by `execute_zone_move`). Stash
-                // the unprocessed members so `drain_pending_change_zone_iteration`
-                // resumes the mass move after the host is chosen — without the
-                // stash, every member after the Aura was silently dropped, so a
-                // "return all … from your graveyard" with an Aura among the cards
-                // returned only the cards before it (issue #2858: Archangel
-                // Elspeth's −6 "returned only one"). Mirrors the targeted
-                // multi-object loop above; no `park_waiting_for` (the Aura prompt
-                // is the pending WaitingFor) and the Devour snapshot is NOT
-                // cleared — the mass-entry event is no longer terminal here and
-                // the resumed members may still consume it.
-                state.pending_change_zone_iteration =
-                    Some(crate::types::game_state::PendingChangeZoneIteration {
-                        remaining: matching[i + 1..].to_vec(),
-                        source_id: ability.source_id,
-                        controller: ability.controller,
-                        origin: None,
-                        destination: dest_zone,
-                        enter_transformed: false,
-                        enter_tapped,
-                        enters_under_player,
-                        enters_attacking: false,
-                        // CR 122.1h: resumed members of a paused mass return still
-                        // receive their counters (Shilgengar's finality counter).
-                        enter_with_counters: enter_with_counters.clone(),
-                        conditional_enter_with_counters: vec![],
-                        duration: ability.duration.clone(),
-                        track_exiled_by_source,
-                        moved_count: Some(moved_count + 1),
-                        // CR 708.2a + CR 708.3: preserve the face-down profile so
-                        // resumed members of a paused face-down mass return enter
-                        // face down.
-                        face_down_profile: face_down_profile.clone(),
-                        library_placement: effect_library_position.clone(),
-                        // CR 614.12: mass zone moves carry no moved-object type gate.
-                        enters_modified_if: None,
-                        enter_attached_to: None,
-                        effect_kind: EffectKind::from(&ability.effect),
-                    });
-                return Ok(());
-            }
-        }
+            false
+        },
+    );
+    if paused {
+        return Ok(());
     }
     // CR 614.13a: the whole co-entry event completed without pausing — clear the
     // pre-entry Devour snapshot (its lifetime = this one ChangeZone-to-battlefield
     // event). NOT cleared on the NeedsChoice pause above (the paused devourer's
     // sacrifice + remaining co-entering members still need it).
     let _ = state.devour_eligible_snapshot.take();
-
-    // CR 603.10a + CR 608.2f: Every battlefield-origin object that left did so as
-    // part of the same mass zone-change event, so leaves-the-battlefield observers
-    // among the departed group observe each other via last-known information.
-    zones::mark_simultaneous_departures(events, &departed);
 
     // CR 608.2c: "that many" in a later instruction refers back to the prior
     // action's count. Record the number of objects moved so downstream

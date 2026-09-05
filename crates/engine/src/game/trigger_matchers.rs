@@ -1,3 +1,4 @@
+use super::trigger_suppression::ActiveSuppressTriggerStatic;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
@@ -1065,6 +1066,8 @@ fn zone_change_clause_matches(
     record: &crate::types::game_state::ZoneChangeRecord,
     source_id: ObjectId,
     state: &GameState,
+    trigger: &TriggerDefinition,
+    legacy_death_suppressors: Option<&[ActiveSuppressTriggerStatic]>,
 ) -> bool {
     // CR 603.6c + CR 111.1: A zone-change event's `from` is `None` when the
     // object was created directly in `to` (token creation / emblem). Any
@@ -1093,6 +1096,34 @@ fn zone_change_clause_matches(
             return false;
         }
     }
+    if *from == Some(Zone::Battlefield) && *to == Zone::Graveyard {
+        // CR 603.10 + CR 603.6c: Timing belongs to the matching clause,
+        // independently of other clauses in the same definition.
+        let suppressed = match origin {
+            OriginConstraint::Any => {
+                // A destination-functioning self-arrival ability sees the new
+                // card, rather than a creature dying (CR 603.6c).
+                let self_arrival = source_id == record.object_id
+                    && matches!(valid_card, Some(TargetFilter::SelfRef))
+                    && trigger.trigger_zones.contains(to);
+                !self_arrival && super::trigger_suppression::death_suppressed_after(state, record)
+            }
+            OriginConstraint::Equals(Zone::Battlefield) => {
+                super::trigger_suppression::death_suppressed_before(state, record)
+            }
+            OriginConstraint::Equals(_) => false, // Rejected by matches_from above.
+            OriginConstraint::NotEquals(_) | OriginConstraint::OneOf(_) => {
+                // Ambiguous/restricted origins retain each consumer's legacy
+                // policy: ordinary live cache; registered delayed bypass.
+                legacy_death_suppressors.is_some_and(|active| {
+                    super::trigger_suppression::legacy_death_suppressed(state, record, active)
+                })
+            }
+        };
+        if suppressed {
+            return false;
+        }
+    }
     true
 }
 
@@ -1102,6 +1133,16 @@ pub(super) fn match_changes_zone(
     trigger: &TriggerDefinition,
     source_id: ObjectId,
     state: &GameState,
+) -> bool {
+    match_changes_zone_with_context(event, trigger, source_id, state, None)
+}
+
+fn match_changes_zone_with_context(
+    event: &GameEvent,
+    trigger: &TriggerDefinition,
+    source_id: ObjectId,
+    state: &GameState,
+    legacy_death_suppressors: Option<&[ActiveSuppressTriggerStatic]>,
 ) -> bool {
     if let GameEvent::ZoneChanged {
         object_id: _,
@@ -1127,6 +1168,8 @@ pub(super) fn match_changes_zone(
                     record,
                     source_id,
                     state,
+                    trigger,
+                    legacy_death_suppressors,
                 )
             });
         }
@@ -1151,9 +1194,33 @@ pub(super) fn match_changes_zone(
             record,
             source_id,
             state,
+            trigger,
+            legacy_death_suppressors,
         )
     } else {
         false
+    }
+}
+
+pub(super) fn match_for_ordinary_collection(
+    matcher: TriggerMatcher,
+    event: &GameEvent,
+    trigger: &TriggerDefinition,
+    source_id: ObjectId,
+    state: &GameState,
+    active: &[ActiveSuppressTriggerStatic],
+) -> bool {
+    match trigger.mode {
+        TriggerMode::ChangesZone
+        | TriggerMode::ChangesZoneAll
+        | TriggerMode::Evolve
+        | TriggerMode::EntersOrHauntedCreatureDies => {
+            match_changes_zone_with_context(event, trigger, source_id, state, Some(active))
+        }
+        TriggerMode::LeavesBattlefield => {
+            match_leaves_battlefield_with_context(event, trigger, source_id, state, Some(active))
+        }
+        _ => matcher(event, trigger, source_id, state),
     }
 }
 
@@ -2798,7 +2865,10 @@ pub(super) fn match_unattach(
                 && unattach_target_matches(trigger, old_target, state, source_id)
         }
         GameEvent::ZoneChanged {
-            object_id, from, ..
+            object_id,
+            from,
+            to,
+            record,
         } if *from == Some(Zone::Battlefield) => {
             let old_target = TargetRef::Object(*object_id);
             valid_card_matches(trigger, state, source_id, source_id)
@@ -2810,6 +2880,9 @@ pub(super) fn match_unattach(
                     .and_then(|t| t.as_object())
                     .map(|attached| attached == *object_id)
                     .unwrap_or(false)
+                // CR 603.10c: Only the death-caused fallback looks back here.
+                && (*to != Zone::Graveyard
+                    || !super::trigger_suppression::death_suppressed_before(state, record))
         }
         _ => false,
     }
@@ -3430,6 +3503,16 @@ pub(super) fn match_leaves_battlefield(
     source_id: ObjectId,
     state: &GameState,
 ) -> bool {
+    match_leaves_battlefield_with_context(event, trigger, source_id, state, None)
+}
+
+fn match_leaves_battlefield_with_context(
+    event: &GameEvent,
+    trigger: &TriggerDefinition,
+    source_id: ObjectId,
+    state: &GameState,
+    legacy_death_suppressors: Option<&[ActiveSuppressTriggerStatic]>,
+) -> bool {
     if let GameEvent::ZoneChanged {
         from, to, record, ..
     } = event
@@ -3453,6 +3536,8 @@ pub(super) fn match_leaves_battlefield(
             record,
             source_id,
             state,
+            trigger,
+            legacy_death_suppressors,
         )
     } else {
         false

@@ -147,4 +147,5 @@ pub fn match_haunted_creature_dies(
         return false;
     }
     haunted_creature(state, source_id) == Some(*object_id)
+        && !super::trigger_suppression::death_suppressed_before(state, record)
 }

@@ -116,7 +116,6 @@ pub fn resolve(
         // CR 603.10a: the permanents this sweep sacrifices left the battlefield
         // together — stamp the sub-slice so a co-departing leaves-the-battlefield
         // observer among them observes the rest.
-        let before = events.len();
         sacrifice_unchosen(
             state,
             &[],
@@ -126,7 +125,6 @@ pub fn resolve(
             ability.controller,
             events,
         );
-        crate::game::zones::stamp_simultaneous_from_slice(state, &mut events[before..]);
         events.push(GameEvent::EffectResolved {
             kind: EffectKind::ChooseAndSacrificeRest,
             source_id: ability.source_id,
@@ -158,7 +156,6 @@ pub fn resolve(
         if remaining_players.is_empty() {
             // CR 603.10a: co-departing observer among the sacrificed group
             // observes the rest — stamp the sweep's sub-slice.
-            let before = events.len();
             sacrifice_unchosen(
                 state,
                 &kept,
@@ -168,7 +165,6 @@ pub fn resolve(
                 ability.controller,
                 events,
             );
-            crate::game::zones::stamp_simultaneous_from_slice(state, &mut events[before..]);
             events.push(GameEvent::EffectResolved {
                 kind: EffectKind::ChooseAndSacrificeRest,
                 source_id: ability.source_id,
@@ -294,7 +290,6 @@ pub(crate) fn step_total_power(
     let Some((&current_player, rest)) = players_remaining.split_first() else {
         // CR 603.10a: all choices made — sacrifice the unchosen as one event so a
         // co-departing leaves-the-battlefield observer among them sees the rest.
-        let before = events.len();
         sacrifice_unchosen(
             state,
             &all_kept,
@@ -304,7 +299,6 @@ pub(crate) fn step_total_power(
             source_controller,
             events,
         );
-        crate::game::zones::stamp_simultaneous_from_slice(state, &mut events[before..]);
         events.push(GameEvent::EffectResolved {
             kind: EffectKind::ChooseAndSacrificeRest,
             source_id,
@@ -404,7 +398,6 @@ pub(crate) fn advance_to_next_player(
     if remaining.is_empty() {
         // CR 603.10a: terminal APNAP sweep — the sacrificed group left the
         // battlefield together, so stamp this sub-slice for co-departing observers.
-        let before = events.len();
         sacrifice_unchosen(
             state,
             &all_kept,
@@ -414,7 +407,6 @@ pub(crate) fn advance_to_next_player(
             controller,
             events,
         );
-        crate::game::zones::stamp_simultaneous_from_slice(state, &mut events[before..]);
         events.push(GameEvent::EffectResolved {
             kind: EffectKind::ChooseAndSacrificeRest,
             source_id,
@@ -555,26 +547,45 @@ fn sacrifice_unchosen(
         })
         .collect();
 
-    for obj_id in to_sacrifice {
-        let controller = state
-            .objects
-            .get(&obj_id)
-            .map(|obj| obj.controller)
-            .unwrap_or(state.active_player);
-        // Use the sacrifice primitive directly — single authority for sacrifice.
-        match crate::game::sacrifice::sacrifice_permanent(state, obj_id, controller, events) {
-            Ok(crate::game::sacrifice::SacrificeOutcome::Complete) => {}
-            Ok(crate::game::sacrifice::SacrificeOutcome::NeedsReplacementChoice(player)) => {
-                state.waiting_for =
-                    crate::game::replacement::replacement_choice_waiting_for(player, state);
-                // Replacement choice will resume; remaining sacrifices happen after.
-                return;
+    crate::game::zones::with_departure_suppression(
+        state,
+        events,
+        &to_sacrifice,
+        |state, events, owner| {
+            for obj_id in to_sacrifice.iter().copied() {
+                let controller = state
+                    .objects
+                    .get(&obj_id)
+                    .map(|obj| obj.controller)
+                    .unwrap_or(state.active_player);
+                // Use the sacrifice primitive directly — single authority for sacrifice.
+                match crate::game::zones::with_departure_member(
+                    state,
+                    events,
+                    owner,
+                    obj_id,
+                    |state, events| {
+                        crate::game::sacrifice::sacrifice_permanent(
+                            state, obj_id, controller, events,
+                        )
+                    },
+                ) {
+                    Ok(crate::game::sacrifice::SacrificeOutcome::Complete) => {}
+                    Ok(crate::game::sacrifice::SacrificeOutcome::NeedsReplacementChoice(
+                        player,
+                    )) => {
+                        state.waiting_for =
+                            crate::game::replacement::replacement_choice_waiting_for(player, state);
+                        // Replacement choice will resume; remaining sacrifices happen after.
+                        return;
+                    }
+                    Err(_) => {
+                        // Object may have left the battlefield; skip silently.
+                    }
+                }
             }
-            Err(_) => {
-                // Object may have left the battlefield; skip silently.
-            }
-        }
-    }
+        },
+    );
 }
 
 fn dedupe_object_ids(ids: &mut Vec<ObjectId>) {

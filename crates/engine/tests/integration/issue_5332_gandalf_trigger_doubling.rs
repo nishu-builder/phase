@@ -107,6 +107,7 @@ fn gandalf_parsed_static_doubles_legendary_reentry_triggers() {
         from: Some(Zone::Exile),
         to: Zone::Battlefield,
         record: Box::new(ZoneChangeRecord {
+            trigger_suppression: None,
             object_id: norin,
             name: "Norin the Wary".to_string(),
             core_types: vec![CoreType::Creature],

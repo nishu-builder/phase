@@ -1584,6 +1584,41 @@ mod tests {
     }
 
     #[test]
+    fn zone_change_suppression_preserves_missing_empty_and_captured_history() {
+        use crate::types::game_state::TriggerSuppressionSnapshot;
+        use crate::types::statics::SuppressedTriggerEvent;
+        for snapshot in [
+            None,
+            Some(TriggerSuppressionSnapshot::default()),
+            Some(TriggerSuppressionSnapshot {
+                before: vec![SuppressedTriggerEvent::Dies],
+                after: vec![],
+            }),
+        ] {
+            let event = GameEvent::ZoneChanged {
+                object_id: ObjectId(5),
+                from: Some(Zone::Battlefield),
+                to: Zone::Graveyard,
+                record: Box::new(ZoneChangeRecord {
+                    trigger_suppression: snapshot.clone(),
+                    ..ZoneChangeRecord::test_minimal(
+                        ObjectId(5),
+                        Some(Zone::Battlefield),
+                        Zone::Graveyard,
+                    )
+                }),
+            };
+            let json = serde_json::to_value(&event).unwrap();
+            assert_eq!(
+                json["data"]["record"].get("trigger_suppression").is_some(),
+                snapshot.is_some()
+            );
+            let restored: GameEvent = serde_json::from_value(json).unwrap();
+            assert_eq!(restored, event);
+        }
+    }
+
+    #[test]
     fn game_over_with_winner_roundtrips() {
         let event = GameEvent::GameOver {
             winner: Some(PlayerId(1)),

@@ -242,6 +242,20 @@ pub(super) fn apply_action_boundary_with_stack_limit(
     state.consumed_before_priority_trigger_events.clear();
     check_actor_authorization(state, actor, &action)?;
     let action_class = action.automation_class();
+    // CR 104.3a: pending payment cannot prevent an authorized concession.
+    // These independent actions retain their existing downstream permission gates.
+    if action_class != ActionAutomationClass::OutOfBandPreference
+        && !matches!(
+            action,
+            GameAction::CancelCast
+                | GameAction::Concede { .. }
+                | GameAction::Debug(_)
+                | GameAction::GrantDebugPermission { .. }
+                | GameAction::RevokeDebugPermission { .. }
+        )
+    {
+        super::casting_costs::validate_pending_deferred_sacrifice_components(state)?;
+    }
     // Snapshot the stopped priority decision before dispatch. A one-shot stop
     // is consumed only after this exact authenticated in-band rules action
     // succeeds, even if that action advances the phase.

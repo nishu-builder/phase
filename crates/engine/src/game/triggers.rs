@@ -1,3 +1,6 @@
+use super::trigger_suppression::{
+    active_suppress_trigger_statics, etb_event_is_suppressed_cached, ActiveSuppressTriggerStatic,
+};
 use std::collections::{HashMap, HashSet};
 
 use crate::database::synthesis::KeywordTriggerInstaller;
@@ -220,12 +223,6 @@ struct OffZoneTriggerSourceCache {
     granted_keyword_triggers: HashMap<ObjectId, Vec<(KeywordKind, TriggerDefinition)>>,
 }
 
-struct ActiveSuppressTriggerStatic {
-    source_id: ObjectId,
-    source_filter: TargetFilter,
-    events: Vec<SuppressedTriggerEvent>,
-}
-
 /// A trigger that has been collected and is queued for stack placement.
 ///
 /// CR 113.2c + CR 603.2 + CR 603.3b: Each instance of a printed triggered
@@ -289,13 +286,18 @@ fn matching_batched_trigger_events(
     event_batch
         .iter()
         .filter(|candidate| {
-            !event_is_suppressed_by_static_triggers_cached(
-                state,
+            !etb_event_is_suppressed_cached(state, candidate, active_suppress_triggers)
+        })
+        .filter(|candidate| {
+            super::trigger_matchers::match_for_ordinary_collection(
+                matcher,
                 candidate,
+                trig_def,
+                obj_id,
+                state,
                 active_suppress_triggers,
             )
         })
-        .filter(|candidate| matcher(candidate, trig_def, obj_id, state))
         .filter(|candidate| {
             trig_def.condition.as_ref().is_none_or(|condition| {
                 check_trigger_condition(state, condition, controller, Some(obj_id), Some(candidate))
@@ -768,7 +770,14 @@ fn collect_matching_triggers_inner(
             continue;
         }
         if let Some(matcher) = trigger_matcher(trig_def.mode.clone()) {
-            if !matcher(event, trig_def, obj_id, state) {
+            if !super::trigger_matchers::match_for_ordinary_collection(
+                matcher,
+                event,
+                trig_def,
+                obj_id,
+                state,
+                active_suppress_triggers,
+            ) {
                 continue;
             }
             if !check_trigger_constraint(state, trig_def, obj_id, trig_idx, controller, event) {
@@ -1092,88 +1101,10 @@ fn storm_copy_count_before_cast(state: &GameState) -> i32 {
         .saturating_sub(1) as i32
 }
 
-/// CR 603.2g + CR 603.6a + CR 700.4: Check whether an event's trigger-firing
-/// should be suppressed by any active `SuppressTriggers` static on the battlefield.
-///
-/// Only matches ZoneChanged events that correspond to ETB (to=Battlefield) or Dies
-/// (from=Battlefield, to=Graveyard). The suppression tests the event's *subject*
-/// (the entering/dying permanent) against the static's `source_filter`, matching
-/// official Torpor Orb rulings: a creature entering suppresses every ETB trigger
-/// in response — including observer triggers on other permanents.
-///
-/// CR 603.10a: Filter evaluation uses the event's `ZoneChangeRecord`
-/// (last-known-information snapshot) rather than live `state.objects` — for Dies
-/// events the subject has already left the battlefield and its live type data may
-/// no longer reflect the pre-change state.
-///
-/// Replacement effects (CR 614) are unaffected — they run in a different phase.
-/// Static "enters with" / "enters tapped" / "as X enters" effects (CR 603.6d) are
-/// also unaffected because they are static abilities, not triggered ones.
-fn active_suppress_trigger_statics(state: &GameState) -> Vec<ActiveSuppressTriggerStatic> {
-    // CR 702.26b + CR 604.1: `battlefield_active_statics` owns the phased-out /
-    // command-zone / condition gate so Torpor Orb phased out no longer silently
-    // suppresses ETB triggers.
-    super::functioning_abilities::battlefield_active_statics(state)
-        .filter_map(|(bf_obj, def)| {
-            let StaticMode::SuppressTriggers {
-                source_filter,
-                events,
-            } = &def.mode
-            else {
-                return None;
-            };
-            Some(ActiveSuppressTriggerStatic {
-                source_id: bf_obj.id,
-                source_filter: source_filter.clone(),
-                events: events.clone(),
-            })
-        })
-        .collect()
-}
-
 #[cfg(test)]
 fn event_is_suppressed_by_static_triggers(state: &GameState, event: &GameEvent) -> bool {
-    let active_suppress_triggers = active_suppress_trigger_statics(state);
-    event_is_suppressed_by_static_triggers_cached(state, event, &active_suppress_triggers)
-}
-
-fn event_is_suppressed_by_static_triggers_cached(
-    state: &GameState,
-    event: &GameEvent,
-    active_suppress_triggers: &[ActiveSuppressTriggerStatic],
-) -> bool {
-    // Classify the event: is it ETB, Dies, or neither?
-    let (record, triggered_event) = match event {
-        GameEvent::ZoneChanged {
-            record,
-            to: Zone::Battlefield,
-            ..
-        } => (record.as_ref(), SuppressedTriggerEvent::EntersBattlefield),
-        GameEvent::ZoneChanged {
-            record,
-            from: Some(Zone::Battlefield),
-            to: Zone::Graveyard,
-            ..
-        } => (record.as_ref(), SuppressedTriggerEvent::Dies),
-        _ => return false,
-    };
-
-    for suppressor in active_suppress_triggers {
-        if !suppressor.events.contains(&triggered_event) {
-            continue;
-        }
-        // CR 603.10a: Zone-change last-known information — use the record snapshot.
-        let filter_ctx = super::filter::FilterContext::from_source(state, suppressor.source_id);
-        if super::filter::matches_target_filter_on_zone_change_record(
-            state,
-            record,
-            &suppressor.source_filter,
-            &filter_ctx,
-        ) {
-            return true;
-        }
-    }
-    false
+    let active = active_suppress_trigger_statics(state);
+    super::trigger_suppression::event_is_suppressed_by_static_triggers_cached(state, event, &active)
 }
 
 /// CR 702.21a + CR 611.3 + CR 613.11: Whether an active `SuppressTriggers
@@ -1490,15 +1421,9 @@ fn collect_pending_triggers(
         // all reach the same `(obj_id, trig_idx)` pair for this event. Cleared
         // between events so each distinct event can still fire the trigger.
         let mut registered_this_event: HashSet<(ObjectId, usize)> = HashSet::new();
-        // CR 603.2g + CR 603.6a + CR 700.4: If a SuppressTriggers static matches the
-        // subject of an ETB/Dies event, skip all trigger matching for that event —
-        // per CR 603.2g, an event that "won't trigger anything" because the static
-        // declares its trigger registration void. Torpor Orb stops every ETB trigger
-        // caused by a creature entering, including observer triggers like Soul Warden.
-        // CR 603.6d: Static "enters tapped"/"enters with counters"/"as X enters"
-        // effects are NOT triggered and are unaffected (they run as part of the ETB
-        // event itself, not through process_triggers).
-        if event_is_suppressed_by_static_triggers_cached(state, event, &active_suppress_triggers) {
+        // CR 603.6a + CR 611.3: ETB causal suppression remains event-wide.
+        // Death suppression is selected by each matching clause's timing.
+        if etb_event_is_suppressed_cached(state, event, &active_suppress_triggers) {
             continue;
         }
 
@@ -11826,6 +11751,9 @@ pub mod tests {
         {
             let obj = state.objects.get_mut(&source).unwrap();
             obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types = obj.card_types.clone();
+            obj.base_power = Some(2);
+            obj.base_toughness = Some(2);
             obj.power = Some(2);
             obj.toughness = Some(2);
         }
@@ -11876,11 +11804,30 @@ pub mod tests {
         {
             let obj = state.objects.get_mut(&entrant).unwrap();
             obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types = obj.card_types.clone();
             obj.base_power = Some(1);
             obj.base_toughness = Some(1);
-            obj.power = Some(3);
-            obj.toughness = Some(3);
+            obj.power = Some(1);
+            obj.toughness = Some(1);
         }
+        // CR 611.2a + CR 613.4c: seed a real temporary layer effect, not derived P/T.
+        let pump_id = state.add_transient_continuous_effect(
+            source,
+            PlayerId(0),
+            crate::types::ability::Duration::UntilEndOfTurn,
+            TargetFilter::SpecificObject { id: entrant },
+            vec![
+                crate::types::ability::ContinuousModification::AddPower { value: 2 },
+                crate::types::ability::ContinuousModification::AddToughness { value: 2 },
+            ],
+            None,
+        );
+        crate::game::layers::flush_layers(&mut state);
+        assert_eq!(state.objects[&source].power, Some(2));
+        assert_eq!(state.objects[&source].toughness, Some(2));
+        assert_eq!(state.objects[&entrant].base_power, Some(1));
+        assert_eq!(state.objects[&entrant].power, Some(3));
+        assert_eq!(state.objects[&entrant].toughness, Some(3));
         // The original ETB event used for the intervening-if recheck.
         let etb_event = zone_changed_event(
             entrant,
@@ -11894,6 +11841,10 @@ pub mod tests {
         // snapshots exit LKI (live 3/3) AND reverts the live object to base (1/1).
         let mut evs = Vec::new();
         crate::game::zones::move_to_zone(&mut state, entrant, Zone::Graveyard, &mut evs);
+        assert!(!state
+            .transient_continuous_effects
+            .iter()
+            .any(|effect| effect.id == pump_id));
 
         // Non-vacuity: live obj and LKI now hold DISTINCT values. If these ever
         // coincide the positive/pre-fix discrimination below is meaningless.
@@ -11934,6 +11885,7 @@ pub mod tests {
         {
             let obj = state.objects.get_mut(&weak).unwrap();
             obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types = obj.card_types.clone();
             obj.base_power = Some(1);
             obj.base_toughness = Some(1);
             obj.power = Some(1);
@@ -11989,6 +11941,9 @@ pub mod tests {
         {
             let obj = state.objects.get_mut(&source).unwrap();
             obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types = obj.card_types.clone();
+            obj.base_power = Some(2);
+            obj.base_toughness = Some(2);
             obj.power = Some(2);
             obj.toughness = Some(2);
         }
@@ -12037,6 +11992,7 @@ pub mod tests {
         {
             let obj = state.objects.get_mut(&entrant).unwrap();
             obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types = obj.card_types.clone();
             obj.base_power = Some(1);
             obj.base_toughness = Some(1);
             obj.power = Some(1);
@@ -12069,16 +12025,33 @@ pub mod tests {
 
         // While on the battlefield the entrant is buffed to 3/3 (layered above its
         // printed base), which IS greater than the source's 2/2 threshold.
-        {
-            let obj = state.objects.get_mut(&entrant).unwrap();
-            obj.power = Some(3);
-            obj.toughness = Some(3);
-        }
 
+        // CR 611.2a + CR 613.4c: seed a real temporary layer effect, not derived P/T.
+        let pump_id = state.add_transient_continuous_effect(
+            source,
+            PlayerId(0),
+            crate::types::ability::Duration::UntilEndOfTurn,
+            TargetFilter::SpecificObject { id: entrant },
+            vec![
+                crate::types::ability::ContinuousModification::AddPower { value: 2 },
+                crate::types::ability::ContinuousModification::AddToughness { value: 2 },
+            ],
+            None,
+        );
+        crate::game::layers::flush_layers(&mut state);
+        assert_eq!(state.objects[&source].power, Some(2));
+        assert_eq!(state.objects[&source].toughness, Some(2));
+        assert_eq!(state.objects[&entrant].base_power, Some(1));
+        assert_eq!(state.objects[&entrant].power, Some(3));
+        assert_eq!(state.objects[&entrant].toughness, Some(3));
         // Leave to the graveyard via the production exit path: caches exit LKI
         // (3/3) and reverts the live object to its printed base (1/1).
         let mut leave_evs = Vec::new();
         crate::game::zones::move_to_zone(&mut state, entrant, Zone::Graveyard, &mut leave_evs);
+        assert!(!state
+            .transient_continuous_effects
+            .iter()
+            .any(|effect| effect.id == pump_id));
         assert_eq!(
             state.lki_cache.get(&entrant).unwrap().power,
             Some(3),
