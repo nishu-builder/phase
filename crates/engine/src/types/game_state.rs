@@ -314,6 +314,63 @@ pub struct CombatPhaseSkipState {
     pub active: bool,
 }
 
+/// Event-local outcomes; these are evaluated values, never deferred filters.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TriggerSuppressionSnapshot {
+    pub before: Vec<super::statics::SuppressedTriggerEvent>,
+    pub after: Vec<super::statics::SuppressedTriggerEvent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DepartureScopeId(pub(crate) u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DepartureSubject {
+    pub(crate) object_id: ObjectId,
+    pub(crate) incarnation: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DepartureEventKey {
+    pub(crate) event_offset: usize,
+    pub(crate) object_id: ObjectId,
+    pub(crate) turn_zone_change_index: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DepartureSuppressionCapture {
+    pub(crate) outcomes: Vec<(
+        DepartureSubject,
+        Vec<super::statics::SuppressedTriggerEvent>,
+    )>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DepartureScopeFrame {
+    pub(crate) id: DepartureScopeId,
+    pub(crate) event_start: usize,
+    pub(crate) candidates: Vec<DepartureSubject>,
+    pub(crate) capture: Option<DepartureSuppressionCapture>,
+    pub(crate) emitted: Vec<DepartureEventKey>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DepartureMemberBinding {
+    pub(crate) owner: DepartureScopeId,
+    pub(crate) subject: DepartureSubject,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DepartureSuppressionScopeState {
+    pub(crate) next_id: u64,
+    pub(crate) frames: Vec<DepartureScopeFrame>,
+    pub(crate) member_bindings: Vec<Option<DepartureMemberBinding>>,
+    // Per-state test instrumentation at the two new capture boundaries.
+    // Absent from production builds and the serialized GameState carrier.
+    #[cfg(test)]
+    pub(crate) boundary_flushes: (usize, usize),
+}
+
 /// CR 400.7: Snapshot of an object's characteristics at the time it left a public zone.
 /// Used for event-context resolution when the object is no longer in its original zone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -586,6 +643,11 @@ pub enum NextSpellModifier {
 /// event-time characteristics instead of chasing the object to its new zone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ZoneChangeRecord {
+    /// CR 603.10: Evaluated suppression in the worlds immediately before and
+    /// after this occurrence. None is legacy/unavailable history; empty Some
+    /// is authoritative. Non-dispatched turn-history copies retain None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_suppression: Option<TriggerSuppressionSnapshot>,
     pub object_id: ObjectId,
     pub name: String,
     pub core_types: Vec<CoreType>,
@@ -800,6 +862,7 @@ impl ZoneChangeRecord {
             is_token: false,
             combat_status: ZoneChangeCombatStatus::default(),
             co_departed: Vec::new(),
+            trigger_suppression: None,
             attached_to: None,
             entered_incarnation: None,
             turn_zone_change_index: 0,
@@ -2234,10 +2297,17 @@ impl ActivationResidual {
     }
 }
 
+/// Identity of one selected sacrifice component within an announced cast.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct DeferredSacrificeComponentId(pub(crate) u64);
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeferredSacrificeSelection {
     pub object_id: ObjectId,
     pub filter: TargetFilter,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component: Option<DeferredSacrificeComponentId>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -6824,6 +6894,10 @@ pub struct PendingLiminalEntryResume {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GameState {
+    /// Synchronous execution ownership only. Excluded from PartialEq because
+    /// comparisons and loop sampling occur at completed engine boundaries.
+    #[serde(skip, default)]
+    pub(crate) departure_suppression_scope: DepartureSuppressionScopeState,
     pub turn_number: u32,
     pub active_player: PlayerId,
     pub phase: Phase,
@@ -9850,6 +9924,7 @@ impl GameState {
         let archenemy = config.archenemy_player();
 
         GameState {
+            departure_suppression_scope: DepartureSuppressionScopeState::default(),
             turn_number: 0,
             active_player: starting_player,
             phase: Phase::Untap,
@@ -10647,6 +10722,7 @@ impl GameState {
     /// times can compare equal on everything a mandatory action could change.
     pub(crate) fn normalize_for_loop(&self) -> GameState {
         let mut clone = self.clone();
+        clone.departure_suppression_scope = DepartureSuppressionScopeState::default();
         clone.state_revision = 0;
         clone.next_timestamp = 0;
         clone.next_object_id = 0;
@@ -10881,6 +10957,7 @@ pub(crate) fn object_content_eq(x: &GameObject, y: &GameObject) -> bool {
 #[cfg(test)]
 fn _gamestate_partition_is_total(s: &GameState) {
     let GameState {
+        departure_suppression_scope: _,
         turn_number: _,
         active_player: _,
         phase: _,
@@ -11199,6 +11276,9 @@ impl Default for GameState {
 // Reconstruct RNG from seed on deserialization
 impl PartialEq for GameState {
     fn eq(&self, other: &Self) -> bool {
+        // departure_suppression_scope is synchronous bookkeeping. Equality and
+        // loop sampling occur at completed boundaries, where both stacks are
+        // empty; allocator history must never distinguish equivalent games.
         self.turn_number == other.turn_number
             && self.active_player == other.active_player
             && self.phase == other.phase

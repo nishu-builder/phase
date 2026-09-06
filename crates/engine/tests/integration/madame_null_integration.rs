@@ -84,6 +84,7 @@ fn set_etb_event(state: &mut GameState, entering: ObjectId) {
         from: Some(Zone::Hand),
         to: Zone::Battlefield,
         record: Box::new(ZoneChangeRecord {
+            trigger_suppression: None,
             object_id: entering,
             name: String::new(),
             core_types: Vec::new(),

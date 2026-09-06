@@ -946,54 +946,53 @@ fn deliver_batch(
     attempted: &[ObjectId],
     events: &mut Vec<GameEvent>,
 ) -> BatchMoveResult {
-    let mut queue = reqs.into_iter();
-    while let Some(req) = queue.next() {
-        let destination = req.to;
-        match move_object(state, req, events) {
-            ZoneMoveResult::Done => {}
-            ZoneMoveResult::NeedsChoice(_) => {
-                // CR 616.1: `move_object` already parked the surfaced prompt
-                // (centralized park at its `replace_event` NeedsChoice arm);
-                // stash the rest of the batch so no object strands. The paused
-                // object rides in `state.pending_replacement` and is delivered
-                // by the resume path.
-                stash_batch_tail(state, queue.collect(), destination);
-                return BatchMoveResult::NeedsChoice;
-            }
-            ZoneMoveResult::NeedsAuraAttachmentChoice => {
-                // CR 303.4f: an aura-host choice flows through
-                // `WaitingFor::ReturnAsAuraTarget`, not the replacement-choice
-                // resume path. No batch flow targets a battlefield aura entry
-                // today (mill destinations are graveyard/exile/hand; mass bounce
-                // returns to hand/library), so this arm is unreachable for the
-                // current batch callers; stop and stash the tail so a future
-                // battlefield-entry batch does not silently drop its remainder.
-                //
-                // The stashed tail IS drained correctly on resume: the
-                // `ReturnAsAuraTarget` handler (engine.rs:3608-3611) and its
-                // chain-resume sibling (engine.rs:3572) both call
-                // `drain_pending_batch_deliveries` when
-                // `pending_batch_deliveries.is_some()`, so the aura-attachment
-                // pause finishes the parked batch the same way the replacement-
-                // choice resume does. (Updated for d5a12b8c6, which added the
-                // aura-resume drain; the prior note here that the tail would be
-                // "silently drained by the NEXT unrelated resume" is no longer
-                // accurate.)
-                stash_batch_tail(state, queue.collect(), destination);
-                return BatchMoveResult::NeedsChoice;
+    zones::with_departure_suppression(state, events, attempted, |state, events, owner| {
+        let mut queue = reqs.into_iter();
+        while let Some(req) = queue.next() {
+            let destination = req.to;
+            match zones::with_departure_member(
+                state,
+                events,
+                owner,
+                req.object_id,
+                |state, events| move_object(state, req, events),
+            ) {
+                ZoneMoveResult::Done => {}
+                ZoneMoveResult::NeedsChoice(_) => {
+                    // CR 616.1: `move_object` already parked the surfaced prompt
+                    // (centralized park at its `replace_event` NeedsChoice arm);
+                    // stash the rest of the batch so no object strands. The paused
+                    // object rides in `state.pending_replacement` and is delivered
+                    // by the resume path.
+                    stash_batch_tail(state, queue.collect(), destination);
+                    return BatchMoveResult::NeedsChoice;
+                }
+                ZoneMoveResult::NeedsAuraAttachmentChoice => {
+                    // CR 303.4f: an aura-host choice flows through
+                    // `WaitingFor::ReturnAsAuraTarget`, not the replacement-choice
+                    // resume path. No batch flow targets a battlefield aura entry
+                    // today (mill destinations are graveyard/exile/hand; mass bounce
+                    // returns to hand/library), so this arm is unreachable for the
+                    // current batch callers; stop and stash the tail so a future
+                    // battlefield-entry batch does not silently drop its remainder.
+                    //
+                    // The stashed tail IS drained correctly on resume: the
+                    // `ReturnAsAuraTarget` handler (engine.rs:3608-3611) and its
+                    // chain-resume sibling (engine.rs:3572) both call
+                    // `drain_pending_batch_deliveries` when
+                    // `pending_batch_deliveries.is_some()`, so the aura-attachment
+                    // pause finishes the parked batch the same way the replacement-
+                    // choice resume does. (Updated for d5a12b8c6, which added the
+                    // aura-resume drain; the prior note here that the tail would be
+                    // "silently drained by the NEXT unrelated resume" is no longer
+                    // accurate.)
+                    stash_batch_tail(state, queue.collect(), destination);
+                    return BatchMoveResult::NeedsChoice;
+                }
             }
         }
-    }
-    // CR 603.10a + CR 608.2f: every object that actually left the battlefield in
-    // this segment departed together — stamp co-departure so leaves-the-
-    // battlefield observers among the group see each other via last-known info.
-    // For non-battlefield origins (mill) this is a no-op via the EVENT gate, not
-    // the subset filter: `departed_subset` includes milled cards (their current
-    // zone — graveyard — is not Battlefield), but `mark_simultaneous_departures`
-    // only stamps `ZoneChanged` events with `from: Some(Zone::Battlefield)`, and
-    // a library-origin move emits none.
-    zones::mark_simultaneous_departures(events, &zones::departed_subset(state, attempted));
-    BatchMoveResult::Done
+        BatchMoveResult::Done
+    })
 }
 
 /// CR 603.10a + CR 616.1: Park the undelivered batch tail so the resume path
@@ -2225,6 +2224,78 @@ pub(crate) fn execute_zone_move(
             replacement::park_waiting_for(state, player);
             ZoneMoveResult::NeedsChoice(player)
         }
+    }
+}
+
+#[cfg(test)]
+mod departure_scope_tests {
+    use super::*;
+    use crate::types::{
+        ability::{StaticDefinition, TargetFilter},
+        game_state::TriggerSuppressionSnapshot,
+        identifiers::CardId,
+        statics::{StaticMode, SuppressedTriggerEvent},
+    };
+
+    #[test]
+    fn synchronous_batch_finalizes_exact_departures_before_return() {
+        let mut state = GameState::new_two_player(42);
+        let subjects: Vec<_> = (0..2)
+            .map(|index| {
+                zones::create_object(
+                    &mut state,
+                    CardId(index),
+                    PlayerId(0),
+                    format!("Batch subject {index}"),
+                    Zone::Battlefield,
+                )
+            })
+            .collect();
+        state
+            .objects
+            .get_mut(&subjects[0])
+            .unwrap()
+            .static_definitions
+            .push(StaticDefinition::new(StaticMode::SuppressTriggers {
+                source_filter: TargetFilter::Any,
+                events: vec![SuppressedTriggerEvent::Dies],
+            }));
+        let requests = subjects
+            .iter()
+            .map(|id| ZoneMoveRequest::effect(*id, Zone::Graveyard, *id))
+            .collect();
+        let mut events = Vec::new();
+        assert!(matches!(
+            move_objects_simultaneously(&mut state, requests, &mut events),
+            BatchMoveResult::Done
+        ));
+        let records: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                GameEvent::ZoneChanged {
+                    from: Some(Zone::Battlefield),
+                    to: Zone::Graveyard,
+                    record,
+                    ..
+                } => Some(record),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(records.len(), 2);
+        for (index, record) in records.iter().enumerate() {
+            assert_eq!(state.objects[&subjects[index]].zone, Zone::Graveyard);
+            assert_eq!(
+                record.trigger_suppression,
+                Some(TriggerSuppressionSnapshot {
+                    before: vec![SuppressedTriggerEvent::Dies],
+                    after: vec![],
+                })
+            );
+            assert_eq!(record.co_departed, vec![subjects[1 - index]]);
+        }
+        assert!(state.departure_suppression_scope.frames.is_empty());
+        assert!(state.departure_suppression_scope.member_bindings.is_empty());
+        assert_eq!(state.departure_suppression_scope.next_id, 0);
     }
 }
 

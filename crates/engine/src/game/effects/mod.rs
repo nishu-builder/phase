@@ -909,154 +909,163 @@ fn drain_pending_change_zone_iteration(state: &mut GameState, events: &mut Vec<G
         // documented by an ignored test. See plan STEP 4b.
         let events_before_drain = events.len();
         let mut paused = false;
-        for (i, obj_id) in remaining.iter().enumerate() {
-            let per_obj_enter_counters =
-                crate::game::effects::change_zone::enter_with_counters_for_pending_object(
-                    state,
-                    source_id,
-                    *obj_id,
-                    &enter_with_counters,
-                    &conditional_enter_with_counters,
-                );
-            let ctx = crate::game::effects::change_zone::ChangeZoneIterationCtx {
-                source_id,
-                controller,
-                origin,
-                destination,
-                enter_transformed,
-                enter_tapped,
-                enters_under_player,
-                enters_attacking,
-                enter_with_counters: per_obj_enter_counters,
-                conditional_enter_with_counters: vec![],
-                duration: duration.clone(),
-                track_exiled_by_source,
-                // CR 708.2a + CR 708.3: thread the preserved face-down profile back
-                // into the resume ctx so a face-down move that parked on a
-                // per-permanent replacement-ordering / as-enters choice resumes
-                // FACE DOWN with the same characteristics (Yedora-style return),
-                // instead of exposing the real object face up. Mirrors the
-                // `enter_tapped`/`enter_transformed`/`enters_under_player` carry-through.
-                face_down_profile: face_down_profile.clone(),
-                library_placement: library_placement.clone(),
-                // CR 614.12: thread the moved-object type gate into the per-object
-                // resume ctx so a resumed member is still gated on its type
-                // (Summoner's Grimoire), matching the synchronous move path.
-                enters_modified_if: enters_modified_if.clone(),
-                enter_attached_to,
-            };
-            let before_zone = state.objects.get(obj_id).map(|object| object.zone);
-            match crate::game::effects::change_zone::process_one_zone_move(
-                state, &ctx, *obj_id, events,
-            ) {
-                crate::game::effects::change_zone::ZoneMoveResult::Done => {
-                    if let Some(count) = moved_count.as_mut() {
-                        if before_zone != Some(ctx.destination)
-                            && state
-                                .objects
-                                .get(obj_id)
-                                .is_some_and(|object| object.zone == ctx.destination)
-                        {
-                            *count += 1;
+        crate::game::zones::with_departure_suppression(
+            state,
+            events,
+            &remaining,
+            |state, events, owner| {
+                for (i, obj_id) in remaining.iter().enumerate() {
+                    let per_obj_enter_counters =
+                        crate::game::effects::change_zone::enter_with_counters_for_pending_object(
+                            state,
+                            source_id,
+                            *obj_id,
+                            &enter_with_counters,
+                            &conditional_enter_with_counters,
+                        );
+                    let ctx = crate::game::effects::change_zone::ChangeZoneIterationCtx {
+                        source_id,
+                        controller,
+                        origin,
+                        destination,
+                        enter_transformed,
+                        enter_tapped,
+                        enters_under_player,
+                        enters_attacking,
+                        enter_with_counters: per_obj_enter_counters,
+                        conditional_enter_with_counters: vec![],
+                        duration: duration.clone(),
+                        track_exiled_by_source,
+                        // CR 708.2a + CR 708.3: thread the preserved face-down profile back
+                        // into the resume ctx so a face-down move that parked on a
+                        // per-permanent replacement-ordering / as-enters choice resumes
+                        // FACE DOWN with the same characteristics (Yedora-style return),
+                        // instead of exposing the real object face up. Mirrors the
+                        // `enter_tapped`/`enter_transformed`/`enters_under_player` carry-through.
+                        face_down_profile: face_down_profile.clone(),
+                        library_placement: library_placement.clone(),
+                        // CR 614.12: thread the moved-object type gate into the per-object
+                        // resume ctx so a resumed member is still gated on its type
+                        // (Summoner's Grimoire), matching the synchronous move path.
+                        enters_modified_if: enters_modified_if.clone(),
+                        enter_attached_to,
+                    };
+                    let before_zone = state.objects.get(obj_id).map(|object| object.zone);
+                    let result = crate::game::zones::with_departure_member(
+                        state,
+                        events,
+                        owner,
+                        *obj_id,
+                        |state, events| {
+                            crate::game::effects::change_zone::process_one_zone_move(
+                                state, &ctx, *obj_id, events,
+                            )
+                        },
+                    );
+                    match result {
+                        crate::game::effects::change_zone::ZoneMoveResult::Done => {
+                            if let Some(count) = moved_count.as_mut() {
+                                if before_zone != Some(ctx.destination)
+                                    && state
+                                        .objects
+                                        .get(obj_id)
+                                        .is_some_and(|object| object.zone == ctx.destination)
+                                {
+                                    *count += 1;
+                                }
+                            }
+                        }
+                        crate::game::effects::change_zone::ZoneMoveResult::NeedsAuraAttachmentChoice => {
+                            if let Some(count) = moved_count.as_mut() {
+                                if before_zone != Some(ctx.destination)
+                                    && state
+                                        .objects
+                                        .get(obj_id)
+                                        .is_some_and(|object| object.zone == ctx.destination)
+                                {
+                                    *count += 1;
+                                }
+                            }
+                            state.pending_change_zone_iteration =
+                                Some(crate::types::game_state::PendingChangeZoneIteration {
+                                    remaining: remaining[i + 1..].to_vec(),
+                                    source_id: ctx.source_id,
+                                    controller: ctx.controller,
+                                    origin: ctx.origin,
+                                    destination: ctx.destination,
+                                    enter_transformed: ctx.enter_transformed,
+                                    enter_tapped: ctx.enter_tapped,
+                                    enters_under_player: ctx.enters_under_player,
+                                    enters_attacking: ctx.enters_attacking,
+                                    enter_with_counters: enter_with_counters.clone(),
+                                    conditional_enter_with_counters: conditional_enter_with_counters
+                                        .clone(),
+                                    duration: ctx.duration.clone(),
+                                    track_exiled_by_source: ctx.track_exiled_by_source,
+                                    moved_count,
+                                    // CR 708.2a + CR 708.3: preserve the face-down profile
+                                    // across a further pause so resumed members stay face down.
+                                    face_down_profile: ctx.face_down_profile.clone(),
+                                    library_placement: ctx.library_placement.clone(),
+                                    // CR 614.12: preserve the moved-object type gate
+                                    // across a further pause.
+                                    enters_modified_if: ctx.enters_modified_if.clone(),
+                                    enter_attached_to: ctx.enter_attached_to,
+                                    effect_kind,
+                                });
+                            paused = true;
+                            break;
+                        }
+                        crate::game::effects::change_zone::ZoneMoveResult::NeedsChoice(player) => {
+                            state.pending_change_zone_iteration =
+                                Some(crate::types::game_state::PendingChangeZoneIteration {
+                                    remaining: remaining[i + 1..].to_vec(),
+                                    source_id: ctx.source_id,
+                                    controller: ctx.controller,
+                                    origin: ctx.origin,
+                                    destination: ctx.destination,
+                                    enter_transformed: ctx.enter_transformed,
+                                    enter_tapped: ctx.enter_tapped,
+                                    enters_under_player: ctx.enters_under_player,
+                                    enters_attacking: ctx.enters_attacking,
+                                    enter_with_counters: enter_with_counters.clone(),
+                                    conditional_enter_with_counters: conditional_enter_with_counters
+                                        .clone(),
+                                    duration: ctx.duration.clone(),
+                                    track_exiled_by_source: ctx.track_exiled_by_source,
+                                    moved_count,
+                                    // CR 708.2a + CR 708.3: preserve the face-down profile
+                                    // across a further pause so resumed members stay face down.
+                                    face_down_profile: ctx.face_down_profile.clone(),
+                                    library_placement: ctx.library_placement.clone(),
+                                    // CR 614.12: preserve the moved-object type gate
+                                    // across a further pause.
+                                    enters_modified_if: ctx.enters_modified_if.clone(),
+                                    enter_attached_to: ctx.enter_attached_to,
+                                    effect_kind,
+                                });
+                            // CR 608.2c: a further member paused mid-move on a replacement
+                            // choice; it will be delivered by the resume, not this drain's
+                            // `remaining` loop. Record it as in-flight (with its pre-move zone)
+                            // so the NEXT drain pass counts it once it reaches the destination.
+                            if let Some(before) = before_zone {
+                                state.pending_change_zone_in_flight = Some((*obj_id, before));
+                            }
+                            // CR 614.12a: park (don't clobber) — a Devour as-enters sacrifice
+                            // may already have surfaced its own `EffectZoneChoice` during the
+                            // resumed member's entry.
+                            crate::game::replacement::park_waiting_for(state, player);
+                            paused = true;
+                            break;
                         }
                     }
                 }
-                crate::game::effects::change_zone::ZoneMoveResult::NeedsAuraAttachmentChoice => {
-                    if let Some(count) = moved_count.as_mut() {
-                        if before_zone != Some(ctx.destination)
-                            && state
-                                .objects
-                                .get(obj_id)
-                                .is_some_and(|object| object.zone == ctx.destination)
-                        {
-                            *count += 1;
-                        }
-                    }
-                    state.pending_change_zone_iteration =
-                        Some(crate::types::game_state::PendingChangeZoneIteration {
-                            remaining: remaining[i + 1..].to_vec(),
-                            source_id: ctx.source_id,
-                            controller: ctx.controller,
-                            origin: ctx.origin,
-                            destination: ctx.destination,
-                            enter_transformed: ctx.enter_transformed,
-                            enter_tapped: ctx.enter_tapped,
-                            enters_under_player: ctx.enters_under_player,
-                            enters_attacking: ctx.enters_attacking,
-                            enter_with_counters: enter_with_counters.clone(),
-                            conditional_enter_with_counters: conditional_enter_with_counters
-                                .clone(),
-                            duration: ctx.duration.clone(),
-                            track_exiled_by_source: ctx.track_exiled_by_source,
-                            moved_count,
-                            // CR 708.2a + CR 708.3: preserve the face-down profile
-                            // across a further pause so resumed members stay face down.
-                            face_down_profile: ctx.face_down_profile.clone(),
-                            library_placement: ctx.library_placement.clone(),
-                            // CR 614.12: preserve the moved-object type gate
-                            // across a further pause.
-                            enters_modified_if: ctx.enters_modified_if.clone(),
-                            enter_attached_to: ctx.enter_attached_to,
-                            effect_kind,
-                        });
-                    paused = true;
-                    break;
-                }
-                crate::game::effects::change_zone::ZoneMoveResult::NeedsChoice(player) => {
-                    state.pending_change_zone_iteration =
-                        Some(crate::types::game_state::PendingChangeZoneIteration {
-                            remaining: remaining[i + 1..].to_vec(),
-                            source_id: ctx.source_id,
-                            controller: ctx.controller,
-                            origin: ctx.origin,
-                            destination: ctx.destination,
-                            enter_transformed: ctx.enter_transformed,
-                            enter_tapped: ctx.enter_tapped,
-                            enters_under_player: ctx.enters_under_player,
-                            enters_attacking: ctx.enters_attacking,
-                            enter_with_counters: enter_with_counters.clone(),
-                            conditional_enter_with_counters: conditional_enter_with_counters
-                                .clone(),
-                            duration: ctx.duration.clone(),
-                            track_exiled_by_source: ctx.track_exiled_by_source,
-                            moved_count,
-                            // CR 708.2a + CR 708.3: preserve the face-down profile
-                            // across a further pause so resumed members stay face down.
-                            face_down_profile: ctx.face_down_profile.clone(),
-                            library_placement: ctx.library_placement.clone(),
-                            // CR 614.12: preserve the moved-object type gate
-                            // across a further pause.
-                            enters_modified_if: ctx.enters_modified_if.clone(),
-                            enter_attached_to: ctx.enter_attached_to,
-                            effect_kind,
-                        });
-                    // CR 608.2c: a further member paused mid-move on a replacement
-                    // choice; it will be delivered by the resume, not this drain's
-                    // `remaining` loop. Record it as in-flight (with its pre-move zone)
-                    // so the NEXT drain pass counts it once it reaches the destination.
-                    if let Some(before) = before_zone {
-                        state.pending_change_zone_in_flight = Some((*obj_id, before));
-                    }
-                    // CR 614.12a: park (don't clobber) — a Devour as-enters sacrifice
-                    // may already have surfaced its own `EffectZoneChoice` during the
-                    // resumed member's entry.
-                    crate::game::replacement::park_waiting_for(state, player);
-                    paused = true;
-                    break;
-                }
-            }
-        }
+            },
+        );
         if paused {
-            // CR 603.10a: paused again on a further choice. Stamp the members
-            // this pass moved so any co-departing observer among them observes
-            // the rest, then B2-park their observer triggers: `waiting_for` is
-            // now a choice (not Priority), so `run_post_action_pipeline` will
-            // not scan these events — deferring keeps issue #423 dies-triggers
-            // from being lost across the pause.
-            crate::game::zones::stamp_simultaneous_from_slice(
-                state,
-                &mut events[events_before_drain..],
-            );
+            // The scope finalized this pass before the pause. Park observer
+            // triggers while the resolution choice remains pending, preserving
+            // the existing resume collector for issue #423.
             let trigger_events: Vec<GameEvent> = events[events_before_drain..]
                 .iter()
                 .filter(|ev| !matches!(ev, GameEvent::PhaseChanged { .. }))
@@ -1065,14 +1074,8 @@ fn drain_pending_change_zone_iteration(state: &mut GameState, events: &mut Vec<G
             crate::game::triggers::collect_triggers_into_deferred(state, &trigger_events);
             break;
         }
-        // Loop completed — stamp the members this pass moved (CR 603.10a) so a
-        // co-departing observer among the resumed group observes the rest, then
-        // emit the trailing EffectResolved event that the non-pause path emits at
-        // the tail of `change_zone::resolve`.
-        crate::game::zones::stamp_simultaneous_from_slice(
-            state,
-            &mut events[events_before_drain..],
-        );
+        // The completed scope finalized this pass. Emit the trailing
+        // EffectResolved event used by the non-pause ChangeZone path.
         // CR 614.13a: the resumed mass/targeted co-entry finished without pausing —
         // the whole ChangeZone entry event is complete, so clear the pre-entry
         // Devour snapshot. NOT cleared on the `paused` break above (a further
@@ -5782,48 +5785,68 @@ fn perform_player_scope_sacrifices(
     events: &mut Vec<GameEvent>,
 ) -> Result<PlayerScopeSacrificePerformOutcome, EffectError> {
     let events_before_sacrifice = events.len();
-    let mut all_chosen = Vec::new();
     let mut sacrificed = 0;
 
     // CR 101.4: after every player has made the required APNAP choice, the
     // chosen permanents are moved as one simultaneous instruction.
     // CR 701.21a: to sacrifice a permanent, its controller moves it from the
     // battlefield to its owner's graveyard.
-    while !selections.is_empty() {
-        let (player, mut cards) = selections.remove(0);
-        while !cards.is_empty() {
-            let card = cards.remove(0);
-            all_chosen.push(card);
-            match crate::game::sacrifice::sacrifice_permanent(state, card, player, events)
-                .map_err(|error| EffectError::InvalidParam(error.to_string()))?
-            {
-                crate::game::sacrifice::SacrificeOutcome::Complete => sacrificed += 1,
-                crate::game::sacrifice::SacrificeOutcome::NeedsReplacementChoice(choice_player) => {
-                    if !cards.is_empty() {
-                        selections.insert(0, (player, cards));
-                    }
-                    if !selections.is_empty() {
-                        state.pending_player_scope_sacrifice_choice =
-                            Some(PendingPlayerScopeSacrificeChoice {
-                                ability: Box::new(ability.clone()),
-                                remaining_players: vec![],
-                                selections,
-                            });
-                    }
-                    state.waiting_for = crate::game::replacement::replacement_choice_waiting_for(
-                        choice_player,
+    let candidates: Vec<_> = selections
+        .iter()
+        .flat_map(|(_, cards)| cards.iter().copied())
+        .collect();
+    let outcome = crate::game::zones::with_departure_suppression(
+        state,
+        events,
+        &candidates,
+        |state, events, owner| {
+            while !selections.is_empty() {
+                let (player, mut cards) = selections.remove(0);
+                while !cards.is_empty() {
+                    let card = cards.remove(0);
+                    match crate::game::zones::with_departure_member(
                         state,
-                    );
-                    return Ok(PlayerScopeSacrificePerformOutcome::PausedForReplacement);
+                        events,
+                        owner,
+                        card,
+                        |state, events| {
+                            crate::game::sacrifice::sacrifice_permanent(state, card, player, events)
+                        },
+                    )
+                    .map_err(|error| EffectError::InvalidParam(error.to_string()))?
+                    {
+                        crate::game::sacrifice::SacrificeOutcome::Complete => sacrificed += 1,
+                        crate::game::sacrifice::SacrificeOutcome::NeedsReplacementChoice(
+                            choice_player,
+                        ) => {
+                            if !cards.is_empty() {
+                                selections.insert(0, (player, cards));
+                            }
+                            if !selections.is_empty() {
+                                state.pending_player_scope_sacrifice_choice =
+                                    Some(PendingPlayerScopeSacrificeChoice {
+                                        ability: Box::new(ability.clone()),
+                                        remaining_players: vec![],
+                                        selections,
+                                    });
+                            }
+                            state.waiting_for =
+                                crate::game::replacement::replacement_choice_waiting_for(
+                                    choice_player,
+                                    state,
+                                );
+                            return Ok(true);
+                        }
+                    }
                 }
             }
-        }
+            Ok::<bool, EffectError>(false)
+        },
+    )?;
+    if outcome {
+        return Ok(PlayerScopeSacrificePerformOutcome::PausedForReplacement);
     }
 
-    crate::game::zones::mark_simultaneous_departures(
-        &mut events[events_before_sacrifice..],
-        &crate::game::zones::departed_subset(state, &all_chosen),
-    );
     state.last_effect_count = Some(sacrificed);
     events.push(GameEvent::EffectResolved {
         kind: EffectKind::Sacrifice,
@@ -5970,6 +5993,17 @@ pub(crate) fn drain_pending_player_scope_sacrifice_after_replacement(
 /// Resolve an ability and follow its sub_ability chain using typed nested structs.
 /// No SVar lookup, no parse_ability(). The depth is bounded by the data structure.
 pub fn resolve_ability_chain(
+    state: &mut GameState,
+    ability: &ResolvedAbility,
+    events: &mut Vec<GameEvent>,
+    depth: u32,
+) -> Result<(), EffectError> {
+    crate::game::zones::without_departure_member(state, events, |state, events| {
+        resolve_ability_chain_inner(state, ability, events, depth)
+    })
+}
+
+fn resolve_ability_chain_inner(
     state: &mut GameState,
     ability: &ResolvedAbility,
     events: &mut Vec<GameEvent>,
@@ -13018,8 +13052,24 @@ mod tests {
             Zone::Battlefield,
         );
         let permanent_obj = state.objects.get_mut(&permanent).unwrap();
-        permanent_obj.controller = permanent_controller;
         permanent_obj.card_types.core_types.push(CoreType::Artifact);
+        permanent_obj.base_card_types = permanent_obj.card_types.clone();
+        let base_controller = permanent_obj.base_controller;
+        if permanent_controller == PlayerId(0) {
+            // CR 611.2a + CR 613.1b: temporary control must survive layer evaluation.
+            state.add_transient_continuous_effect(
+                permanent,
+                permanent_controller,
+                crate::types::ability::Duration::UntilEndOfTurn,
+                TargetFilter::SpecificObject { id: permanent },
+                vec![crate::types::ability::ContinuousModification::ChangeController],
+                None,
+            );
+        }
+        crate::game::layers::flush_layers(&mut state);
+        assert_eq!(state.objects[&permanent].owner, PlayerId(1));
+        assert_eq!(state.objects[&permanent].controller, permanent_controller);
+        assert_eq!(state.objects[&permanent].base_controller, base_controller);
 
         let draw = ResolvedAbility::new(
             Effect::Draw {
@@ -13049,6 +13099,12 @@ mod tests {
 
         let mut events = Vec::new();
         resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+        assert_eq!(state.objects[&permanent].zone, Zone::Hand);
+        assert_eq!(state.objects[&permanent].controller, PlayerId(1));
+        assert_eq!(state.lki_cache[&permanent].controller, permanent_controller);
+        assert!(events.iter().any(|event| matches!(event,
+            GameEvent::ZoneChanged { object_id, from: Some(Zone::Battlefield), to: Zone::Hand, record, .. }
+            if *object_id == permanent && record.controller == permanent_controller)));
         (state, events)
     }
 

@@ -1571,6 +1571,7 @@ mod tests {
             from: Some(Zone::Library),
             to: Zone::Hand,
             record: Box::new(ZoneChangeRecord {
+                trigger_suppression: None,
                 object_id: hidden_card,
                 name: "Secret Card".to_string(),
                 core_types: Vec::new(),

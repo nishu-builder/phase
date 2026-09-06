@@ -60,6 +60,7 @@ fn add_creature(
     );
     let obj = state.objects.get_mut(&id).unwrap();
     obj.card_types.core_types.push(CoreType::Creature);
+    obj.base_card_types = obj.card_types.clone();
     obj.power = Some(power);
     obj.toughness = Some(toughness);
     obj.base_power = Some(power);
@@ -168,7 +169,18 @@ fn oversimplify_per_player_fractal_counters_match_exiled_power() {
     // Without the fallback, this 2/2 would count toward P0 (yielding P0:7,
     // P1:3) instead of P1 (correct: P0:5, P1:5).
     let stolen = add_creature(&mut state, 104, PlayerId(0), "Stolen 2/2", 2, 2);
-    state.objects.get_mut(&stolen).unwrap().controller = PlayerId(1);
+    // CR 611.2a + CR 613.1b: use actual temporary control authority at the exit boundary.
+    state.add_transient_continuous_effect(
+        source_id,
+        PlayerId(1),
+        engine::types::ability::Duration::UntilEndOfTurn,
+        TargetFilter::SpecificObject { id: stolen },
+        vec![engine::types::ability::ContinuousModification::ChangeController],
+        None,
+    );
+    engine::game::layers::flush_layers(&mut state);
+    assert_eq!(state.objects[&stolen].owner, PlayerId(0));
+    assert_eq!(state.objects[&stolen].controller, PlayerId(1));
 
     let ability = build_resolved_from_def(definition, source_id, PlayerId(0));
     let mut events = Vec::<GameEvent>::new();
@@ -182,6 +194,13 @@ fn oversimplify_per_player_fractal_counters_match_exiled_power() {
             "creature {victim:?} must be exiled off the battlefield"
         );
     }
+
+    for victim in [p0_big, p0_small, p1_mid, stolen] {
+        assert_eq!(state.objects[&victim].zone, Zone::Exile);
+    }
+    assert_eq!(state.objects[&stolen].controller, PlayerId(0));
+    assert_eq!(state.lki_cache[&stolen].controller, PlayerId(1));
+    assert_eq!(state.lki_cache[&stolen].power, Some(2));
 
     // Find each player's Fractal token. The per-player iteration creates one
     // token per player; the iterating player is the token's controller.

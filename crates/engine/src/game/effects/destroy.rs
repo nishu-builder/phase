@@ -202,26 +202,49 @@ pub fn resolve(
             ..
         }
     );
-    if self_ref_target && ability.targets.is_empty() {
-        match destroy_single_object(
-            state,
-            ability.source_id,
-            ability.source_id,
-            cant_regenerate,
-            events,
-        ) {
-            DestroyOutcome::Completed | DestroyOutcome::Skipped => {}
-            DestroyOutcome::NeedsChoice => return Ok(()),
-        }
-    }
-    for target in &ability.targets {
-        if let TargetRef::Object(obj_id) = target {
-            match destroy_single_object(state, *obj_id, ability.source_id, cant_regenerate, events)
-            {
-                DestroyOutcome::Completed | DestroyOutcome::Skipped => {}
-                DestroyOutcome::NeedsChoice => return Ok(()),
+    let candidates: Vec<_> = if self_ref_target && ability.targets.is_empty() {
+        vec![ability.source_id]
+    } else {
+        ability
+            .targets
+            .iter()
+            .filter_map(|target| match target {
+                TargetRef::Object(id) => Some(*id),
+                TargetRef::Player(_) => None,
+            })
+            .collect()
+    };
+    let paused = crate::game::zones::with_departure_suppression(
+        state,
+        events,
+        &candidates,
+        |state, events, owner| {
+            for obj_id in candidates.iter().copied() {
+                let outcome = crate::game::zones::with_departure_member(
+                    state,
+                    events,
+                    owner,
+                    obj_id,
+                    |state, events| {
+                        destroy_single_object(
+                            state,
+                            obj_id,
+                            ability.source_id,
+                            cant_regenerate,
+                            events,
+                        )
+                    },
+                );
+                match outcome {
+                    DestroyOutcome::Completed | DestroyOutcome::Skipped => {}
+                    DestroyOutcome::NeedsChoice => return true,
+                }
             }
-        }
+            false
+        },
+    );
+    if paused {
+        return Ok(());
     }
 
     events.push(GameEvent::EffectResolved {
@@ -338,38 +361,51 @@ pub fn resolve_all(
         .copied()
         .collect();
 
-    for &obj_id in &matching {
-        let proposed = ProposedEvent::Destroy {
-            object_id: obj_id,
-            source: Some(ability.source_id),
-            cant_regenerate,
-            applied: HashSet::new(),
-        };
+    let paused = crate::game::zones::with_departure_suppression(
+        state,
+        events,
+        &matching,
+        |state, events, owner| {
+            for &obj_id in &matching {
+                let paused = crate::game::zones::with_departure_member(
+                    state,
+                    events,
+                    owner,
+                    obj_id,
+                    |state, events| {
+                        let proposed = ProposedEvent::Destroy {
+                            object_id: obj_id,
+                            source: Some(ability.source_id),
+                            cant_regenerate,
+                            applied: HashSet::new(),
+                        };
 
-        match replacement::replace_event(state, proposed, events) {
-            ReplacementResult::Execute(event) => {
-                if !apply_destroy_after_replacement(state, event, events) {
-                    return Ok(());
+                        match replacement::replace_event(state, proposed, events) {
+                            ReplacementResult::Execute(event) => {
+                                if !apply_destroy_after_replacement(state, event, events) {
+                                    return true;
+                                }
+                            }
+                            ReplacementResult::Prevented => {} // Regenerated or other replacement
+                            ReplacementResult::NeedsChoice(player) => {
+                                state.waiting_for =
+                                    replacement::replacement_choice_waiting_for(player, state);
+                                return true;
+                            }
+                        }
+                        false
+                    },
+                );
+                if paused {
+                    return true;
                 }
             }
-            ReplacementResult::Prevented => {} // Regenerated or other replacement
-            ReplacementResult::NeedsChoice(player) => {
-                state.waiting_for = replacement::replacement_choice_waiting_for(player, state);
-                return Ok(());
-            }
-        }
-    }
-
-    // CR 603.10a + CR 704.3: every creature destroyed by this effect left the
-    // battlefield simultaneously, so co-departing leaves-the-battlefield/dies
-    // observers (Blood Artist, Zulaport Cutthroat) must observe each other.
-    // CR 701.19a/b: a regenerated member (and any other Prevented destruction)
-    // stays on the battlefield, so `departed_subset` excludes it from every
-    // survivor's co-departed group.
-    crate::game::zones::mark_simultaneous_departures(
-        events,
-        &crate::game::zones::departed_subset(state, &matching),
+            false
+        },
     );
+    if paused {
+        return Ok(());
+    }
 
     events.push(GameEvent::EffectResolved {
         kind: EffectKind::from(&ability.effect),

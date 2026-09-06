@@ -170,6 +170,7 @@ pub(crate) fn check_standalone_augment_permanents(
     events: &mut Vec<GameEvent>,
     any_performed: &mut bool,
     battlefield_snapshot: &[ObjectId],
+    owner: &crate::game::zones::DepartureScopeToken,
 ) {
     let standalone: Vec<ObjectId> = battlefield_snapshot
         .iter()
@@ -199,7 +200,14 @@ pub(crate) fn check_standalone_augment_permanents(
         // graveyard zone change, so it must use the same replacement-aware
         // authority as the other SBA moves. A parked CR 616 choice is resumed
         // by the SBA fixpoint after the player chooses.
-        if move_to_graveyard_via_pipeline(state, object_id, events) {
+        let paused = crate::game::zones::with_departure_member(
+            state,
+            events,
+            owner,
+            object_id,
+            |state, events| move_to_graveyard_via_pipeline(state, object_id, events),
+        );
+        if paused {
             return;
         }
         *any_performed = true;

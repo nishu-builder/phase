@@ -13,9 +13,10 @@ use crate::types::ability::{
 use crate::types::events::{GameEvent, ManaTapState};
 use crate::types::game_state::{
     ActivationResidual, AssistState, CastPaymentMode, CastingVariant, ConvokeMode, CostResume,
-    CounterCostChoice, CounterRemoveChoice, DeferredSacrificeSelection, DistributionUnit,
-    GameState, PayCostKind, PendingCast, PendingDiscardForCostResume, SpellCostSource, StackEntry,
-    StackEntryKind, StackPaidSnapshot, WaitingFor,
+    CounterCostChoice, CounterRemoveChoice, DeferredSacrificeComponentId,
+    DeferredSacrificeSelection, DistributionUnit, GameState, PayCostKind, PendingCast,
+    PendingDiscardForCostResume, SpellCostSource, StackEntry, StackEntryKind, StackPaidSnapshot,
+    WaitingFor,
 };
 use crate::types::identifiers::{CardId, ObjectId};
 use crate::types::keywords::Keyword;
@@ -1730,6 +1731,46 @@ fn auto_activate_spell_mana_abilities_before_deferred_sacrifice(
     Ok(())
 }
 
+/// Validate selected component provenance without guessing boundaries in old saves.
+pub(crate) fn validate_deferred_sacrifice_components(
+    selections: &[DeferredSacrificeSelection],
+) -> Result<(), EngineError> {
+    let mut offset = 0;
+    for component in selections.chunk_by(|a, b| a.component == b.component) {
+        let expected = u64::try_from(offset).map_err(|_| {
+            EngineError::ActionNotAllowed(
+                "Deferred sacrifice component is too large; cancel this saved cast and announce it again"
+                    .to_string(),
+            )
+        })?;
+        if component[0].component != Some(DeferredSacrificeComponentId(expected)) {
+            return Err(EngineError::ActionNotAllowed(
+                "Deferred sacrifice component provenance is unavailable or invalid; cancel this saved cast and announce it again"
+                    .to_string(),
+            ));
+        }
+        offset += component.len();
+    }
+    Ok(())
+}
+
+/// Cast boundaries validate only their existing pending-cast carrier.
+pub(crate) fn validate_pending_deferred_sacrifice_components(
+    state: &GameState,
+) -> Result<(), EngineError> {
+    let pending = state.waiting_for.pending_cast_ref().or_else(|| {
+        state
+            .waiting_for
+            .has_pending_cast()
+            .then_some(state.pending_cast.as_deref())
+            .flatten()
+    });
+    if let Some(pending) = pending {
+        validate_deferred_sacrifice_components(&pending.deferred_sacrificed_permanents)?;
+    }
+    Ok(())
+}
+
 fn validate_deferred_spell_sacrifices_at_commit(
     state: &GameState,
     player: PlayerId,
@@ -1802,31 +1843,48 @@ fn pay_deferred_spell_sacrifices_at_commit(
         return Ok(None);
     }
 
+    validate_deferred_sacrifice_components(&pending.deferred_sacrificed_permanents)?;
     let cost_event_start = events.len();
-    for selection in &pending.deferred_sacrificed_permanents {
-        let id = selection.object_id;
-        match super::sacrifice::sacrifice_permanent(state, id, player, events)
-            .map_err(|e| EngineError::InvalidAction(format!("{e}")))?
-        {
-            super::sacrifice::SacrificeOutcome::Complete => {}
-            super::sacrifice::SacrificeOutcome::NeedsReplacementChoice(_) => {
-                return Err(EngineError::ActionNotAllowed(
-                    "Deferred sacrifice cost requires replacement ordering".to_string(),
-                ));
-            }
-        }
-    }
-    // CR 603.10a + CR 701.21a + CR 601.2h + CR 118.8: permanents sacrificed to
-    // pay one cost component leave the battlefield together.
-    let departed_ids: Vec<ObjectId> = pending
+    // CR 601.2h + CR 608.2f: separate selected costs pay in their existing order;
+    // the members of one selected sacrifice action share its event boundary.
+    for component in pending
         .deferred_sacrificed_permanents
-        .iter()
-        .map(|selection| selection.object_id)
-        .collect();
-    crate::game::zones::mark_simultaneous_departures(
-        events,
-        &crate::game::zones::departed_subset(state, &departed_ids),
-    );
+        .chunk_by(|a, b| a.component == b.component)
+    {
+        let candidates: Vec<_> = component
+            .iter()
+            .map(|selection| selection.object_id)
+            .collect();
+        crate::game::zones::with_departure_suppression(
+            state,
+            events,
+            &candidates,
+            |state, events, owner| {
+                for selection in component {
+                    let id = selection.object_id;
+                    match crate::game::zones::with_departure_member(
+                        state,
+                        events,
+                        owner,
+                        id,
+                        |state, events| {
+                            super::sacrifice::sacrifice_permanent(state, id, player, events)
+                        },
+                    )
+                    .map_err(|e| EngineError::InvalidAction(format!("{e}")))?
+                    {
+                        super::sacrifice::SacrificeOutcome::Complete => {}
+                        super::sacrifice::SacrificeOutcome::NeedsReplacementChoice(_) => {
+                            return Err(EngineError::ActionNotAllowed(
+                                "Deferred sacrifice cost requires replacement ordering".to_string(),
+                            ));
+                        }
+                    }
+                }
+                Ok::<(), EngineError>(())
+            },
+        )?;
+    }
     Ok(Some((cost_event_start, events.len())))
 }
 
@@ -1858,6 +1916,7 @@ pub(crate) fn handle_sacrifice_for_cost(
     selection: CostSelection<'_>,
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
+    validate_deferred_sacrifice_components(&pending.deferred_sacrificed_permanents)?;
     let CostSelection {
         min_count,
         count,
@@ -1986,6 +2045,11 @@ pub(crate) fn handle_sacrifice_for_cost(
     });
     if let Some(filter) = deferred_sacrifice_filter {
         if can_defer_spell_sacrifice_until_mana_payment(state, player, &pending, chosen) {
+            let component = DeferredSacrificeComponentId(
+                u64::try_from(pending.deferred_sacrificed_permanents.len()).map_err(|_| {
+                    EngineError::InvalidAction("Too many deferred sacrifice selections".to_string())
+                })?,
+            );
             pending
                 .deferred_sacrificed_permanents
                 .extend(
@@ -1995,6 +2059,7 @@ pub(crate) fn handle_sacrifice_for_cost(
                         .map(|object_id| DeferredSacrificeSelection {
                             object_id,
                             filter: filter.clone(),
+                            component: Some(component),
                         }),
                 );
             return finish_pending_cost_or_cast(state, player, pending, events);
@@ -2008,21 +2073,28 @@ pub(crate) fn handle_sacrifice_for_cost(
     // block after `finish_pending_cost_or_cast`).
     let cost_event_start = events.len();
 
-    // Sacrifice each chosen permanent
-    for &id in chosen {
-        super::sacrifice::sacrifice_permanent(state, id, player, events)
-            .map_err(|e| EngineError::InvalidAction(format!("{e}")))?;
-    }
-
-    // CR 603.10a + CR 701.21a + CR 601.2h + CR 118.8: permanents sacrificed to pay
-    // one cost component leave the battlefield together; a co-departing observer
-    // among them observes the rest (look-back-in-time). Single authority — identical
-    // wiring to `effects::sacrifice::resolve`. `departed_subset` drops any permanent
-    // that did not actually leave (CantBeSacrificed, replacement).
-    crate::game::zones::mark_simultaneous_departures(
+    crate::game::zones::with_departure_suppression(
+        state,
         events,
-        &crate::game::zones::departed_subset(state, chosen),
-    );
+        chosen,
+        |state, events, owner| {
+            // Sacrifice each chosen permanent
+            for &id in chosen {
+                crate::game::zones::with_departure_member(
+                    state,
+                    events,
+                    owner,
+                    id,
+                    |state, events| {
+                        super::sacrifice::sacrifice_permanent(state, id, player, events)
+                    },
+                )
+                .map_err(|e| EngineError::InvalidAction(format!("{e}")))?;
+            }
+
+            Ok::<(), EngineError>(())
+        },
+    )?;
     let cost_event_end = events.len();
 
     let waiting_for = finish_pending_cost_or_cast(state, player, pending, events)?;
@@ -9132,6 +9204,10 @@ pub fn finalize_mana_payment(
     player: PlayerId,
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
+    if let Some(pending) = state.pending_cast.as_ref() {
+        validate_deferred_sacrifice_components(&pending.deferred_sacrificed_permanents)?;
+    }
+
     // CR 107.4f + CR 601.2f: Pause for per-shard Phyrexian choice if the cost contains
     // Phyrexian mana AND at least one shard has both mana and life options available.
     // `PendingCast` stays in `state.pending_cast` across the pause — the resume handler
@@ -9476,6 +9552,10 @@ pub fn finalize_mana_payment_with_phyrexian_choices(
     phyrexian_choices: &[crate::types::game_state::ShardChoice],
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
+    if let Some(pending) = state.pending_cast.as_ref() {
+        validate_deferred_sacrifice_components(&pending.deferred_sacrificed_permanents)?;
+    }
+
     let pending = state
         .pending_cast
         .take()
@@ -19067,5 +19147,247 @@ its replicate cost was paid.)\nDraw a card.";
             "excluding one real card leaves insufficient Delve capacity for {{X}}{{X}}"
         );
         assert!(state.objects[&real_b].is_delve_eligible(PlayerId(0)));
+    }
+}
+
+#[cfg(test)]
+mod deferred_component_guard_tests {
+    use super::*;
+    use crate::game::scenario::{GameRunner, GameScenario, P0};
+    use crate::types::ability::{AdditionalCost, ControllerRef, SacrificeCost, TypedFilter};
+    use crate::types::actions::GameAction;
+    use crate::types::mana::{ManaCostShard, ManaType, ManaUnit};
+    use crate::types::phase::Phase;
+
+    fn checkpoint(two_components: bool, phyrexian: bool) -> (GameRunner, ObjectId, ObjectId) {
+        let mut s = GameScenario::new();
+        s.at_phase(Phase::PreCombatMain);
+        let a = s.add_vanilla(P0, 2, 2);
+        let b = s.add_vanilla(P0, 2, 2);
+        s.with_mana_pool(
+            P0,
+            vec![
+                ManaUnit::new(ManaType::Colorless, ObjectId(0), false, vec![]),
+                ManaUnit::new(ManaType::Black, ObjectId(0), false, vec![]),
+            ],
+        );
+        let cost = AbilityCost::Sacrifice(SacrificeCost::count(
+            TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You)),
+            1,
+        ));
+        let spell = s
+            .add_spell_to_hand(P0, "Test internal component guard", true)
+            .with_ability_definition(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::GainLife {
+                    amount: QuantityExpr::Fixed { value: 1 },
+                    player: TargetFilter::Controller,
+                },
+            ))
+            .with_mana_cost(ManaCost::Cost {
+                shards: if phyrexian {
+                    vec![ManaCostShard::PhyrexianBlack]
+                } else {
+                    vec![]
+                },
+                generic: 1,
+            })
+            .with_additional_cost(AdditionalCost::Required(if two_components {
+                AbilityCost::Composite {
+                    costs: vec![cost.clone(), cost],
+                }
+            } else {
+                cost
+            }))
+            .id();
+        let mut r = s.build();
+        let card_id = r.state().objects[&spell].card_id;
+        r.act(GameAction::CastSpell {
+            object_id: spell,
+            card_id,
+            targets: vec![],
+            payment_mode: CastPaymentMode::Manual,
+        })
+        .unwrap();
+        assert!(matches!(r.state().waiting_for, WaitingFor::PayCost { .. }));
+        r.act(GameAction::SelectCards { cards: vec![a] }).unwrap();
+        assert_eq!(r.state().objects[&a].zone, Zone::Battlefield);
+        (r, a, b)
+    }
+
+    fn refusal(
+        result: Result<WaitingFor, EngineError>,
+        state: &GameState,
+        before: serde_json::Value,
+        events: &[GameEvent],
+    ) {
+        assert!(
+            matches!(result, Err(EngineError::ActionNotAllowed(_))),
+            "internal entry must refuse unknown provenance before changing state: {result:?}"
+        );
+        assert_eq!(
+            serde_json::to_value(state).unwrap(),
+            before,
+            "early component guard preserves full serialized state"
+        );
+        assert!(
+            events.is_empty(),
+            "early component guard emits no payment or choice events"
+        );
+    }
+
+    #[test]
+    fn deferred_component_normal_finalizer_guard_precedes_phyrexian_prompt() {
+        let (mut r, _, _) = checkpoint(false, true);
+        assert!(matches!(
+            r.state().waiting_for,
+            WaitingFor::ManaPayment { .. }
+        ));
+        r.state_mut()
+            .pending_cast
+            .as_mut()
+            .unwrap()
+            .deferred_sacrificed_permanents[0]
+            .component = None;
+        let before = serde_json::to_value(r.state()).unwrap();
+        let mut events = vec![];
+        let result = finalize_mana_payment(r.state_mut(), P0, &mut events);
+        refusal(result, r.state(), before, &events);
+    }
+
+    #[test]
+    fn deferred_component_phyrexian_finalizer_guard_precedes_payment() {
+        use crate::types::game_state::ShardChoice;
+        let (mut r, _, _) = checkpoint(false, true);
+        r.act(GameAction::PassPriority).unwrap();
+        assert!(matches!(
+            r.state().waiting_for,
+            WaitingFor::PhyrexianPayment { .. }
+        ));
+        r.state_mut()
+            .pending_cast
+            .as_mut()
+            .unwrap()
+            .deferred_sacrificed_permanents[0]
+            .component = None;
+        let before = serde_json::to_value(r.state()).unwrap();
+        let mut events = vec![];
+        let result = finalize_mana_payment_with_phyrexian_choices(
+            r.state_mut(),
+            P0,
+            &[ShardChoice::PayLife],
+            &mut events,
+        );
+        refusal(result, r.state(), before, &events);
+    }
+
+    #[test]
+    fn deferred_component_append_guard_precedes_cost_snapshot_and_new_selection() {
+        let (mut r, _, b) = checkpoint(true, false);
+        let mut pending = r.state().waiting_for.pending_cast_ref().unwrap().clone();
+        pending.deferred_sacrificed_permanents[0].component = None;
+        let before = serde_json::to_value(r.state()).unwrap();
+        let mut events = vec![];
+        let result = handle_sacrifice_for_cost(
+            r.state_mut(),
+            P0,
+            pending,
+            None,
+            CostSelection {
+                min_count: 1,
+                count: 1,
+                legal_permanents: &[b],
+                chosen: &[b],
+            },
+            &mut events,
+        );
+        refusal(result, r.state(), before, &events);
+    }
+
+    #[test]
+    fn deferred_component_layout_clone_serde_and_loop_normalization_keep_provenance() {
+        let (r, _, _) = checkpoint(false, false);
+        let canonical = r.state().pending_cast.as_ref().unwrap().as_ref().clone();
+        assert_eq!(
+            canonical.deferred_sacrificed_permanents[0].component,
+            Some(DeferredSacrificeComponentId(0))
+        );
+        for ids in [
+            vec![],
+            vec![Some(0)],
+            vec![Some(0), Some(0), Some(2)],
+            vec![Some(0), Some(1), Some(1)],
+        ] {
+            let mut p = canonical.clone();
+            p.deferred_sacrificed_permanents = ids
+                .iter()
+                .map(|id| {
+                    let mut selected = canonical.deferred_sacrificed_permanents[0].clone();
+                    selected.component = id.map(DeferredSacrificeComponentId);
+                    selected
+                })
+                .collect();
+            assert!(
+                validate_deferred_sacrifice_components(&p.deferred_sacrificed_permanents).is_ok()
+            );
+            assert_eq!(p.clone(), p);
+            let restored: PendingCast =
+                serde_json::from_value(serde_json::to_value(&p).unwrap()).unwrap();
+            assert_eq!(restored, p);
+        }
+        for ids in [
+            vec![None],
+            vec![None, None],
+            vec![Some(0), None],
+            vec![Some(2)],
+            vec![Some(0), Some(2)],
+            vec![Some(0), Some(1), Some(0)],
+        ] {
+            let selected: Vec<_> = ids
+                .iter()
+                .map(|id| {
+                    let mut selected = canonical.deferred_sacrificed_permanents[0].clone();
+                    selected.component = id.map(DeferredSacrificeComponentId);
+                    selected
+                })
+                .collect();
+            assert!(validate_deferred_sacrifice_components(&selected).is_err());
+            let restored: Vec<DeferredSacrificeSelection> =
+                serde_json::from_value(serde_json::to_value(&selected).unwrap()).unwrap();
+            assert_eq!(
+                restored, selected,
+                "unknown data roundtrips without inventing a component"
+            );
+            if ids == vec![None] {
+                assert!(serde_json::to_value(&selected).unwrap()[0]
+                    .get("component")
+                    .is_none());
+            }
+        }
+        let state = r.state().normalize_for_loop();
+        assert_eq!(
+            state
+                .pending_cast
+                .as_ref()
+                .unwrap()
+                .deferred_sacrificed_permanents,
+            canonical.deferred_sacrificed_permanents
+        );
+        for absent in [false, true] {
+            let mut json = serde_json::to_value(&canonical).unwrap();
+            if absent {
+                json.as_object_mut()
+                    .unwrap()
+                    .remove("deferred_sacrificed_permanents");
+            } else {
+                json["deferred_sacrificed_permanents"] = serde_json::json!([]);
+            }
+            let restored: PendingCast = serde_json::from_value(json).unwrap();
+            assert!(restored.deferred_sacrificed_permanents.is_empty());
+            assert!(validate_deferred_sacrifice_components(
+                &restored.deferred_sacrificed_permanents
+            )
+            .is_ok());
+        }
     }
 }

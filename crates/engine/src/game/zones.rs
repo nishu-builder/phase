@@ -3,7 +3,9 @@ use crate::types::events::GameEvent;
 #[cfg(test)]
 use crate::types::game_state::ZoneChangeRecord;
 use crate::types::game_state::{
-    GameState, ResolutionSourceRelatch, StackEntry, ZoneChangeCombatStatus,
+    DepartureEventKey, DepartureMemberBinding, DepartureScopeFrame, DepartureScopeId,
+    DepartureSubject, DepartureSuppressionCapture, GameState, ResolutionSourceRelatch, StackEntry,
+    TriggerSuppressionSnapshot, ZoneChangeCombatStatus,
 };
 use crate::types::identifiers::{CardId, ObjectId};
 use crate::types::player::PlayerId;
@@ -632,12 +634,313 @@ pub(crate) fn record_resolution_source_relatch(
     }
 }
 
+/// A borrowed authority for one synchronous producer; never stored or serialized.
+pub(crate) struct DepartureScopeToken(DepartureScopeId);
+
+/// CR 603.10: Capture suppression once at the actual action's boundaries.
+pub(crate) fn with_departure_suppression<R>(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+    candidates: &[ObjectId],
+    body: impl FnOnce(&mut GameState, &mut Vec<GameEvent>, &DepartureScopeToken) -> R,
+) -> R {
+    let mut subjects = Vec::new();
+    for id in candidates {
+        if let Some(obj) = state
+            .objects
+            .get(id)
+            .filter(|obj| obj.zone == Zone::Battlefield)
+        {
+            let subject = DepartureSubject {
+                object_id: *id,
+                incarnation: obj.incarnation,
+            };
+            if !subjects.contains(&subject) {
+                subjects.push(subject);
+            }
+        }
+    }
+    let can_capture = !subjects.is_empty()
+        && !state
+            .departure_suppression_scope
+            .frames
+            .iter()
+            .any(|frame| frame.capture.is_some());
+    let capture = if can_capture {
+        #[cfg(test)]
+        {
+            state.departure_suppression_scope.boundary_flushes.0 += 1;
+        }
+        super::layers::flush_layers(state);
+        let active = super::trigger_suppression::active_suppress_trigger_statics(state);
+        Some(DepartureSuppressionCapture {
+            outcomes: subjects
+                .iter()
+                .map(|subject| {
+                    (
+                        *subject,
+                        super::trigger_suppression::outcomes_for_live_subject(
+                            state,
+                            subject.object_id,
+                            &active,
+                        ),
+                    )
+                })
+                .collect(),
+        })
+    } else {
+        // Independent children cannot manufacture a fresh layer world midway
+        // through an ancestor's action. Their records keep unavailable history.
+        None
+    };
+    let scope = &mut state.departure_suppression_scope;
+    let member_depth = scope.member_bindings.len();
+    let id = DepartureScopeId(scope.next_id);
+    scope.next_id += 1;
+    scope.frames.push(DepartureScopeFrame {
+        id,
+        event_start: events.len(),
+        candidates: subjects,
+        capture,
+        emitted: Vec::new(),
+    });
+    scope.member_bindings.push(None);
+    let result = body(state, events, &DepartureScopeToken(id));
+    let scope = &mut state.departure_suppression_scope;
+    assert_eq!(
+        scope.member_bindings.len(),
+        member_depth + 1,
+        "unclosed departure member"
+    );
+    scope.member_bindings.truncate(member_depth);
+    let frame = scope.frames.pop().expect("departure owner remains live");
+    assert_eq!(frame.id, id, "departure owners close in lexical order");
+    finish_departure_suppression(state, events, frame);
+    reset_departure_allocator(state);
+    result
+}
+
+pub(crate) fn with_departure_member<R>(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+    owner: &DepartureScopeToken,
+    object_id: ObjectId,
+    body: impl FnOnce(&mut GameState, &mut Vec<GameEvent>) -> R,
+) -> R {
+    let frame = state
+        .departure_suppression_scope
+        .frames
+        .iter()
+        .find(|frame| frame.id == owner.0)
+        .expect("borrowed departure owner remains live");
+    let subject = state
+        .objects
+        .get(&object_id)
+        .filter(|obj| obj.zone == Zone::Battlefield)
+        .map(|obj| DepartureSubject {
+            object_id,
+            incarnation: obj.incarnation,
+        })
+        .filter(|subject| frame.candidates.contains(subject));
+    let binding = subject.map(|subject| DepartureMemberBinding {
+        owner: owner.0,
+        subject,
+    });
+    with_departure_binding(state, events, binding, body)
+}
+
+pub(crate) fn without_departure_member<R>(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+    body: impl FnOnce(&mut GameState, &mut Vec<GameEvent>) -> R,
+) -> R {
+    with_departure_binding(state, events, None, body)
+}
+
+fn with_departure_binding<R>(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+    binding: Option<DepartureMemberBinding>,
+    body: impl FnOnce(&mut GameState, &mut Vec<GameEvent>) -> R,
+) -> R {
+    let depth = state.departure_suppression_scope.member_bindings.len();
+    state
+        .departure_suppression_scope
+        .member_bindings
+        .push(binding);
+    let result = body(state, events);
+    assert_eq!(
+        state.departure_suppression_scope.member_bindings.len(),
+        depth + 1
+    );
+    state
+        .departure_suppression_scope
+        .member_bindings
+        .truncate(depth);
+    reset_departure_allocator(state);
+    result
+}
+
+fn reset_departure_allocator(state: &mut GameState) {
+    let scope = &mut state.departure_suppression_scope;
+    if scope.frames.is_empty() && scope.member_bindings.is_empty() {
+        scope.next_id = 0;
+    }
+}
+
+fn finish_departure_suppression(
+    state: &mut GameState,
+    events: &mut [GameEvent],
+    frame: DepartureScopeFrame,
+) {
+    if frame.emitted.is_empty() {
+        return;
+    }
+    let active = frame.capture.as_ref().map(|_| {
+        #[cfg(test)]
+        {
+            state.departure_suppression_scope.boundary_flushes.1 += 1;
+        }
+        super::layers::flush_layers(state);
+        super::trigger_suppression::active_suppress_trigger_statics(state)
+    });
+    let group: Vec<ObjectId> = frame.emitted.iter().map(|key| key.object_id).collect();
+    for key in frame.emitted {
+        assert!(key.event_offset >= frame.event_start);
+        let GameEvent::ZoneChanged {
+            object_id,
+            from: Some(Zone::Battlefield),
+            record,
+            ..
+        } = &mut events[key.event_offset]
+        else {
+            panic!("departure event identity changed");
+        };
+        assert_eq!(*object_id, key.object_id);
+        assert_eq!(record.turn_zone_change_index, key.turn_zone_change_index);
+        if let (Some(capture), Some(active)) = (&frame.capture, &active) {
+            let before = &capture
+                .outcomes
+                .iter()
+                .find(|(subject, _)| subject.object_id == key.object_id)
+                .expect("claimed occurrence has captured subject")
+                .1;
+            assert!(
+                record.trigger_suppression.is_none(),
+                "occurrence finalized once"
+            );
+            record.trigger_suppression = Some(TriggerSuppressionSnapshot {
+                before: before.clone(),
+                after: super::trigger_suppression::outcomes_for_record(state, record, active),
+            });
+        }
+        // Exact claimed occurrences only: independent child events are excluded.
+        record.co_departed = group
+            .iter()
+            .copied()
+            .filter(|id| *id != *object_id)
+            .collect();
+    }
+}
+
+fn with_departure_leaf(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+    object_id: ObjectId,
+    to: Zone,
+    body: impl FnOnce(&mut GameState, &mut Vec<GameEvent>, Option<DepartureMemberBinding>),
+) {
+    let subject = state
+        .objects
+        .get(&object_id)
+        .filter(|obj| obj.zone == Zone::Battlefield && to != Zone::Battlefield)
+        .map(|obj| DepartureSubject {
+            object_id,
+            incarnation: obj.incarnation,
+        });
+    let binding = state
+        .departure_suppression_scope
+        .member_bindings
+        .last()
+        .copied()
+        .flatten()
+        .filter(|binding| Some(binding.subject) == subject);
+    if let Some(binding) = binding {
+        // Consume the borrowed member for this leaf only; recursive delivery is
+        // an independent cause unless its producer explicitly supplies a member.
+        without_departure_member(state, events, |state, events| {
+            body(state, events, Some(binding))
+        });
+    } else if subject.is_some()
+        && !state
+            .departure_suppression_scope
+            .frames
+            .iter()
+            .any(|frame| frame.capture.is_some())
+    {
+        with_departure_suppression(state, events, &[object_id], |state, events, owner| {
+            with_departure_member(state, events, owner, object_id, |state, events| {
+                let binding = state
+                    .departure_suppression_scope
+                    .member_bindings
+                    .last()
+                    .copied()
+                    .flatten();
+                without_departure_member(state, events, |state, events| {
+                    body(state, events, binding)
+                });
+            });
+        });
+    } else {
+        without_departure_member(state, events, |state, events| body(state, events, None));
+    }
+}
+
+fn claim_departure_event(
+    state: &mut GameState,
+    binding: Option<DepartureMemberBinding>,
+    from: Zone,
+    object_id: ObjectId,
+    turn_zone_change_index: usize,
+    event_offset: usize,
+) {
+    if from != Zone::Battlefield {
+        return;
+    }
+    if let Some(binding) = binding {
+        assert_eq!(binding.subject.object_id, object_id);
+        let frame = state
+            .departure_suppression_scope
+            .frames
+            .iter_mut()
+            .find(|frame| frame.id == binding.owner)
+            .expect("leaf owner remains live");
+        frame.emitted.push(DepartureEventKey {
+            event_offset,
+            object_id,
+            turn_zone_change_index,
+        });
+    }
+}
+
 /// CR 400.7: Move an object to a new zone. An object that moves to a new zone becomes a new object.
 pub fn move_to_zone(
     state: &mut GameState,
     object_id: ObjectId,
+    to: Zone,
+    events: &mut Vec<GameEvent>,
+) {
+    with_departure_leaf(state, events, object_id, to, |state, events, binding| {
+        move_to_zone_inner(state, object_id, to, events, binding);
+    });
+}
+
+fn move_to_zone_inner(
+    state: &mut GameState,
+    object_id: ObjectId,
     mut to: Zone,
     events: &mut Vec<GameEvent>,
+    departure_binding: Option<DepartureMemberBinding>,
 ) {
     // CR 111.8: A token that has left the battlefield can't move to another zone
     // or come back onto the battlefield — "if such a token would change zones, it
@@ -925,6 +1228,15 @@ pub fn move_to_zone(
         });
     }
 
+    // Turn-history copies above deliberately remain non-authoritative.
+    claim_departure_event(
+        state,
+        departure_binding,
+        from,
+        object_id,
+        turn_zone_change_index,
+        events.len(),
+    );
     events.push(GameEvent::ZoneChanged {
         object_id,
         from: Some(from),
@@ -940,7 +1252,7 @@ pub fn move_to_zone(
 /// as the creatures it counts triggers once per co-dying creature).
 ///
 /// Producers of a simultaneous departure batch — one board wipe (`DestroyAll`),
-/// one state-based-action destruction pass (CR 704.7), one mass bounce/exile —
+/// one state-based-action destruction pass (CR 704.3), one mass bounce/exile —
 /// call this on the events they just produced, AFTER moving every member. This
 /// is the authority for simultaneity: it is established here at the
 /// event-production layer rather than inferred downstream from the shape of the
@@ -1127,6 +1439,24 @@ pub fn move_to_library_at_index(
     index: Option<usize>,
     events: &mut Vec<GameEvent>,
 ) {
+    with_departure_leaf(
+        state,
+        events,
+        object_id,
+        Zone::Library,
+        |state, events, binding| {
+            move_to_library_at_index_inner(state, object_id, index, events, binding);
+        },
+    );
+}
+
+fn move_to_library_at_index_inner(
+    state: &mut GameState,
+    object_id: ObjectId,
+    index: Option<usize>,
+    events: &mut Vec<GameEvent>,
+    departure_binding: Option<DepartureMemberBinding>,
+) {
     // CR 111.8: A token that has left the battlefield can't move to another zone.
     if state
         .objects
@@ -1205,6 +1535,15 @@ pub fn move_to_library_at_index(
         });
     }
 
+    // Turn-history copies above deliberately remain non-authoritative.
+    claim_departure_event(
+        state,
+        departure_binding,
+        from,
+        object_id,
+        turn_zone_change_index,
+        events.len(),
+    );
     events.push(GameEvent::ZoneChanged {
         object_id,
         from: Some(from),
@@ -1437,6 +1776,342 @@ mod tests {
 
     fn setup() -> GameState {
         GameState::new_two_player(42)
+    }
+
+    fn assert_departure_scope_empty(state: &GameState) {
+        let scope = &state.departure_suppression_scope;
+        assert!(scope.frames.is_empty());
+        assert!(scope.member_bindings.is_empty());
+        assert_eq!(scope.next_id, 0);
+    }
+
+    fn departure_test_subject(state: &mut GameState) -> ObjectId {
+        create_object(
+            state,
+            CardId(100),
+            PlayerId(0),
+            "Scope subject".to_string(),
+            Zone::Battlefield,
+        )
+    }
+
+    #[test]
+    fn departure_scope_closes_on_error_and_only_claims_explicit_members() {
+        let mut state = setup();
+        let first = departure_test_subject(&mut state);
+        let second = departure_test_subject(&mut state);
+        let child = departure_test_subject(&mut state);
+        let mut events = Vec::new();
+        let result: Result<(), ()> = with_departure_suppression(
+            &mut state,
+            &mut events,
+            &[first, second, child],
+            |state, events, owner| {
+                with_departure_member(state, events, owner, first, |state, events| {
+                    move_to_zone(state, first, Zone::Graveyard, events);
+                });
+                assert!(
+                    state.layers_dirty.is_dirty(),
+                    "member leaf must not flush the intermediate board"
+                );
+                assert_eq!(state.departure_suppression_scope.boundary_flushes, (1, 0));
+                assert!(
+                    matches!(&events[0], GameEvent::ZoneChanged { record, .. } if record.trigger_suppression.is_none()),
+                    "owned leaf must not publish a provisional snapshot"
+                );
+                // The general resolver's barrier has the same isolation semantics.
+                with_departure_member(state, events, owner, child, |state, events| {
+                    without_departure_member(state, events, |state, events| {
+                        move_to_zone(state, child, Zone::Graveyard, events);
+                    });
+                });
+                with_departure_member(state, events, owner, second, |state, events| {
+                    move_to_zone(state, second, Zone::Graveyard, events);
+                });
+                assert_eq!(state.departure_suppression_scope.boundary_flushes, (1, 0));
+                Err(())
+            },
+        );
+        assert!(result.is_err());
+        assert_departure_scope_empty(&state);
+        assert_eq!(state.departure_suppression_scope.boundary_flushes, (1, 1));
+        let records: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                GameEvent::ZoneChanged { record, .. } => Some(record),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].co_departed, vec![second]);
+        assert_eq!(records[2].co_departed, vec![first]);
+        assert!(records[0].trigger_suppression.is_some());
+        assert!(records[2].trigger_suppression.is_some());
+        assert!(records[1].trigger_suppression.is_none());
+        assert!(records[1].co_departed.is_empty());
+        assert!(state
+            .zone_changes_this_turn
+            .iter()
+            .all(|record| record.trigger_suppression.is_none()));
+    }
+
+    #[test]
+    fn departure_scope_nested_owners_and_reused_ids_do_not_steal_occurrences() {
+        let mut state = setup();
+        let first = departure_test_subject(&mut state);
+        let second = departure_test_subject(&mut state);
+        let mut events = Vec::new();
+        with_departure_suppression(
+            &mut state,
+            &mut events,
+            &[first, second],
+            |state, events, owner| {
+                with_departure_member(state, events, owner, first, |state, events| {
+                    move_to_zone(state, first, Zone::Graveyard, events);
+                });
+                with_departure_suppression(state, events, &[second], |state, events, child| {
+                    with_departure_member(state, events, child, second, |state, events| {
+                        move_to_zone(state, second, Zone::Graveyard, events);
+                    });
+                });
+                move_to_zone(state, first, Zone::Battlefield, events);
+                with_departure_member(state, events, owner, first, |state, events| {
+                    move_to_zone(state, first, Zone::Graveyard, events);
+                });
+            },
+        );
+        assert_departure_scope_empty(&state);
+        let records: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                GameEvent::ZoneChanged {
+                    from: Some(Zone::Battlefield),
+                    record,
+                    ..
+                } => Some(record),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(records.len(), 3);
+        assert!(records[0].trigger_suppression.is_some());
+        assert!(records[1].trigger_suppression.is_none());
+        assert!(records[2].trigger_suppression.is_none());
+        assert!(records.iter().all(|record| record.co_departed.is_empty()));
+        assert_ne!(
+            records[0].turn_zone_change_index,
+            records[2].turn_zone_change_index
+        );
+    }
+
+    #[test]
+    fn departure_scope_empty_parent_allows_independent_capture_and_settled_roundtrip() {
+        let mut state = setup();
+        let id = departure_test_subject(&mut state);
+        let mut events = Vec::new();
+        with_departure_suppression(&mut state, &mut events, &[], |state, events, _| {
+            move_to_library_at_index(state, id, Some(0), events);
+        });
+        assert_departure_scope_empty(&state);
+        assert_eq!(state.objects[&id].zone, Zone::Library);
+        let GameEvent::ZoneChanged { record, .. } = &events[0] else {
+            panic!("departure");
+        };
+        assert_eq!(
+            record.trigger_suppression,
+            Some(TriggerSuppressionSnapshot::default())
+        );
+        let cloned = state.clone();
+        assert_eq!(state, cloned);
+        assert_departure_scope_empty(&cloned.normalize_for_loop());
+        let json = serde_json::to_value(&state).unwrap();
+        assert!(json.get("departure_suppression_scope").is_none());
+        let restored: GameState = serde_json::from_value(json).unwrap();
+        assert_departure_scope_empty(&restored);
+        assert_eq!(restored.objects[&id].zone, Zone::Library);
+    }
+
+    #[test]
+    fn departure_scope_standalone_after_world_is_final_at_each_leaf_return() {
+        use crate::game::scenario::{GameScenario, P0};
+        use crate::types::statics::{StaticMode, SuppressedTriggerEvent};
+
+        for library in [false, true] {
+            for grant in [false, true] {
+                let mut scenario = GameScenario::new();
+                let suppression = StaticMode::SuppressTriggers {
+                    source_filter: TargetFilter::Any,
+                    events: vec![SuppressedTriggerEvent::Dies],
+                };
+                let mut survivor = scenario.add_creature(P0, "Scope surviving static", 2, 2);
+                if !grant {
+                    survivor.with_static_definition(StaticDefinition::new(suppression.clone()));
+                }
+                let survivor = survivor.id();
+                let source = scenario
+                    .add_creature(P0, "Scope departing modifier", 2, 2)
+                    .with_static_definition(
+                        StaticDefinition::continuous()
+                            .affected(TargetFilter::SpecificObject { id: survivor })
+                            .modifications(vec![if grant {
+                                ContinuousModification::AddStaticMode { mode: suppression }
+                            } else {
+                                ContinuousModification::RemoveAllAbilities
+                            }]),
+                    )
+                    .id();
+                let mut state = scenario.build().state().clone();
+                super::super::layers::flush_layers(&mut state);
+                let functioning = |state: &GameState| {
+                    super::super::functioning_abilities::battlefield_active_statics(state).any(
+                        |(object, definition)| {
+                            object.id == survivor
+                                && matches!(definition.mode, StaticMode::SuppressTriggers { .. })
+                        },
+                    )
+                };
+                assert_eq!(functioning(&state), grant);
+                let mut events = Vec::new();
+                if library {
+                    move_to_library_at_index(&mut state, source, Some(0), &mut events);
+                } else {
+                    move_to_zone(&mut state, source, Zone::Graveyard, &mut events);
+                }
+                // Inspect immediately: no collector or additional layer flush.
+                let GameEvent::ZoneChanged { record, .. } = &events[0] else {
+                    panic!("actual departure");
+                };
+                assert_eq!(
+                    record.trigger_suppression,
+                    Some(TriggerSuppressionSnapshot {
+                        before: if grant {
+                            vec![SuppressedTriggerEvent::Dies]
+                        } else {
+                            vec![]
+                        },
+                        after: if grant {
+                            vec![]
+                        } else {
+                            vec![SuppressedTriggerEvent::Dies]
+                        },
+                    })
+                );
+                assert_eq!(functioning(&state), !grant);
+                assert_eq!(state.objects[&survivor].zone, Zone::Battlefield);
+                assert_eq!(
+                    state.objects[&source].zone,
+                    if library {
+                        Zone::Library
+                    } else {
+                        Zone::Graveyard
+                    }
+                );
+                if library {
+                    assert_eq!(state.players[0].library.front(), Some(&source));
+                }
+                assert_eq!(state.departure_suppression_scope.boundary_flushes, (1, 1));
+                assert_departure_scope_empty(&state);
+            }
+        }
+    }
+
+    #[test]
+    fn departure_scope_natural_replacement_pause_and_resume_restore_empty_stacks() {
+        use crate::game::scenario::{GameRunner, GameScenario, P0};
+        use crate::types::ability::{
+            AbilityDefinition, AbilityKind, Effect, MultiTargetSpec, ReplacementDefinition,
+        };
+        use crate::types::actions::GameAction;
+        use crate::types::game_state::WaitingFor;
+        use crate::types::phase::Phase;
+        use crate::types::replacements::ReplacementEvent;
+        use crate::types::zones::EtbTapState;
+
+        let change = |target, destination| {
+            AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::ChangeZone {
+                    origin: Some(Zone::Battlefield),
+                    destination,
+                    target,
+                    owner_library: false,
+                    enter_transformed: false,
+                    enters_under: None,
+                    enter_tapped: EtbTapState::Unspecified,
+                    enters_attacking: false,
+                    up_to: false,
+                    enter_with_counters: vec![],
+                    conditional_enter_with_counters: vec![],
+                    face_down_profile: None,
+                    enters_modified_if: None,
+                },
+            )
+        };
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let first = scenario.add_vanilla(P0, 2, 2);
+        let paused_subject = scenario.add_vanilla(P0, 2, 2);
+        let last = scenario.add_vanilla(P0, 2, 2);
+        for name in ["Scope redirect A", "Scope redirect B"] {
+            scenario
+                .add_creature(P0, name, 0, 0)
+                .as_enchantment()
+                .with_replacement_definition(
+                    ReplacementDefinition::new(ReplacementEvent::Moved)
+                        .destination_zone(Zone::Graveyard)
+                        .valid_card(TargetFilter::SpecificObject { id: paused_subject })
+                        .execute(change(TargetFilter::SelfRef, Zone::Exile)),
+                );
+        }
+        let spell = scenario
+            .add_spell_to_hand(P0, "Scope pause fixture", true)
+            .with_ability_definition(
+                change(
+                    TargetFilter::Typed(TypedFilter::creature()),
+                    Zone::Graveyard,
+                )
+                .multi_target(MultiTargetSpec::fixed(3, 3)),
+            )
+            .id();
+        let mut runner = scenario.build();
+        let paused = runner
+            .cast(spell)
+            .target_objects(&[first, paused_subject, last])
+            .resolve();
+        assert!(matches!(
+            paused.final_waiting_for(),
+            WaitingFor::ReplacementChoice { .. }
+        ));
+        paused.assert_zone(&[first], Zone::Graveyard);
+        paused.assert_zone(&[paused_subject, last], Zone::Battlefield);
+        assert!(paused.events().iter().any(|event| matches!(
+            event, GameEvent::ZoneChanged { object_id, record, .. }
+                if *object_id == first && record.trigger_suppression.is_some()
+        )));
+        assert_departure_scope_empty(runner.state());
+        let saved = serde_json::to_value(runner.state()).unwrap();
+        assert!(saved.get("departure_suppression_scope").is_none());
+        let restored: GameState = serde_json::from_value(saved).unwrap();
+        assert_departure_scope_empty(&restored);
+        let mut runner = GameRunner::from_state(restored);
+        for _ in 0..12 {
+            let action = match &runner.state().waiting_for {
+                WaitingFor::ReplacementChoice { .. } => GameAction::ChooseReplacement { index: 0 },
+                WaitingFor::Priority { .. } if runner.state().stack.is_empty() => break,
+                WaitingFor::Priority { .. } => GameAction::PassPriority,
+                other => panic!("unexpected resume prompt: {other:?}"),
+            };
+            runner.act(action).unwrap();
+            assert_departure_scope_empty(runner.state());
+        }
+        assert_eq!(runner.state().objects[&first].zone, Zone::Graveyard);
+        assert_eq!(runner.state().objects[&paused_subject].zone, Zone::Exile);
+        assert_eq!(runner.state().objects[&last].zone, Zone::Graveyard);
+        assert!(runner.state().stack.is_empty());
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::Priority { .. }
+        ));
+        assert_departure_scope_empty(runner.state());
     }
 
     #[test]
@@ -3266,6 +3941,164 @@ mod tests {
                 )
             }),
             "SBA zone movement must still publish the unattach event for triggers"
+        );
+    }
+    #[test]
+    fn departure_scope_before_world_flushes_dirty_ability_authority() {
+        use crate::game::scenario::{GameScenario, P0};
+        use crate::types::statics::{StaticMode, SuppressedTriggerEvent};
+        for library in [false, true] {
+            for grant in [false, true] {
+                let mut scenario = GameScenario::new();
+                let suppression = StaticMode::SuppressTriggers {
+                    source_filter: TargetFilter::Any,
+                    events: vec![SuppressedTriggerEvent::Dies],
+                };
+                let mut survivor = scenario.add_creature(P0, "Dirty surviving static", 2, 2);
+                if !grant {
+                    survivor.with_static_definition(StaticDefinition::new(suppression.clone()));
+                }
+                let survivor = survivor.id();
+                let source = scenario
+                    .add_creature(P0, "Dirty departing modifier", 2, 2)
+                    .with_static_definition(
+                        StaticDefinition::continuous()
+                            .affected(TargetFilter::SpecificObject { id: survivor })
+                            .modifications(vec![if grant {
+                                ContinuousModification::AddStaticMode { mode: suppression }
+                            } else {
+                                ContinuousModification::RemoveAllAbilities
+                            }]),
+                    )
+                    .id();
+                let mut state = scenario.build().state().clone();
+                // Leave real typed continuous-effect work dirty at leaf entry.
+                // This reach guard prevents an external preparatory flush from
+                // making the owner-entry flush mutation vacuous.
+                assert!(state.layers_dirty.is_dirty());
+                let functioning = |state: &GameState| {
+                    super::super::functioning_abilities::battlefield_active_statics(state).any(
+                        |(object, definition)| {
+                            object.id == survivor
+                                && matches!(definition.mode, StaticMode::SuppressTriggers { .. })
+                        },
+                    )
+                };
+                assert_eq!(functioning(&state), !grant);
+                let mut events = Vec::new();
+                if library {
+                    move_to_library_at_index(&mut state, source, Some(0), &mut events);
+                } else {
+                    move_to_zone(&mut state, source, Zone::Graveyard, &mut events);
+                }
+                let GameEvent::ZoneChanged {
+                    object_id,
+                    from: Some(Zone::Battlefield),
+                    record,
+                    ..
+                } = &events[0]
+                else {
+                    panic!("real battlefield departure");
+                };
+                assert_eq!(*object_id, source);
+                assert_eq!(
+                    record.trigger_suppression,
+                    Some(TriggerSuppressionSnapshot {
+                        before: if grant {
+                            vec![SuppressedTriggerEvent::Dies]
+                        } else {
+                            vec![]
+                        },
+                        after: if grant {
+                            vec![]
+                        } else {
+                            vec![SuppressedTriggerEvent::Dies]
+                        },
+                    }),
+                    "owner before-world must evaluate dirty continuous-effect authority"
+                );
+                assert_eq!(functioning(&state), !grant);
+                assert_eq!(state.objects[&survivor].zone, Zone::Battlefield);
+                assert_eq!(
+                    state.objects[&source].zone,
+                    if library {
+                        Zone::Library
+                    } else {
+                        Zone::Graveyard
+                    }
+                );
+                assert_departure_scope_empty(&state);
+            }
+        }
+    }
+
+    #[test]
+    fn departure_scope_recursive_member_leaf_does_not_claim_ancestor() {
+        let mut state = setup();
+        let first = departure_test_subject(&mut state);
+        let second = departure_test_subject(&mut state);
+        let first_incarnation = state.objects[&first].incarnation;
+        let mut events = Vec::new();
+        with_departure_suppression(
+            &mut state,
+            &mut events,
+            &[first, second],
+            |state, events, owner| {
+                with_departure_member(state, events, owner, first, |state, events| {
+                    with_departure_leaf(
+                        state,
+                        events,
+                        first,
+                        Zone::Graveyard,
+                        |state, events, outer_binding| {
+                            assert!(outer_binding.is_some());
+                            // Exercise the leaf callback's recursive-delivery contract:
+                            // this actual child move has the same live ID/incarnation.
+                            // No event or record is synthesized by the fixture.
+                            move_to_zone(state, first, Zone::Exile, events);
+                        },
+                    );
+                });
+                with_departure_member(state, events, owner, second, |state, events| {
+                    move_to_zone(state, second, Zone::Graveyard, events);
+                });
+            },
+        );
+        assert_departure_scope_empty(&state);
+        assert_eq!(state.objects[&first].zone, Zone::Exile);
+        assert_eq!(state.objects[&first].incarnation, first_incarnation + 1);
+        assert_eq!(state.objects[&second].zone, Zone::Graveyard);
+        let records: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                GameEvent::ZoneChanged {
+                    object_id,
+                    from: Some(Zone::Battlefield),
+                    record,
+                    ..
+                } => Some((*object_id, record.as_ref())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].0, first);
+        assert_eq!(records[1].0, second);
+        assert!(
+            records[0].1.trigger_suppression.is_none(),
+            "recursive child cannot claim the ancestor member's snapshot"
+        );
+        assert!(records[0].1.co_departed.is_empty());
+        assert_eq!(
+            records[1].1.trigger_suppression,
+            Some(TriggerSuppressionSnapshot::default())
+        );
+        assert!(
+            records[1].1.co_departed.is_empty(),
+            "ancestor direct singleton cannot absorb recursive child's event"
+        );
+        assert_ne!(
+            records[0].1.turn_zone_change_index,
+            records[1].1.turn_zone_change_index
         );
     }
 }

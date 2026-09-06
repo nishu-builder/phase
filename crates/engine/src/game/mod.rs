@@ -156,6 +156,7 @@ pub mod topology;
 pub mod transform;
 pub mod trigger_index;
 pub(crate) mod trigger_matchers;
+pub(crate) mod trigger_suppression;
 pub mod triggers;
 pub mod turn_control;
 pub mod turns;

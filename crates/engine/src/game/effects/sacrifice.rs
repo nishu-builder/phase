@@ -277,26 +277,38 @@ pub fn resolve(
         // this rather than round-tripping through EffectZoneChoice.
         if !up_to && eligible.len() <= count {
             let mut sacrificed: i32 = 0;
-            for &obj_id in &eligible {
-                match sacrifice::sacrifice_permanent(state, obj_id, chooser, events) {
-                    Ok(SacrificeOutcome::Complete) => sacrificed += 1,
-                    Ok(SacrificeOutcome::NeedsReplacementChoice(player)) => {
-                        state.waiting_for =
-                            crate::game::replacement::replacement_choice_waiting_for(player, state);
-                        return Ok(());
-                    }
-                    Err(_) => {}
-                }
-            }
-            // CR 701.17a + CR 603.10a + CR 608.2f: every eligible permanent was
-            // sacrificed as part of the same resolution event, so co-departing
-            // sacrifice/LTB observers (Blood Artist) observe each other.
-            // `departed_subset` drops any permanent that didn't actually leave
-            // (e.g. CantBeSacrificed members excluded upstream).
-            crate::game::zones::mark_simultaneous_departures(
+            let paused = crate::game::zones::with_departure_suppression(
+                state,
                 events,
-                &crate::game::zones::departed_subset(state, &eligible),
+                &eligible,
+                |state, events, owner| {
+                    for &obj_id in &eligible {
+                        match crate::game::zones::with_departure_member(
+                            state,
+                            events,
+                            owner,
+                            obj_id,
+                            |state, events| {
+                                sacrifice::sacrifice_permanent(state, obj_id, chooser, events)
+                            },
+                        ) {
+                            Ok(SacrificeOutcome::Complete) => sacrificed += 1,
+                            Ok(SacrificeOutcome::NeedsReplacementChoice(player)) => {
+                                state.waiting_for =
+                                    crate::game::replacement::replacement_choice_waiting_for(
+                                        player, state,
+                                    );
+                                return true;
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    false
+                },
             );
+            if paused {
+                return Ok(());
+            }
             state.last_effect_count = Some(sacrificed);
             events.push(GameEvent::EffectResolved {
                 kind: EffectKind::from(&ability.effect),

@@ -3302,27 +3302,45 @@ pub(super) fn handle_resolution_choice(
             let events_before_effect = events.len();
             match effect_kind {
                 EffectKind::Sacrifice => {
-                    for &card_id in &chosen {
-                        match super::sacrifice::sacrifice_permanent(state, card_id, player, events)
-                        {
-                            Ok(super::sacrifice::SacrificeOutcome::Complete) => {}
-                            Ok(super::sacrifice::SacrificeOutcome::NeedsReplacementChoice(
-                                choice_player,
-                            )) => {
-                                state.waiting_for =
-                                    super::replacement::replacement_choice_waiting_for(
-                                        choice_player,
-                                        state,
-                                    );
-                                return Ok(action_result_outcome(
+                    if super::zones::with_departure_suppression(
+                        state,
+                        events,
+                        &chosen,
+                        |state, events, owner| {
+                            for &card_id in &chosen {
+                                match super::zones::with_departure_member(
+                                    state,
                                     events,
-                                    state.waiting_for.clone(),
-                                ));
+                                    owner,
+                                    card_id,
+                                    |state, events| {
+                                        super::sacrifice::sacrifice_permanent(
+                                            state, card_id, player, events,
+                                        )
+                                    },
+                                ) {
+                                    Ok(super::sacrifice::SacrificeOutcome::Complete) => {}
+                                    Ok(
+                                        super::sacrifice::SacrificeOutcome::NeedsReplacementChoice(
+                                            choice_player,
+                                        ),
+                                    ) => {
+                                        state.waiting_for =
+                                            super::replacement::replacement_choice_waiting_for(
+                                                choice_player,
+                                                state,
+                                            );
+                                        return Ok(true);
+                                    }
+                                    Err(error) => {
+                                        return Err(EngineError::InvalidAction(error.to_string()));
+                                    }
+                                }
                             }
-                            Err(error) => {
-                                return Err(EngineError::InvalidAction(error.to_string()));
-                            }
-                        }
+                            Ok::<bool, EngineError>(false)
+                        },
+                    )? {
+                        return Ok(action_result_outcome(events, state.waiting_for.clone()));
                     }
                 }
                 EffectKind::ChangeZone | EffectKind::BounceAll => {
@@ -3332,45 +3350,50 @@ pub(super) fn handle_resolution_choice(
                         )
                     })?;
                     let chosen_ids: Vec<_> = chosen.to_vec();
-                    for (i, card_id) in chosen_ids.iter().enumerate() {
-                        let per_obj_enter_counters =
-                            effects::change_zone::enter_with_counters_for_pending_object(
-                                state,
-                                source_id,
-                                *card_id,
-                                &enter_with_counters,
-                                &conditional_enter_with_counters,
-                            );
-                        let ctx = effects::change_zone::ChangeZoneIterationCtx {
-                            source_id,
-                            controller: player,
-                            origin: Some(zone),
-                            destination: dest_zone,
-                            enter_transformed,
-                            enter_tapped,
-                            enters_under_player,
-                            enters_attacking,
-                            enter_with_counters: per_obj_enter_counters,
-                            conditional_enter_with_counters: vec![],
-                            duration: None,
-                            track_exiled_by_source,
-                            // CR 708.2a + CR 708.3: thread the face-down profile that
-                            // was carried across the `EffectZoneChoice` round-trip into
-                            // the move ctx, so a selected face-down `ChangeZone` card
-                            // (Yedora-style return paused for selection) enters FACE
-                            // DOWN with the specified characteristics instead of
-                            // resuming face up and exposing the real object.
-                            face_down_profile: face_down_profile.clone(),
-                            library_placement: None,
-                            // CR 614.12: evaluate the moved-object type gate carried
-                            // across the `EffectZoneChoice` round-trip against each
-                            // chosen object (Summoner's Grimoire).
-                            enters_modified_if: enters_modified_if.clone(),
-                            enter_attached_to: None,
-                        };
-                        match effects::change_zone::process_one_zone_move(
+                    if super::zones::with_departure_suppression(
+                        state,
+                        events,
+                        &chosen_ids,
+                        |state, events, owner| {
+                            for (i, card_id) in chosen_ids.iter().enumerate() {
+                                let per_obj_enter_counters =
+                                    effects::change_zone::enter_with_counters_for_pending_object(
+                                        state,
+                                        source_id,
+                                        *card_id,
+                                        &enter_with_counters,
+                                        &conditional_enter_with_counters,
+                                    );
+                                let ctx = effects::change_zone::ChangeZoneIterationCtx {
+                                    source_id,
+                                    controller: player,
+                                    origin: Some(zone),
+                                    destination: dest_zone,
+                                    enter_transformed,
+                                    enter_tapped,
+                                    enters_under_player,
+                                    enters_attacking,
+                                    enter_with_counters: per_obj_enter_counters,
+                                    conditional_enter_with_counters: vec![],
+                                    duration: None,
+                                    track_exiled_by_source,
+                                    // CR 708.2a + CR 708.3: thread the face-down profile that
+                                    // was carried across the `EffectZoneChoice` round-trip into
+                                    // the move ctx, so a selected face-down `ChangeZone` card
+                                    // (Yedora-style return paused for selection) enters FACE
+                                    // DOWN with the specified characteristics instead of
+                                    // resuming face up and exposing the real object.
+                                    face_down_profile: face_down_profile.clone(),
+                                    library_placement: None,
+                                    // CR 614.12: evaluate the moved-object type gate carried
+                                    // across the `EffectZoneChoice` round-trip against each
+                                    // chosen object (Summoner's Grimoire).
+                                    enters_modified_if: enters_modified_if.clone(),
+                                    enter_attached_to: None,
+                                };
+                                match super::zones::with_departure_member(state, events, owner, *card_id, |state, events| effects::change_zone::process_one_zone_move(
                             state, &ctx, *card_id, events,
-                        ) {
+                        )) {
                             effects::change_zone::ZoneMoveResult::Done => {
                                 // CR 118.3: When this is a cost-payment exile (e.g., Mimeoplasm),
                                 // populate the exile-link index map so the continuation can
@@ -3409,10 +3432,7 @@ pub(super) fn handle_resolution_choice(
                                         enter_attached_to: None,
                                         effect_kind,
                                     });
-                                return Ok(action_result_outcome(
-                                    events,
-                                    state.waiting_for.clone(),
-                                ));
+                                return Ok(true);
                             }
                             effects::change_zone::ZoneMoveResult::NeedsChoice(choice_player) => {
                                 // CR 614.12b + CR 614.1c + CR 614.13: stash the
@@ -3452,12 +3472,14 @@ pub(super) fn handle_resolution_choice(
                                         choice_player,
                                         state,
                                     );
-                                return Ok(action_result_outcome(
-                                    events,
-                                    state.waiting_for.clone(),
-                                ));
+                                return Ok(true);
                             }
                         }
+                            }
+                            Ok::<bool, EngineError>(false)
+                        },
+                    )? {
+                        return Ok(action_result_outcome(events, state.waiting_for.clone()));
                     }
                 }
                 EffectKind::Tap => {
@@ -3503,30 +3525,68 @@ pub(super) fn handle_resolution_choice(
                         }
                     }
                 }
-                // CR 115.1: Resolution-time selection for PutAtLibraryPosition
+                // CR 608.2d: Resolution-time selection for PutAtLibraryPosition
                 // from a private zone (e.g. Brainstorm's "put two cards from
-                // your hand on top of your library"). Cards are placed in
-                // selection order (first chosen = top). Expressive Iteration's
-                // tracked-set bottom step chains an exile `ParentTarget` tail —
-                // detect that continuation shape to honor bottom placement.
-                EffectKind::PutAtLibraryPosition => match library_position {
-                    Some(LibraryPosition::Bottom) => {
-                        for &card_id in &chosen {
-                            super::zones::move_to_library_position(state, card_id, false, events);
+                // your hand on top of your library"). Top preserves selection
+                // order, Bottom appends in selection order, and NthFromTop inserts
+                // each selected card at the same index. These private-zone moves
+                // have no owned battlefield departure or death snapshot.
+                EffectKind::PutAtLibraryPosition => super::zones::with_departure_suppression(
+                    state,
+                    events,
+                    &chosen,
+                    |state, events, owner| match library_position {
+                        Some(LibraryPosition::Bottom) => {
+                            for &card_id in &chosen {
+                                super::zones::with_departure_member(
+                                    state,
+                                    events,
+                                    owner,
+                                    card_id,
+                                    |state, events| {
+                                        super::zones::move_to_library_position(
+                                            state, card_id, false, events,
+                                        )
+                                    },
+                                );
+                            }
                         }
-                    }
-                    Some(LibraryPosition::NthFromTop { n }) => {
-                        let index = Some(n.saturating_sub(1) as usize);
-                        for &card_id in &chosen {
-                            super::zones::move_to_library_at_index(state, card_id, index, events);
+                        Some(LibraryPosition::NthFromTop { n }) => {
+                            let index = Some(n.saturating_sub(1) as usize);
+                            for &card_id in &chosen {
+                                super::zones::with_departure_member(
+                                    state,
+                                    events,
+                                    owner,
+                                    card_id,
+                                    |state, events| {
+                                        super::zones::move_to_library_at_index(
+                                            state, card_id, index, events,
+                                        )
+                                    },
+                                );
+                            }
                         }
-                    }
-                    _ => {
-                        for &card_id in chosen.iter().rev() {
-                            super::zones::move_to_library_at_index(state, card_id, Some(0), events);
+                        _ => {
+                            for &card_id in chosen.iter().rev() {
+                                super::zones::with_departure_member(
+                                    state,
+                                    events,
+                                    owner,
+                                    card_id,
+                                    |state, events| {
+                                        super::zones::move_to_library_at_index(
+                                            state,
+                                            card_id,
+                                            Some(0),
+                                            events,
+                                        )
+                                    },
+                                );
+                            }
                         }
-                    }
-                },
+                    },
+                ),
                 // CR 608.2d + CR 301.5b: Resolution-time Equipment pick for
                 // deferred optional attach (Nahiri, the Lithomancer +2).
                 EffectKind::Attach => {
@@ -3653,10 +3713,15 @@ pub(super) fn handle_resolution_choice(
                     };
                     let events_before_effect = events.len();
                     let chosen_ids: Vec<_> = chosen.to_vec();
-                    for (i, card_id) in chosen_ids.iter().enumerate() {
-                        match effects::change_zone::process_one_zone_move(
+                    if super::zones::with_departure_suppression(
+                        state,
+                        events,
+                        &chosen_ids,
+                        |state, events, owner| {
+                            for (i, card_id) in chosen_ids.iter().enumerate() {
+                                match super::zones::with_departure_member(state, events, owner, *card_id, |state, events| effects::change_zone::process_one_zone_move(
                             state, &ctx, *card_id, events,
-                        ) {
+                        )) {
                             effects::change_zone::ZoneMoveResult::Done => {
                                 // CR 118.3: Populate the exile-link index map for cost-payment exile
                                 if dest_zone == Zone::Exile {
@@ -3695,10 +3760,7 @@ pub(super) fn handle_resolution_choice(
                                     super::replacement::replacement_choice_waiting_for(
                                         player, state,
                                     );
-                                return Ok(action_result_outcome(
-                                    events,
-                                    state.waiting_for.clone(),
-                                ));
+                                return Ok(true);
                             }
                             effects::change_zone::ZoneMoveResult::NeedsChoice(choice_player) => {
                                 state.pending_change_zone_iteration =
@@ -3731,13 +3793,16 @@ pub(super) fn handle_resolution_choice(
                                         choice_player,
                                         state,
                                     );
-                                return Ok(action_result_outcome(
-                                    events,
-                                    state.waiting_for.clone(),
-                                ));
+                                return Ok(true);
                             }
                         }
+                            }
+                            Ok::<bool, EngineError>(false)
+                        },
+                    )? {
+                        return Ok(action_result_outcome(events, state.waiting_for.clone()));
                     }
+
                     let events_after_move = events.len();
                     // CR 614.12a: this `EffectZoneChoice` was the interactive payment of an
                     // optional `MayCost` replacement's accept (e.g. Mimeoplasm's
@@ -3852,17 +3917,6 @@ pub(super) fn handle_resolution_choice(
                 EffectKind::Sacrifice | EffectKind::ChangeZone | EffectKind::BounceAll
             );
             if moves_permanents {
-                // CR 603.10a: the chosen permanents left the battlefield together
-                // in this single resolution event, so co-departing
-                // leaves-the-battlefield observers among them (Blood Artist among
-                // the sacrificed group) observe each other. Stamp only the
-                // sub-slice this handler produced — never the whole events vector —
-                // so earlier sequential departures in this resolution aren't grouped
-                // with these.
-                super::zones::mark_simultaneous_departures(
-                    &mut events[events_before_effect..events_after_move],
-                    &super::zones::departed_subset(state, &chosen),
-                );
                 if let Some(outcome) = batch_or_drain_observer_triggers(
                     state,
                     events,
@@ -4537,16 +4591,6 @@ pub(super) fn handle_resolution_choice(
             } else {
                 // The sacrifice (if any) is complete. Mark its event slice.
                 let events_after_sacrifice = events.len();
-                // CR 603.10a + CR 608.2f + CR 701.21a: the permanents sacrificed by
-                // `sacrifice_unchosen` (keep-one-sacrifice-rest: Cataclysm,
-                // Tragic Arrogance) left the battlefield together in this single
-                // resolution event, so a co-departing leaves-the-battlefield
-                // observer among them (Blood Artist) observes the rest. Stamp the
-                // sacrifice sub-slice before the B1/B2 trigger dispatch reads it.
-                super::zones::stamp_simultaneous_from_slice(
-                    state,
-                    &mut events[events_before_sacrifice..events_after_sacrifice],
-                );
                 // Step B: if the sacrifice did not itself pause (no replacement
                 // choice was raised by `sacrifice_unchosen`), resolve any
                 // reflexive continuation. `state.waiting_for` is the `Priority`
