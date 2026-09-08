@@ -571,6 +571,7 @@ mod magus_of_the_abyss_scoped_chooser;
 mod make_an_example_pile_separation;
 mod mana_cost_reducers_issue_141;
 mod mana_drain_refund;
+mod mana_draw_classification;
 mod maraxus_team_pump_anthem;
 mod mass_phase_out_1792_repro;
 mod master_of_ceremonies;

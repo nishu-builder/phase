@@ -232,6 +232,7 @@ pub(super) fn apply_action_boundary_with_stack_limit(
     stack_resolution_limit: Option<u32>,
     drive: ActionDriveContext,
 ) -> Result<ActionResult, EngineError> {
+    preflight_mana_payment_activation(state, actor, &action)?;
     // Clear transient inter-effect state at the start of each player action.
     // last_effect_count is set by interactive handlers (e.g., DiscardChoice) and
     // consumed by sub_ability continuations via EventContextAmount fallback.
@@ -2128,6 +2129,33 @@ fn remember_public_reveals(state: &mut GameState, events: &[GameEvent]) {
 ///   `WaitingFor`. `SetAutoPass` is deliberately NOT exempt: its handler
 ///   stores the mode for the `WaitingFor::Priority` player and immediately
 ///   passes that priority, so it must come from the authorized submitter.
+// CR 601.2g + CR 605.3a: The mana-payment window admits only mana abilities.
+// CR 733.1: Reject this illegal activation before even transient state is cleared.
+fn preflight_mana_payment_activation(
+    state: &GameState,
+    actor: PlayerId,
+    action: &GameAction,
+) -> Result<(), EngineError> {
+    if let (
+        WaitingFor::ManaPayment { .. },
+        GameAction::ActivateAbility {
+            source_id,
+            ability_index,
+        },
+    ) = (&state.waiting_for, action)
+    {
+        check_actor_authorization(state, actor, action)?;
+        if let Some(ability) = state
+            .objects
+            .get(source_id)
+            .and_then(|object| object.abilities.get(*ability_index))
+        {
+            mana_abilities::require_mana_ability(ability)?;
+        }
+    }
+    Ok(())
+}
+
 fn check_actor_authorization(
     state: &GameState,
     actor: PlayerId,

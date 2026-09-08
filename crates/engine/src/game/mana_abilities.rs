@@ -2,7 +2,7 @@ use crate::game::functioning_abilities::static_kind_present;
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, ChoiceValue, ChosenAttribute,
     ContinuousModification, CostPaidObjectSnapshot, Effect, ManaProduction, QuantityExpr,
-    QuantityRef, ResolvedAbility, TargetFilter, REMOVE_COUNTER_COST_ALL,
+    QuantityRef, ResolvedAbility, TargetFilter, VoteSubject, REMOVE_COUNTER_COST_ALL,
     REMOVE_COUNTER_COST_ANY_NUMBER,
 };
 use crate::types::counter::{CounterMatch, CounterType};
@@ -31,12 +31,12 @@ use super::mana_sources::{mana_color_to_type, mana_type_to_color};
 use super::sacrifice;
 
 /// Check if a typed ability definition represents a mana ability (CR 605).
-/// CR 605.3: Mana abilities produce mana and resolve immediately without using the stack.
-/// CR 605.1a: A mana ability cannot have targets. If the effect produces mana but the
-/// ability has targeting (e.g., via `multi_target`), it must use the stack instead.
-/// Currently `Effect::Mana` has no embedded target field and no `AbilityCost` variant
-/// implies targeting, so this check is defensive — if future variants introduce
-/// targeting on mana-producing abilities, this guard ensures correctness.
+/// CR 605.3b: Mana abilities resolve immediately without using the stack.
+/// CR 605.1a: Preserve Mana-head recognition and exclude root targeting, loyalty
+/// costs, and explicit potentially positive Draw instructions in the current body.
+/// Both multi_target and Effect::Mana::target carry targeting.
+/// This is a bounded library-movement check: other library effects and activation
+/// costs, including Mill, are not classified here.
 pub fn is_mana_ability(ability_def: &AbilityDefinition) -> bool {
     let target_attached = match &*ability_def.effect {
         Effect::Mana { target, .. } => target.as_ref(),
@@ -61,7 +61,365 @@ pub fn is_mana_ability(ability_def: &AbilityDefinition) -> bool {
     }) {
         return false;
     }
-    true
+    !ability_body_may_draw(ability_def)
+}
+
+/// CR 605.1a + CR 121.1: Explicit Draw moves cards out of a library.
+/// Inspect immediate instructions, including either sub-link kind, without
+/// following future grants or unused activation costs on nested definitions.
+fn ability_body_may_draw(ability: &AbilityDefinition) -> bool {
+    effect_may_draw(&ability.effect)
+        || ability
+            .sub_ability
+            .as_deref()
+            .is_some_and(ability_body_may_draw)
+        || ability
+            .else_ability
+            .as_deref()
+            .is_some_and(ability_body_may_draw)
+        || (ability.modal.is_some() && ability.mode_abilities.iter().any(ability_body_may_draw))
+        || ability
+            .unless_pay
+            .as_ref()
+            .is_some_and(|unless| resolution_cost_may_draw(&unless.cost))
+}
+
+/// CR 107.1b: A fixed nonpositive amount cannot draw a positive number of cards.
+/// CR 605.2: Classification does not depend on current game state. Dynamic and
+/// arithmetic expressions conservatively remain potentially positive.
+fn draw_count_may_be_positive(count: &QuantityExpr) -> bool {
+    match count.peel_up_to().0 {
+        QuantityExpr::Fixed { value } => *value > 0,
+        QuantityExpr::Ref { .. }
+        | QuantityExpr::DivideRounded { .. }
+        | QuantityExpr::Offset { .. }
+        | QuantityExpr::ClampMin { .. }
+        | QuantityExpr::Multiply { .. }
+        | QuantityExpr::Sum { .. }
+        | QuantityExpr::Power { .. }
+        | QuantityExpr::Difference { .. }
+        | QuantityExpr::Max { .. }
+        | QuantityExpr::UpTo { .. } => true,
+    }
+}
+
+/// Inspect only explicit effect payloads of costs encountered during resolution.
+/// This does not make unsupported EffectCost payloads executable.
+fn resolution_cost_may_draw(cost: &AbilityCost) -> bool {
+    match cost {
+        AbilityCost::EffectCost { effect } => effect_may_draw(effect),
+        AbilityCost::Composite { costs } | AbilityCost::OneOf { costs } => {
+            costs.iter().any(resolution_cost_may_draw)
+        }
+        AbilityCost::PerCounter { base, .. } => resolution_cost_may_draw(base),
+        AbilityCost::Mana { .. }
+        | AbilityCost::ManaDynamic { .. }
+        | AbilityCost::Tap
+        | AbilityCost::Untap
+        | AbilityCost::Loyalty { .. }
+        | AbilityCost::Sacrifice(..)
+        | AbilityCost::PayLife { .. }
+        | AbilityCost::Discard { .. }
+        | AbilityCost::Exile { .. }
+        | AbilityCost::ExileMaterials { .. }
+        | AbilityCost::CollectEvidence { .. }
+        | AbilityCost::ExileWithAggregate { .. }
+        | AbilityCost::TapCreatures { .. }
+        | AbilityCost::RemoveCounter { .. }
+        | AbilityCost::PayEnergy { .. }
+        | AbilityCost::PaySpeed { .. }
+        | AbilityCost::ReturnToHand { .. }
+        | AbilityCost::Unattach
+        | AbilityCost::UnattachFrom { .. }
+        | AbilityCost::Mill { .. }
+        | AbilityCost::Exert
+        | AbilityCost::Blight { .. }
+        | AbilityCost::Reveal { .. }
+        | AbilityCost::Behold { .. }
+        | AbilityCost::Waterbend { .. }
+        | AbilityCost::NinjutsuFamily { .. }
+        | AbilityCost::KeywordCostOfCastSpell { .. }
+        | AbilityCost::Unimplemented { .. } => false,
+    }
+}
+
+/// CR 608.2c: Follow instruction bodies that can execute during this resolution.
+/// Future registrations (including CR 603.7a delayed triggers) are not executed
+/// here; their following ordinary siblings are still visited by the body helper.
+fn effect_may_draw(effect: &Effect) -> bool {
+    match effect {
+        Effect::Draw { count, .. } => draw_count_may_be_positive(count),
+        Effect::ChooseOneOf { branches, .. } => branches.iter().any(ability_body_may_draw),
+        Effect::FlipCoin {
+            win_effect,
+            lose_effect,
+            ..
+        }
+        | Effect::FlipCoins {
+            win_effect,
+            lose_effect,
+            ..
+        } => {
+            win_effect.as_deref().is_some_and(ability_body_may_draw)
+                || lose_effect.as_deref().is_some_and(ability_body_may_draw)
+        }
+        Effect::FlipCoinUntilLose { win_effect } => ability_body_may_draw(win_effect),
+        Effect::RollDie { results, .. } => results
+            .iter()
+            .any(|branch| ability_body_may_draw(&branch.effect)),
+        Effect::Vote {
+            subject,
+            per_choice_effect,
+            ..
+        } => match subject {
+            VoteSubject::Named => per_choice_effect
+                .iter()
+                .any(|body| ability_body_may_draw(body)),
+            VoteSubject::Objects {
+                outcome_template, ..
+            } => ability_body_may_draw(outcome_template),
+        },
+        Effect::SeparateIntoPiles {
+            chosen_pile_effect,
+            unchosen_pile_effect,
+            ..
+        } => {
+            ability_body_may_draw(chosen_pile_effect)
+                || unchosen_pile_effect
+                    .as_deref()
+                    .is_some_and(ability_body_may_draw)
+        }
+        Effect::RevealFromHand { on_decline, .. } => {
+            on_decline.as_deref().is_some_and(ability_body_may_draw)
+        }
+        Effect::PayCost { cost, .. } => resolution_cost_may_draw(cost),
+        Effect::StartYourEngines { .. }
+        | Effect::ChangeSpeed { .. }
+        | Effect::DealDamage { .. }
+        | Effect::ApplyPostReplacementDamage { .. }
+        | Effect::EachDealsDamageEqualToPower { .. }
+        | Effect::EachSourceDealsDamage { .. }
+        | Effect::Pump { .. }
+        | Effect::PairWith { .. }
+        | Effect::Destroy { .. }
+        | Effect::Regenerate { .. }
+        | Effect::RemoveAllDamage { .. }
+        | Effect::Counter { .. }
+        | Effect::CounterAll { .. }
+        | Effect::Token { .. }
+        | Effect::GainLife { .. }
+        | Effect::LoseLife { .. }
+        | Effect::SetTapState { .. }
+        | Effect::RemoveCounter { .. }
+        | Effect::Sacrifice { .. }
+        | Effect::DiscardCard { .. }
+        | Effect::Mill { .. }
+        | Effect::Scry { .. }
+        | Effect::PumpAll { .. }
+        | Effect::DamageAll { .. }
+        | Effect::DamageEachPlayer { .. }
+        | Effect::DestroyAll { .. }
+        | Effect::ChangeZone { .. }
+        | Effect::ChangeZoneAll { .. }
+        | Effect::Dig { .. }
+        | Effect::GainControl { .. }
+        | Effect::GainControlAll { .. }
+        | Effect::ControlNextTurn { .. }
+        | Effect::Attach { .. }
+        | Effect::UnattachAll { .. }
+        | Effect::Surveil { .. }
+        | Effect::Fight { .. }
+        | Effect::Bounce { .. }
+        | Effect::BounceAll { .. }
+        | Effect::Explore
+        | Effect::ExploreAll { .. }
+        | Effect::Investigate
+        | Effect::Tribute { .. }
+        | Effect::TimeTravel
+        | Effect::BecomeMonarch
+        | Effect::NoOp
+        | Effect::Proliferate
+        | Effect::ProliferateTarget { .. }
+        | Effect::Populate
+        | Effect::Clash
+        | Effect::Behold { .. }
+        | Effect::EndTheTurn
+        | Effect::EndCombatPhase
+        | Effect::SwitchPT { .. }
+        | Effect::CopySpell { .. }
+        | Effect::EpicCopy { .. }
+        | Effect::CastCopyOfCard { .. }
+        | Effect::CopyTokenOf { .. }
+        | Effect::CreateTokenCopyFromPool { .. }
+        | Effect::Myriad
+        | Effect::Encore
+        | Effect::CombineHost { .. }
+        | Effect::ChooseAugmentAndCombineWithHost { .. }
+        | Effect::Meld { .. }
+        | Effect::ExileHaunting { .. }
+        | Effect::HideawayConceal { .. }
+        | Effect::CopyTokenBlockingAttacker { .. }
+        | Effect::BecomeCopy { .. }
+        | Effect::GainActivatedAbilitiesOfTarget { .. }
+        | Effect::ChooseCard { .. }
+        | Effect::PutCounter { .. }
+        | Effect::ChooseCounterKind { .. }
+        | Effect::PutChosenCounter { .. }
+        | Effect::PutCounterAll { .. }
+        | Effect::MultiplyCounter { .. }
+        | Effect::ChooseCounterAdjustment { .. }
+        | Effect::DoublePT { .. }
+        | Effect::DoublePTAll { .. }
+        | Effect::MoveCounters { .. }
+        | Effect::Animate { .. }
+        | Effect::ReturnAsAura { .. }
+        | Effect::RegisterBending { .. }
+        | Effect::GenericEffect { .. }
+        | Effect::Cleanup { .. }
+        | Effect::Mana { .. }
+        | Effect::Discard { .. }
+        | Effect::Shuffle { .. }
+        | Effect::Transform { .. }
+        | Effect::SearchLibrary { .. }
+        | Effect::SearchOutsideGame { .. }
+        | Effect::RevealHand { .. }
+        | Effect::Reveal { .. }
+        | Effect::RevealTop { .. }
+        | Effect::ExileTop { .. }
+        | Effect::TargetOnly { .. }
+        | Effect::Choose { .. }
+        | Effect::OpponentGuess { .. }
+        | Effect::SwapChosenLabels { .. }
+        | Effect::ChooseDamageSource { .. }
+        | Effect::Suspect { .. }
+        | Effect::Unsuspect { .. }
+        | Effect::Connive { .. }
+        | Effect::PhaseOut { .. }
+        | Effect::PhaseIn { .. }
+        | Effect::ForceBlock { .. }
+        | Effect::ForceAttack { .. }
+        | Effect::SolveCase
+        | Effect::BecomePrepared { .. }
+        | Effect::BecomeUnprepared { .. }
+        | Effect::BecomeSaddled { .. }
+        | Effect::SetClassLevel { .. }
+        | Effect::CreateDelayedTrigger { .. }
+        | Effect::AddTargetReplacement { .. }
+        | Effect::AddRestriction { .. }
+        | Effect::ReduceNextSpellCost { .. }
+        | Effect::GrantNextSpellAbility { .. }
+        | Effect::AddPendingETBCounters { .. }
+        | Effect::AddPendingEntersModifications { .. }
+        | Effect::CreateEmblem { .. }
+        | Effect::CastFromZone { .. }
+        | Effect::FreeCastFromZones { .. }
+        | Effect::ExileResolvingSpellInsteadOfGraveyard
+        | Effect::PreventDamage { .. }
+        | Effect::CreateDamageReplacement { .. }
+        | Effect::CreateDrawReplacement { .. }
+        | Effect::CreatePlaneswalkReplacement { .. }
+        | Effect::LoseTheGame { .. }
+        | Effect::WinTheGame { .. }
+        | Effect::RingTemptsYou
+        | Effect::VentureIntoDungeon
+        | Effect::VentureInto { .. }
+        | Effect::TakeTheInitiative
+        | Effect::Planeswalk
+        | Effect::ChaosEnsues
+        | Effect::ReverseTurnOrder
+        | Effect::RedistributeLifeTotals
+        | Effect::OpenAttractions { .. }
+        | Effect::RollToVisitAttractions
+        | Effect::AssembleContraptions { .. }
+        | Effect::AssembleContraptionsFromRollDifference
+        | Effect::CrankContraptions { .. }
+        | Effect::ReassembleContraption { .. }
+        | Effect::AssembleContraptionOnSprocket { .. }
+        | Effect::ReassembleContraptionOnSprocket { .. }
+        | Effect::PutSticker { .. }
+        | Effect::ApplySticker { .. }
+        | Effect::ProcessRadCounters
+        | Effect::GrantCastingPermission { .. }
+        | Effect::ChooseFromZone { .. }
+        | Effect::RememberCard { .. }
+        | Effect::ForEachCategory { .. }
+        | Effect::ChooseObjectsIntoTrackedSet { .. }
+        | Effect::ChooseAndSacrificeRest { .. }
+        | Effect::EachPlayerCopyChosen { .. }
+        | Effect::Exploit { .. }
+        | Effect::GainEnergy { .. }
+        | Effect::GivePlayerCounter { .. }
+        | Effect::LoseAllPlayerCounters { .. }
+        | Effect::ExileFromTopUntil { .. }
+        | Effect::RevealUntil { .. }
+        | Effect::Discover { .. }
+        | Effect::Heist { .. }
+        | Effect::HeistExile
+        | Effect::Cascade
+        | Effect::Ripple { .. }
+        | Effect::MiracleCast { .. }
+        | Effect::MadnessCast { .. }
+        | Effect::PutAtLibraryPosition { .. }
+        | Effect::ChooseDrawnThisTurnPayOrTopdeck { .. }
+        | Effect::PutOnTopOrBottom { .. }
+        | Effect::GiftDelivery { .. }
+        | Effect::Goad { .. }
+        | Effect::GoadAll { .. }
+        | Effect::Detain { .. }
+        | Effect::SetRoomDoorLock { .. }
+        | Effect::ExchangeControl { .. }
+        | Effect::ChangeTargets { .. }
+        | Effect::Manifest { .. }
+        | Effect::ManifestDread
+        | Effect::Cloak { .. }
+        | Effect::TurnFaceUp { .. }
+        | Effect::TurnFaceDown { .. }
+        | Effect::ExtraTurn { .. }
+        | Effect::GrantExtraLoyaltyActivations { .. }
+        | Effect::SkipNextTurn { .. }
+        | Effect::SkipNextStep { .. }
+        | Effect::AdditionalPhase { .. }
+        | Effect::Double { .. }
+        | Effect::RuntimeHandled { .. }
+        | Effect::Incubate { .. }
+        | Effect::Amass { .. }
+        | Effect::Monstrosity { .. }
+        | Effect::Specialize
+        | Effect::Renown { .. }
+        | Effect::Bolster { .. }
+        | Effect::Adapt { .. }
+        | Effect::Learn
+        | Effect::Forage
+        | Effect::Harness
+        | Effect::CollectEvidence { .. }
+        | Effect::Endure { .. }
+        | Effect::BlightEffect { .. }
+        | Effect::Seek { .. }
+        | Effect::SetLifeTotal { .. }
+        | Effect::ExchangeLifeWithStat { .. }
+        | Effect::ExchangeLifeTotals { .. }
+        | Effect::SetDayNight { .. }
+        | Effect::GiveControl { .. }
+        | Effect::RemoveFromCombat { .. }
+        | Effect::BecomeBlocked { .. }
+        | Effect::Conjure { .. }
+        | Effect::ApplyPerpetual { .. }
+        | Effect::Intensify { .. }
+        | Effect::DraftFromSpellbook { .. }
+        | Effect::Unimplemented { .. } => false,
+    }
+}
+
+/// CR 605.1a + CR 605.3b: Only a classified mana ability may execute inline.
+pub(super) fn require_mana_ability(ability: &AbilityDefinition) -> Result<(), EngineError> {
+    if is_mana_ability(ability) {
+        Ok(())
+    } else {
+        Err(EngineError::ActionNotAllowed(
+            "Only mana abilities can be activated through mana payment or immediate mana execution"
+                .to_string(),
+        ))
+    }
 }
 
 /// CR 605.1b: A triggered ability is a mana ability iff all three hold:
@@ -288,6 +646,7 @@ pub(super) fn resolve_mana_ability_excluding(
     // at the top-level entry — there is no outer cost on the stack.
     sub_cost_demand: Option<&mana_payment::ColorDemand>,
 ) -> Result<(), EngineError> {
+    require_mana_ability(ability_def)?;
     // Pay the full ability cost (tap, sacrifice, etc.)
     let waiting_before_cost = state.waiting_for.clone();
     pay_mana_ability_cost(
@@ -536,6 +895,7 @@ pub fn activate_mana_ability(
     resume: ManaAbilityResume,
     color_override: Option<ProductionOverride>,
 ) -> Result<WaitingFor, EngineError> {
+    require_mana_ability(ability_def)?;
     let source = state
         .objects
         .get(&source_id)
@@ -3401,6 +3761,85 @@ fn resume_waiting_for(player: PlayerId, resume: ManaAbilityResume) -> WaitingFor
 
 #[cfg(test)]
 mod tests {
+
+    // SHAPE/private predicate tests: a Draw leaf must reach the new query,
+    // without short-circuiting at the preexisting Mana-head recognition gate.
+    #[test]
+    fn explicit_draw_leaf_count_boundaries() {
+        let fixed = |value| QuantityExpr::Fixed { value };
+        for (count, expected) in [
+            (fixed(1), true),
+            (fixed(0), false),
+            (fixed(-1), false),
+            (QuantityExpr::up_to(fixed(0)), false),
+            (QuantityExpr::up_to(fixed(1)), true),
+            (
+                QuantityExpr::up_to(QuantityExpr::Ref {
+                    qty: QuantityRef::Variable { name: "X".into() },
+                }),
+                true,
+            ),
+        ] {
+            let effect = Effect::Draw {
+                count,
+                target: TargetFilter::Controller,
+            };
+            // CR 107.1b + CR 121.1: Only potentially positive amounts draw a card.
+            assert_eq!(effect_may_draw(&effect), expected);
+        }
+        assert!(!effect_may_draw(&Effect::Mana {
+            produced: ManaProduction::Colorless { count: fixed(1) },
+            restrictions: vec![],
+            grants: vec![],
+            expiry: None,
+            target: None,
+        }));
+    }
+
+    #[test]
+    fn explicit_draw_dynamic_counts_remain_potential() {
+        let fixed = || Box::new(QuantityExpr::Fixed { value: 0 });
+        let expressions = [
+            QuantityExpr::Ref {
+                qty: QuantityRef::Variable { name: "X".into() },
+            },
+            QuantityExpr::DivideRounded {
+                inner: fixed(),
+                divisor: 2,
+                rounding: crate::types::ability::RoundingMode::Down,
+            },
+            QuantityExpr::Offset {
+                inner: fixed(),
+                offset: 0,
+            },
+            QuantityExpr::ClampMin {
+                inner: fixed(),
+                minimum: 0,
+            },
+            QuantityExpr::Multiply {
+                factor: 0,
+                inner: fixed(),
+            },
+            QuantityExpr::Sum { exprs: vec![] },
+            QuantityExpr::Power {
+                base: 0,
+                exponent: fixed(),
+            },
+            QuantityExpr::Difference {
+                left: fixed(),
+                right: fixed(),
+            },
+            QuantityExpr::Max { exprs: vec![] },
+        ];
+        for count in expressions {
+            // CR 605.2: The bounded query does not evaluate or simplify game-state quantities.
+            assert!(effect_may_draw(&Effect::Draw {
+                count,
+                target: TargetFilter::Controller
+            }));
+        }
+    }
+
     use std::sync::Arc;
 
     use super::*;
